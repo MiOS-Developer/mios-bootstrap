@@ -128,6 +128,17 @@ resolve_build_mios_sh() {
     fi
 }
 
+resolve_install_core() {
+    local mode="$1"
+    case "$mode" in
+        fhs|bootc) ;;
+        *) die "Internal installer mode must be fhs or bootc: $mode" ;;
+    esac
+    REQUIRES_ROOT=1
+    ENV+=("INSTALL_MODE=$mode")
+    CMD=(do_install_core "$mode")
+}
+
 resolve_fedora() {
     TYPE="${TYPE:-fhs}"
     [[ "$TYPE" == "fhs" ]] || die "Target 'fedora' only supports"
@@ -577,11 +588,68 @@ require_root() {
 detect_host_kind() {
     if command -v bootc >/dev/null 2>&1 && bootc status --format=json 2>/dev/null | grep -q '"booted"'; then
         echo "bootc"
-    elif [[ -f /etc/os-release ]] && grep -qE '^ID(_LIKE)?=.*fedora' /etc/os-release; then
-        echo "fhs-fedora"
     else
-        echo "unsupported"
+        mios_os_release_kind /etc/os-release
     fi
+}
+
+# os-release(5) -> fhs-fedora | unsupported. The FHS path installs Fedora
+# packages, so it needs the Fedora platform: "fedora" as a whole token of ID or
+# ID_LIKE (a MiOS-overlaid host reads ID=mios ID_LIKE="fedora coreos") and a
+# Fedora PLATFORM_ID (platform:f<N>; RHEL-family hosts are platform:el<N>).
+mios_os_release_kind() {
+    local key value id="" like="" platform=""
+    if [[ -r "$1" ]]; then
+        while IFS='=' read -r key value || [[ -n "$key" ]]; do
+            value="${value%\"}"; value="${value#\"}"; value="${value%\'}"; value="${value#\'}"
+            case "$key" in
+                ID) id="$value" ;;
+                ID_LIKE) like="$value" ;;
+                PLATFORM_ID) platform="$value" ;;
+            esac
+        done < "$1"
+    fi
+    case " ${id} ${like} " in
+        *" fedora "*) [[ "$platform" =~ ^platform:f[0-9]+$ ]] && { echo "fhs-fedora"; return 0; } ;;
+    esac
+    echo "unsupported"
+}
+
+# mios_apply_unit_presets <root> -- apply the MiOS preset roster
+# (usr/lib/systemd/{system,user}-preset/*mios*.preset) to every unit it names
+# that is installed under <root>. The image gets this from 88-finalize's
+# preset-all at bake time; an FHS host has no bake, so without this step every
+# MiOS unit stays disabled. Only roster units are preset: preset-all on a live
+# host would also reset the operator's own units. Units the roster names but
+# the host lacks (Quadlet-generated, substrate- or package-specific) are listed,
+# not preset; a failing preset fails the install.
+mios_apply_unit_presets() {
+    local root="${1:-/}" scope unit n=0
+    local -a flag units installed absent
+    local -A known
+    for scope in system user; do
+        flag=()
+        [[ "$scope" == user ]] && flag=(--global)
+        mapfile -t units < <(cat "${root%/}/usr/lib/systemd/${scope}-preset/"*mios*.preset 2>/dev/null \
+            | awk '$1 == "enable" || $1 == "disable" { print $2 }' | sort -u)
+        known=()
+        while read -r unit _; do
+            [[ -n "$unit" ]] && known["$unit"]=1
+        done < <(systemctl --root="$root" "${flag[@]}" list-unit-files --no-legend --no-pager 2>/dev/null)
+        installed=() absent=()
+        for unit in "${units[@]}"; do
+            if [[ -n "${known[$unit]:-}" ]]; then installed+=("$unit"); else absent+=("$unit"); fi
+        done
+        (( ${#absent[@]} )) && log_info "Preset roster units not installed (${scope}): ${absent[*]}"
+        (( ${#installed[@]} )) || continue
+        if ! systemctl --root="$root" "${flag[@]}" preset -- "${installed[@]}"; then
+            log_err "Applying the MiOS ${scope} unit presets failed"
+            return 1
+        fi
+        n=$(( n + ${#installed[@]} ))
+    done
+    (( n )) || { log_err "No MiOS preset roster units are installed under ${root}"; return 1; }
+    log_ok "MiOS unit presets applied to ${n} installed units"
 }
 
 check_network() {
@@ -1293,38 +1361,22 @@ trigger_mios_install() {
                 esac
             fi
 
-            # 1. Initialize / as the git root for 'MiOS' core
+            # 1. Make / the MiOS Git worktree ("/ IS $ROOT") so `git -C / pull`
+            # works on Day-N+. mios_root_merge (mios-common.sh) fetches, resets,
+            # puts HEAD on ${DEFAULT_BRANCH} tracking origin, and fails unless /
+            # is then the clean Git top level of that commit.
             log_info "Staging 'MiOS' core repository (mios.git) to /"
-            if [[ ! -d "/.git" ]]; then
-                git init /
-                git -C / remote add origin "${MIOS_REPO}"
-            fi
             spin_start "Fetching mios.git (system layer)"
-            local fetch_err
-            fetch_err=$(git -C / fetch --depth=1 origin "${DEFAULT_BRANCH}" 2>&1)
-            local fetch_rc=$?
-            if [[ $fetch_rc -ne 0 ]]; then
+            if ! mios_root_merge / "${MIOS_REPO}" "${DEFAULT_BRANCH}"; then
                 spin_stop
-                log_err "Failed to fetch mios.git from ${MIOS_REPO}: ${fetch_err}"
+                log_err "Failed to merge mios.git (${MIOS_REPO}) into /"
                 return 1
             fi
-            if ! git -C / reset --hard FETCH_HEAD; then
-                spin_stop
-                log_err "Failed to reset root filesystem to FETCH_HEAD"
-                return 1
-            fi
-            # Make / a first-class, SELF-UPDATING git work tree so `git -C / pull` works
-            # on Day-N+ -- "/ IS $ROOT": the deployed root is the SAME git tree the
-            # drift-gate resolves ($ROOT = $(cd automation/.. ) = /), and it pulls its own
-            # updates. `fetch <branch>` + `reset --hard FETCH_HEAD` leaves HEAD on
-            # git-init's default branch with NO upstream, so a bare `git pull` errors
-            # "no tracking information". checkout -B at the CURRENT commit renames/creates
-            # ${DEFAULT_BRANCH} with no working-tree change; the config lines wire its
-            # upstream to origin so `git -C / pull --ff-only` fast-forwards mios.git.
-            git -C / checkout -B "${DEFAULT_BRANCH}" >/dev/null 2>&1 || true
-            git -C / config "branch.${DEFAULT_BRANCH}.remote" origin
-            git -C / config "branch.${DEFAULT_BRANCH}.merge" "refs/heads/${DEFAULT_BRANCH}"
             spin_stop
+            if ! git -C / ls-files --error-unmatch usr/share/mios/mios.toml >/dev/null 2>&1; then
+                log_err "The merged root does not track the SSOT usr/share/mios/mios.toml"
+                return 1
+            fi
             log_ok "MiOS core (mios.git) merged to / (branch ${DEFAULT_BRANCH} tracks origin -- git -C / pull works)"
 
             # 2. Apply MiOS-bootstrap repo overlays. Prefer a LOCALLY-STAGED source
@@ -1341,8 +1393,9 @@ trigger_mios_install() {
                 spin_start "Cloning mios-bootstrap.git (user layer)"
                 rm -rf "${bootstrap_tmp}"
                 local clone_err
-                clone_err=$(git clone --depth=1 "${BOOTSTRAP_REPO}" "${bootstrap_tmp}" 2>&1)
-                local clone_rc=$?
+                # umask 022: cp -a below copies these modes into /etc and /usr.
+                local clone_rc=0
+                clone_err=$(umask 022; git clone --depth=1 "${BOOTSTRAP_REPO}" "${bootstrap_tmp}" 2>&1) || clone_rc=$?
                 if [[ $clone_rc -ne 0 ]]; then
                     spin_stop
                     log_err "Failed to clone mios-bootstrap from ${BOOTSTRAP_REPO}: ${clone_err}"
@@ -1356,7 +1409,10 @@ trigger_mios_install() {
             log_info "Merging bootstrap system folders (etc, usr) to /"
             for d in etc usr; do
                 if [[ -d "${bootstrap_src}/${d}" ]]; then
-                    cp -a "${bootstrap_src}/${d}/." "/${d}/" 2>/dev/null || true
+                    if ! cp -a "${bootstrap_src}/${d}/." "/${d}/"; then
+                        log_err "Failed to apply bootstrap overlay: ${d}/"
+                        return 1
+                    fi
                 fi
             done
             [[ "${bootstrap_src}" == "${bootstrap_tmp}" ]] && rm -rf "${bootstrap_tmp}"
@@ -1368,36 +1424,52 @@ trigger_mios_install() {
             # sense inside the OCI build pipeline, not on a running FHS host.
             log_phase "Phase-2 -- FHS package install (from mios.toml)"
             local toml_path
-            toml_path="$(_resolve_mios_toml)"
-            if [[ -z "$toml_path" ]]; then
+            if ! toml_path="$(_resolve_mios_toml)" || [[ -z "$toml_path" ]]; then
                 log_err "mios.toml not found -- package installation skipped"
                 return 1
             fi
 
             local repo_pkgs
-            repo_pkgs=$(get_packages_from_toml "repos")
+            if ! repo_pkgs=$(get_packages_from_toml "repos"); then
+                log_err "Failed to resolve repository packages from mios.toml"
+                return 1
+            fi
             if [[ -n "$repo_pkgs" ]]; then
                 log_info "Setting up additional repos..."
                 spin_start "Installing repo packages"
                 # shellcheck disable=SC2086
-                $dnf_cmd install -y --skip-unavailable $repo_pkgs 2>&1 | grep -E '^(Install|Upgrade|Error|Warning|Failed)' || true
+                if ! $dnf_cmd install -y $repo_pkgs; then
+                    spin_stop
+                    log_err "Repository package installation failed"
+                    return 1
+                fi
                 spin_stop
-                $dnf_cmd makecache --refresh 2>/dev/null || true
+                if ! $dnf_cmd makecache --refresh; then
+                    log_err "Repository metadata refresh failed"
+                    return 1
+                fi
                 log_ok "Repos configured"
             fi
 
             local pkgs
-            pkgs=$(get_all_packages_except)
+            if ! pkgs=$(get_all_packages_except); then
+                log_err "Failed to resolve system packages from mios.toml"
+                return 1
+            fi
             if [[ -n "$pkgs" ]]; then
                 log_info "Installing full 'MiOS' component stack..."
                 spin_start "dnf install (this takes several minutes)"
                 # shellcheck disable=SC2086
-                $dnf_cmd install -y --skip-unavailable --best $pkgs 2>&1 \
-                    | grep -E '^\s*(Installing|Upgrading|Removing|Error|Warning|Nothing)' || true
+                if ! $dnf_cmd install -y --best $pkgs; then
+                    spin_stop
+                    log_err "System package installation failed"
+                    return 1
+                fi
                 spin_stop
                 log_ok "Package installation complete"
             else
-                log_warn "No packages extracted from mios.toml"
+                log_err "No system packages resolved from mios.toml"
+                return 1
             fi
 
             # 4. Phase-3: systemd-sysusers, systemd-tmpfiles, daemon-reload.
@@ -1405,29 +1477,61 @@ trigger_mios_install() {
             # declared in usr/lib/tmpfiles.d/mios*.conf.
             log_phase "Phase-3 -- System init (sysusers + tmpfiles + daemon-reload)"
 
-            log_info "Ensuring executable permissions on all core binaries and scripts..."
-            chmod +x /automation/*.sh /usr/bin/mios* 2>/dev/null || true
-            find /usr/libexec/mios -type f -exec chmod +x {} + 2>/dev/null || true
-
             log_info "Synchronizing environment configuration..."
             if [[ -f "/usr/libexec/mios/system-sync-env.sh" ]]; then
-                /usr/libexec/mios/system-sync-env.sh 2>/dev/null || log_warn "system-sync-env.sh failed"
+                if ! /usr/libexec/mios/system-sync-env.sh; then
+                    log_err "Environment synchronization failed"
+                    return 1
+                fi
             fi
 
             spin_start "Running systemd-sysusers"
-            systemctl-sysusers 2>/dev/null || systemd-sysusers 2>/dev/null || log_warn "systemd-sysusers not available"
+            if ! systemd-sysusers; then
+                spin_stop
+                log_err "System user provisioning failed"
+                return 1
+            fi
             spin_stop
             spin_start "Running systemd-tmpfiles --create"
-            systemd-tmpfiles --create 2>/dev/null || log_warn "systemd-tmpfiles failed"
-            spin_stop
-            if [[ -f "/automation/15-render-quadlets.sh" ]]; then
-                spin_start "Rendering Quadlet container files"
-                (cd /automation && ./15-render-quadlets.sh) 2>/dev/null || log_warn "15-render-quadlets.sh failed"
+            if ! systemd-tmpfiles --create; then
                 spin_stop
+                log_err "Persistent directory provisioning failed"
+                return 1
+            fi
+            spin_stop
+            # 5. Native catalog, then the Quadlet stages that dispatch to it. The
+            # root merge put these stages at /automation; a missing one is a
+            # broken merge, not an optional step.
+            local stage
+            for stage in 55-native-build.sh 33-generate-quadlets.sh 34-render-quadlets.sh; do
+                if [[ ! -f "/automation/${stage}" ]]; then
+                    log_err "The merged root lacks /automation/${stage}"
+                    return 1
+                fi
+                spin_start "Running ${stage}"
+                if ! bash "/automation/${stage}"; then
+                    spin_stop
+                    log_err "Provisioning stage ${stage} failed"
+                    return 1
+                fi
+                spin_stop
+            done
+            if ! /usr/libexec/mios/miosd native-runtime-check --root /; then
+                log_err "Native runtime catalog is incomplete (miosd native-runtime-check)"
+                return 1
+            fi
+            # 6. Enable the SSOT-selected MiOS units (the bake's preset-all).
+            if ! mios_apply_unit_presets /; then
+                log_err "MiOS unit enablement failed"
+                return 1
             fi
             if systemctl is-system-running --quiet 2>/dev/null; then
                 spin_start "Reloading systemd daemon"
-                systemctl daemon-reload
+                if ! systemctl daemon-reload; then
+                    spin_stop
+                    log_err "Systemd daemon reload failed"
+                    return 1
+                fi
                 spin_stop
                 log_ok "Systemd daemon reloaded"
             fi
@@ -1517,47 +1621,33 @@ case "$TARGET" in
         die "Unknown target '${TARGET}'. Valid targets: live xbox fedora bootc oci seed flash build update config stage verify" ;;
 esac
 
+# A prerequisite that cannot be installed stops the target here: the target
+# would otherwise run without it and fail later (or report a false success).
 resolve_target_prereqs() {
-    local target="$1"
-    log_info "Resolving prerequisites for target '${target}'..."
+    local target="$1" pkg pkgs=() missing=() sudo=()
     case "$target" in
-        build|fedora|bootc)
-            if command -v dnf >/dev/null 2>&1; then
-                for pkg in git curl podman; do
-                    if ! rpm -q "$pkg" >/dev/null 2>&1; then
-                        log_info "Target prerequisite missing: ${pkg}"
-                        (( DRY_RUN )) || sudo dnf install -y "$pkg" || true
-                    fi
-                done
-            fi
-            if ! command -v cargo >/dev/null 2>&1 && ! command -v rustup >/dev/null 2>&1; then
-                log_info "Target prerequisite missing: rustup/cargo for native tools"
-                if (( ! DRY_RUN )) && command -v dnf >/dev/null 2>&1; then
-                    sudo dnf install -y cargo rust || true
-                fi
-            fi
-            ;;
-        live|flash)
-            if command -v dnf >/dev/null 2>&1; then
-                for pkg in git curl podman ventoy; do
-                    if ! rpm -q "$pkg" >/dev/null 2>&1; then
-                        log_info "Target prerequisite missing: ${pkg}"
-                        (( DRY_RUN )) || sudo dnf install -y "$pkg" || true
-                    fi
-                done
-            fi
-            ;;
-        update)
-            if command -v dnf >/dev/null 2>&1; then
-                for pkg in git curl; do
-                    if ! rpm -q "$pkg" >/dev/null 2>&1; then
-                        log_info "Target prerequisite missing: ${pkg}"
-                        (( DRY_RUN )) || sudo dnf install -y "$pkg" || true
-                    fi
-                done
-            fi
-            ;;
+        build|fedora|bootc) pkgs=(git curl podman) ;;
+        # The field menu neither partitions media nor installs Ventoy (see
+        # resolve_flash_or_live), so Ventoy is not a prerequisite here.
+        live|flash) pkgs=(git curl podman) ;;
+        update) pkgs=(git curl) ;;
+        *) return 0 ;;
     esac
+    command -v rpm >/dev/null 2>&1 || return 0
+    log_info "Resolving prerequisites for target '${target}'..."
+    for pkg in "${pkgs[@]}"; do
+        rpm -q "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+    done
+    if [[ "$target" == build || "$target" == fedora || "$target" == bootc ]] \
+        && ! command -v cargo >/dev/null 2>&1 && ! command -v rustup >/dev/null 2>&1; then
+        missing+=(cargo rust)
+    fi
+    (( ${#missing[@]} )) || return 0
+    log_info "Target prerequisites missing: ${missing[*]}"
+    command -v dnf >/dev/null 2>&1 || die "Target '${target}' needs ${missing[*]} and dnf is unavailable to install them"
+    [[ "$(id -u)" -eq 0 ]] || sudo=(sudo)
+    "${sudo[@]}" dnf install -y "${missing[@]}" \
+        || die "Failed to install prerequisites for target '${target}': ${missing[*]}"
 }
 
 if [[ -n "$WINDOWS_GUIDANCE" ]]; then
@@ -1599,4 +1689,8 @@ for _kv in "${ENV[@]:-}"; do
 done
 
 log_phase "Launching: ${TARGET}${TYPE:+ (--type ${TYPE})}${STAGE:+ (--stage ${STAGE})}"
-exec "${CMD[@]}"
+if [[ "$TARGET" == "_install_core" ]]; then
+    "${CMD[@]}"
+else
+    exec "${CMD[@]}"
+fi

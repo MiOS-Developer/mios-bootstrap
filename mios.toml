@@ -560,7 +560,7 @@ name            = "ghcr.io/mios-dev/mios"
 tag             = "latest"
 local_tag       = "localhost/mios:latest"
 machine_os_repo = "quay.io/podman/machine-os"
-machine_os_tag  = "6.1"
+machine_os_tag  = "6.2"
 machine_os_mirror = "ghcr.io/mios-dev/machine-os"
 
 # ----------------------------------------------------------------------------
@@ -1245,7 +1245,8 @@ volume_label      = "MIOS-DEV"
 # the podman-machine VHDX is bootstrapped from before mios-build-driver
 # bootc-switches it to localhost/mios:latest.
 [bootstrap.dev_vm]
-base_image        = "quay.io/podman/machine-os:6.1"
+base_image        = "quay.io/podman/machine-os:6.2"
+minimum_cpus = 4            # minimum allocation for MiOS hosts, guests and build containers
 
 [bootstrap.dev_vm.host_reserve]
 # Reserve at least half of host memory for Windows while MiOS-DEV builds.

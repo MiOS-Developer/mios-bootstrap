@@ -3,7 +3,7 @@
 # Implements Law 9 (ONE-CANONICAL-NAME) and Task task_239 parity with MiOS-Field.psm1.
 # Folded losslessly with installation/mios-common.sh (Task task_3411).
 
-_MIOS_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+_MIOS_REPO_ROOT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 COMMON_SH="${_MIOS_REPO_ROOT}/installation/mios-common.sh"
 if [[ ! -f "$COMMON_SH" ]]; then
     echo "Shared MiOS-Field backend not found: $COMMON_SH. Preserve the bootstrap repository layout." >&2
@@ -43,14 +43,17 @@ function Show_MiOSFieldMenu() {
 # Media staging and verification are implemented in installation/mios-common.sh.
 
 function Invoke_MiOSFieldInstall() {
-    echo -e "\033[32m[MiOS-Field] Executing verb: install\033[0m"
-    local bootstrap_path="$(dirname "${BASH_SOURCE[0]}")/../../bootstrap.sh"
-    if [[ -f "$bootstrap_path" ]]; then
-        bash "$bootstrap_path" "$@"
-    else
-        echo "bootstrap.sh not found." >&2
+    local installer="${_MIOS_REPO_ROOT}/installation/mios-install.sh" target="fedora"
+    if [[ ! -f "$installer" || "$(readlink -f -- "$installer")" != "$installer" ]]; then
+        echo "Canonical MiOS installer not found inside ${_MIOS_REPO_ROOT}: $installer" >&2
         return 1
     fi
+    if [[ "${INSTALL_MODE:-}" == "bootc" ]]; then
+        target="bootc"
+    elif command -v bootc >/dev/null 2>&1 && bootc status --format=json 2>/dev/null | grep -q '"booted"'; then
+        target="bootc"
+    fi
+    exec bash "$installer" "$target" "$@"
 }
 
 function Invoke_MiOSFieldBuild() {

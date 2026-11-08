@@ -343,7 +343,6 @@ forge_ssh          = 8410    # Forgejo git+ssh (vacated 2222 for host admin sshd
 cockpit            = 8110     # host Cockpit web console
 cockpit_internal   = 9090     # Cockpit internal container listening port (upstream standard 9090; host maps 8110->9090)
 cockpit_link       = 8120    # mios-cockpit-link Podman Desktop discovery shim
-searxng_internal   = 8888     # SearXNG internal container listening port (upstream standard 8888; host maps 8800->8888)
 crawl4ai           = 8810    # local crawl engine -- the crawl4ai FastAPI (crawl4ai over Chrome CDP + Camoufox fallback), the crawl4ai member of the mios-webtools pod. LOOPBACK only (127.0.0.1), NOT a published/LAN port.
 crawl4ai_internal  = 11235   # crawl4ai container internal listening port (upstream default 11235)
 firecrawl          = 8820     # self-hosted firecrawl api -- the firecrawl-api member of the mios-webtools pod (Hermes's native web backend; FIRECRAWL_API_URL). LOOPBACK only (127.0.0.1), NOT a published/LAN port. (3002 is firecrawl's own default; free on MiOS -- 3000=forge_http, 3033=open_webui.)
@@ -398,13 +397,7 @@ piper              = 8179     # mios-piper: Piper streaming TTS engine (audio ba
 # SHRINK-ONLY (gate: check_port_fallbacks), and currently EMPTY -- a new entry
 # needs a reason here, not just a line.
 stale_fallbacks = []
-
-# Allocated ports nothing references yet. SHRINK-ONLY (gate: check_ports_bound).
-# Per-key reasons: TASKS.jsonl task_261. chrome_cdp_worker's only binder is an
-# `Environment=` literal in a shipped .service -- systemd does not expand ${} in
-# Environment=, and the [units] block that WOULD render the placeholder is inert
-# until task_267 makes mios-unit-gen faithful.
-unbound = ["chrome_cdp_worker", "ai_legacy", "field_live_chat"]
+unbound = ["field_live_chat"]
 searxng = 8800     # local privacy-respecting metasearch
 devpod_agent = 8910     # DevPod client agent transport port
 [ports.lan_firewall]

@@ -114,6 +114,11 @@
 !installation/
 !installation/**
 
+# Portable source continuation receipts; runtime state and credentials stay ignored.
+!.devloop/
+!.devloop/handoff/
+!.devloop/handoff/mios-bootstrap-port-parity.md
+
 # Re-ignore noise
 **/__pycache__/
 **/*.pyc

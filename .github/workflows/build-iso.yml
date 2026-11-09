@@ -85,7 +85,7 @@ jobs:
           git -C "$mios" sparse-checkout set --no-cone /tools/native/ /rust-toolchain.toml
           git -C "$mios" checkout
           rc=0
-          out="$(cd "$mios/tools/native" && cargo run -q -p mios-template-conform -- \
+          out="$(cd "$mios/tools/native" && cargo run -q --target x86_64-unknown-linux-gnu -p mios-template-conform -- \
               --llms-txt --root "$GITHUB_WORKSPACE")" || rc=$?
           printf '%s\n' "$out"
           if (( rc == 1 )) && grep -q '^\[llms-txt\] .*: [0-9]* violation' <<<"$out"; then

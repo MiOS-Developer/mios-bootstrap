@@ -1,8 +1,10 @@
 # Source-only fixtures: AST-extracted functions, mocked vendor fetches, scratch writes only.
 # No entry script runs; registry cmdlets are always shadowed.
 [CmdletBinding()]
-param([switch]$PlantDefect)
+param([switch]$PlantDefect, [switch]$SkipWindows)
 $ErrorActionPreference = 'Stop'
+if ($env:OS -ne 'Windows_NT' -and -not $SkipWindows) { throw 'Use -SkipWindows for portable source fixtures; Windows API and command-parser checks will remain UNRUN.' }
+Write-Host 'SOURCE_FIXTURE_UNRUN LIVE_REGISTRY LIVE_ELEVATION LIVE_FETCH OEM_LIVE_ACL_WRITE'
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $realLib = Join-Path $repoRoot 'field/autounattend/MiOS-Provision.lib.ps1'
 $realProvision = Join-Path $repoRoot 'field/autounattend/Invoke-MiOSProvision.ps1'
@@ -192,7 +194,8 @@ function New-GuardProbe([string]$Command, [string]$Value, [string]$Marker, [stri
     return $Command.Replace('-Command "', '-Command "' + $prelude).Replace($oemKey, $FixtureKey)
 }
 
-function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNative) {
+function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNative, [switch]$SkipWindows) {
+    if ($SkipWindows) { $SkipNative = $true }
     $script:fail = 0; $script:checks = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
     $libAst = Import-MiosFunctions $LibPath @('Find-MiosTomlMultilineEnd', 'ConvertFrom-MiosTomlFile', 'Get-MiOSVendorBytes', 'Invoke-MiOSVendorFetch',
         'Get-MiOSVendorSource', 'Resolve-MiOSVendorCommit', 'Get-MiOSOemLogoTargetGap', 'Assert-MiOSOemLogoBitmap', 'Install-MiOSOemLogo',
@@ -362,12 +365,14 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     $w = $null
     $linked = Install-MiOSOemLogo -Toml (New-View) -Fetch $script:fetch -DestinationPath (Join-Path $linkDirectory 'mios-logo.bmp') -WarningVariable w -WarningAction SilentlyContinue
     Check ($null -eq $linked -and (@($w) -join ' ').Contains('link or not a directory') -and @(Get-ChildItem -LiteralPath $realDirectory -Force).Count -eq 0) 'staging refuses a reparse-point ancestor without writing through it'
-    Check ((Invoke-AclFixture (New-AclFixture)) -ceq '') 'the ACL policy permits system-owned paths with Users read access'
-    Check ((Invoke-AclFixture (New-AclFixture -Owner 'S-1-5-32-545')).Contains('untrusted owner')) 'the ACL policy refuses a Users-owned destination'
-    Check ((Invoke-AclFixture (New-AclFixture -Rights ([Security.AccessControl.FileSystemRights]::Modify))).Contains('write access')) 'the ACL policy refuses a destination writable by Users'
-    Check ((Invoke-AclFixture (New-AclFixture -Rights ([Security.AccessControl.FileSystemRights]::Write) -InheritOnly)) -ceq '') 'an inherit-only ACE does not falsely describe current directory write access'
-    Check ((Invoke-AclFixture (New-AclFixture -Rights ([Security.AccessControl.FileSystemRights]::AppendData)) -VolumeRoot) -ceq '') 'the volume-root policy permits creating sibling directories'
-    Check ((Invoke-AclFixture (New-AclFixture -Rights ([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles)) -VolumeRoot).Contains('write access')) 'the volume-root policy refuses deleting existing children'
+    if (-not $SkipWindows) {
+        Check ((Invoke-AclFixture (New-AclFixture)) -ceq '') 'the ACL policy permits system-owned paths with Users read access'
+        Check ((Invoke-AclFixture (New-AclFixture -Owner 'S-1-5-32-545')).Contains('untrusted owner')) 'the ACL policy refuses a Users-owned destination'
+        Check ((Invoke-AclFixture (New-AclFixture -Rights ([Security.AccessControl.FileSystemRights]::Modify))).Contains('write access')) 'the ACL policy refuses a destination writable by Users'
+        Check ((Invoke-AclFixture (New-AclFixture -Rights ([Security.AccessControl.FileSystemRights]::Write) -InheritOnly)) -ceq '') 'an inherit-only ACE does not falsely describe current directory write access'
+        Check ((Invoke-AclFixture (New-AclFixture -Rights ([Security.AccessControl.FileSystemRights]::AppendData)) -VolumeRoot) -ceq '') 'the volume-root policy permits creating sibling directories'
+        Check ((Invoke-AclFixture (New-AclFixture -Rights ([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles)) -VolumeRoot).Contains('write access')) 'the volume-root policy refuses deleting existing children'
+    } else { Write-Host 'SOURCE_FIXTURE_UNRUN WINDOWS_ACL_API 6' }
     $stageAst = @($libAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Install-MiOSOemLogo' }, $true))[0]
     $stageText = $stageAst.Extent.Text
     Check ($stageText.Contains('ConvertFrom-MiosTomlFile -ContentBytes $vendorBytes -ProjectedCredentials') -and -not $stageText.Contains('mios-vendor-')) 'vendor parsing consumes fetched bytes without a shared temporary path'
@@ -479,7 +484,7 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
             & $env:ComSpec /d /s /c $probe *> $null
         }
         Check ([IO.File]::Exists($marker) -and [IO.File]::ReadAllText($marker) -ceq ($fixtureKey + '|Logo')) 'bake path: the FirstLogon cmd chain delivers the guard intact'
-    }
+    } else { Write-Host 'SOURCE_FIXTURE_UNRUN WINDOWS_COMMAND_PARSERS 4' }
 
     # --- Entry wiring (AST only; the entry scripts are never run) ----------------------
     $tokens = $null; $errors = $null
@@ -504,18 +509,21 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     $fetcher = @($libAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-MiOSVendorBytes' }, $true))[0].Extent.Text
     Check ($fetcher.Contains('Invoke-WebRequest') -and $fetcher.Contains('-UseBasicParsing') -and $fetcher.Contains('[Net.SecurityProtocolType]::Tls12')) 'the default fetcher is Invoke-WebRequest -UseBasicParsing over TLS 1.2'
 
+    Write-Host ('SOURCE_FIXTURE_SCOPE ' + $(if ($SkipWindows) { 'portable' } else { 'windows' }))
     Write-Host "SOURCE_FIXTURE_ASSERTIONS $($script:checks)"
     return $script:fail
 }
 
 try {
     if (-not $PlantDefect) {
-        $failures = Invoke-Checks $realLib $realProvision
+        $failures = Invoke-Checks $realLib $realProvision -SkipWindows:$SkipWindows
         if ($failures) { Write-Host "RESULT: FAIL ($failures checks)"; exit 1 }
-        Write-Host 'RESULT: PASS (source fixtures; fetches mocked, scratch writes only, registry cmdlets shadowed)'; exit 0
+        if ($SkipWindows) { Write-Host 'RESULT: PASS (portable source fixtures; Windows ACL APIs and command parsers UNRUN)' }
+        else { Write-Host 'RESULT: PASS (source fixtures; fetches mocked, scratch writes only, registry cmdlets shadowed)' }
+        exit 0
     }
     # A planted defect is meaningful only after the complete, unmodified baseline passes.
-    $baseline = Invoke-Checks $realLib $realProvision
+    $baseline = Invoke-Checks $realLib $realProvision -SkipWindows:$SkipWindows
     if ($baseline) { Write-Host 'SOURCE_DEFECT_BASELINE_FAILED'; exit 1 }
     $plants = @(
         @{ Name = 'sha256 check removed'; File = 'lib'; Expected = 'refuses a sidecar sha256 that does not match the bitmap'; From = 'if ($actual -cne [string]$sidecar.sha256)'; To = 'if ($false)' },
@@ -541,10 +549,16 @@ try {
         @{ Name = 'receipt byte verification removed'; File = 'lib'; Expected = 'a receipt is invalid if the staged bytes change'; From = '(Get-MiOSSha256Hex -Bytes $bytes) -ceq $receipt.Sha256'; To = '$true' },
         @{ Name = 'receipt reset dropped'; File = 'lib'; Expected = 'a disabled staging attempt invalidates the previous receipt'; From = '    $script:MiOSOemLogoReceipt = $null'; To = '    # receipt reset omitted' },
         @{ Name = 'ancestor link check removed'; File = 'lib'; Expected = 'staging refuses a reparse-point ancestor without writing through it'; From = '($attributes -band [IO.FileAttributes]::ReparsePoint) -or -not ($attributes -band [IO.FileAttributes]::Directory)'; To = '$false' },
-        @{ Name = 'ACL write check removed'; File = 'lib'; Expected = 'the ACL policy refuses a destination writable by Users'; From = '($rule.FileSystemRights -band $writeMask)'; To = '$false' },
+        @{ Name = 'ACL write check removed'; WindowsOnly = $true; File = 'lib'; Expected = 'the ACL policy refuses a destination writable by Users'; From = '($rule.FileSystemRights -band $writeMask)'; To = '$false' },
         @{ Name = 'missing effective colour mislabeled'; File = 'lib'; Expected = 'names a missing effective required colour instead of claiming an override'; From = 'if (-not $hostBg)'; To = 'if ($false)' },
         @{ Name = 'live entry drops evidence'; File = 'provision'; Expected = 'live apply passes Install-MiOSOemLogo evidence to New-MiOSProvisionCommands'; From = 'New-MiOSProvisionCommands -Toml $toml -OemLogo $oemLogo'; To = 'New-MiOSProvisionCommands -Toml $toml' }
     )
+    $excludedPlants = 0
+    if ($SkipWindows) {
+        $excluded = @($plants | Where-Object { $_.WindowsOnly }); $excludedPlants = $excluded.Count
+        foreach ($plant in $excluded) { Write-Host ('SOURCE_DEFECT_UNRUN WINDOWS_ACL_API: ' + $plant.Name) }
+        $plants = @($plants | Where-Object { -not $_.WindowsOnly })
+    }
     $caught = 0; $index = 0
     foreach ($plant in $plants) {
         $index++
@@ -557,12 +571,16 @@ try {
         $lib = $realLib; $prov = $realProvision
         if ($plant.File -eq 'lib') { $lib = $copy } else { $prov = $copy }
         Write-Host "PLANT $index/$($plants.Count): $($plant.Name)"
-        $null = Invoke-Checks $lib $prov -SkipNative
+        $null = Invoke-Checks $lib $prov -SkipNative -SkipWindows:$SkipWindows
         $detected = $script:failedChecks.Contains($plant.Expected)
         Write-Host ("PLANT_RESULT {0}: {1}" -f $plant.Name, $(if ($detected) { 'caught' } else { 'MISSED' }))
         if ($detected) { $caught++ }
     }
-    if ($caught -eq $plants.Count) { Write-Host "RESULT: PASS (every planted defect was caught: $caught/$($plants.Count))"; exit 0 }
+    if ($caught -eq $plants.Count) {
+        if ($SkipWindows) { Write-Host "RESULT: PASS (portable planted defects caught: $caught/$($plants.Count); Windows-only plants UNRUN: $excludedPlants)" }
+        else { Write-Host "RESULT: PASS (every planted defect was caught: $caught/$($plants.Count))" }
+        exit 0
+    }
     Write-Host "RESULT: FAIL (planted defects caught: $caught/$($plants.Count))"; exit 1
 } finally {
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction Stop

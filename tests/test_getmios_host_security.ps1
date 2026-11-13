@@ -64,6 +64,8 @@ password = ''
 '@
 $grammar = @(
     'identity."default_password" = "FIXTURE-SECRET-G"',
+    'identity.default_password.value = "FIXTURE-SECRET-G"',
+    'identity = { default_password.value = "FIXTURE-SECRET-G" }',
     '"identity" . ''default_password'' = "FIXTURE-SECRET-G"',
     'identity = { "default_password" = "FIXTURE-SECRET-G", username = "fixture" }',
     @'
@@ -180,6 +182,7 @@ function Invoke-Checks([string]$Path) {
     }
     $unsupported = '[identity]' + "`n" + '"default\u005fpassword" = "FIXTURE-SECRET-ESCAPED"'
     Expect-Throw { ConvertTo-MiosCredentialFreeToml $unsupported } 'unsupported escaped keys fail closed'
+    Expect-Throw { ConvertTo-MiosCredentialFreeToml ('[identity.default_password]' + "`n" + 'value = "FIXTURE-SECRET-TABLE"') } 'credential namespaces represented as tables fail closed'
     Expect-Throw { ConvertTo-MiosCredentialFreeToml ('[identity]' + "`n" + 'default_password = "unterminated') } 'unterminated strings fail closed'
     $hostTier = Join-Path (Join-Path (Join-Path $scratch 'etc') 'mios') 'mios.toml'
     Write-MiosHostToml -Path $hostTier -Text $fixture

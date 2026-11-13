@@ -606,7 +606,7 @@ function Get-MiosTomlAssignments {
             while ($true) {
                 $key = Read-MiosTomlKey
                 $name = $Prefix + '.' + ($key -join '.')
-                if ($key[-1] -match $Script:MiosCredentialKeyRe) { $state.Names.Add($name) }
+                if (@($key | Where-Object { $_ -match $Script:MiosCredentialKeyRe }).Count) { $state.Names.Add($name) }
                 if ($state.Pos -ge $state.Length -or $state.Text[$state.Pos] -ne '=') { Stop-MiosTomlRead }
                 $state.Pos++; Skip-MiosTomlSpace $false
                 Read-MiosTomlValue $name ($Depth + 1)
@@ -632,6 +632,9 @@ function Get-MiosTomlAssignments {
             $state.Pos++; $array = $state.Pos -lt $state.Length -and $state.Text[$state.Pos] -eq '['
             if ($array) { $state.Pos++ }
             $section = Read-MiosTomlKey
+            if (@($section | Where-Object { $_ -match $Script:MiosCredentialKeyRe }).Count) {
+                throw 'A credential field cannot be projected as a TOML table; no public write was made.'
+            }
             if ($state.Pos -ge $state.Length -or $state.Text[$state.Pos] -ne ']') { Stop-MiosTomlRead }
             $state.Pos++
             if ($array) {
@@ -643,7 +646,7 @@ function Get-MiosTomlAssignments {
             $key = Read-MiosTomlKey
             $name = (@($section) + @($key)) -join '.'
             $state.Names = New-Object System.Collections.Generic.List[string]
-            if ($key[-1] -match $Script:MiosCredentialKeyRe) { $state.Names.Add($name) }
+            if (@($key | Where-Object { $_ -match $Script:MiosCredentialKeyRe }).Count) { $state.Names.Add($name) }
             if ($state.Pos -ge $state.Length -or $state.Text[$state.Pos] -ne '=') { Stop-MiosTomlRead }
             $state.Pos++; Skip-MiosTomlSpace $false
             $valueStart = $state.Pos

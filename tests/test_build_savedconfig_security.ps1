@@ -12,6 +12,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('mios-build-user-config-' + [guid]::NewGuid().ToString('N'))
 $originalProfile = $env:USERPROFILE
 $originalSystemDrive = $env:SystemDrive
+$originalLocalAppData = $env:LOCALAPPDATA
 $script:failed = 0
 $helperNames = @('Assert-MiosNoReparsePath', 'Set-MiosPrivateUserTomlAcl', 'Import-MiosUserToml',
                  'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder')
@@ -77,6 +78,27 @@ function Get-GeneratedEntrypoints {
     $buildAst = Read-SourceAst (Join-Path $repoRoot 'build-mios.ps1')
     $getPath = Join-Path $repoRoot 'Get-MiOS.ps1'
     $getAst = Read-SourceAst $getPath
+    # The profile renderer resolves these roots before expanding its here-string.
+    # Use the same pure root helper with an explicit private operator known folder;
+    # never let absent generator bindings become empty Join-Path arguments.
+    $runtimeRoot = @($getAst.FindAll({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-MiosWindowsInstallRoot'
+    }, $true))
+    if ($runtimeRoot.Count -ne 1) { throw 'The canonical operator runtime root helper is missing.' }
+    . ([scriptblock]::Create($runtimeRoot[0].Extent.Text))
+    $fixtureOperator = Join-Path $scratch "operator's profile"
+    $script:fixtureLocalAppData = Join-Path $fixtureOperator 'AppData\Local'
+    $fixtureInstallRoot = Get-MiosWindowsInstallRoot -Elevated $false -LocalAppData $script:fixtureLocalAppData -SystemDrive $fixtureOperator
+    $fixtureRepoRoot = Join-Path $fixtureInstallRoot 'repo'
+    foreach ($path in @($fixtureOperator, $script:fixtureLocalAppData, $fixtureInstallRoot, $fixtureRepoRoot)) {
+        if (-not ([IO.Path]::GetFullPath($path)).StartsWith(([IO.Path]::GetFullPath($scratch) + [IO.Path]::DirectorySeparatorChar), [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Generated profile roots escaped the private fixture directory.'
+        }
+        $null = New-Item -ItemType Directory -Path $path -Force
+    }
+    $safeInstallRoot = $fixtureInstallRoot.Replace("'", "''")
+    $safeOperatorRepoRoot = $fixtureRepoRoot.Replace("'", "''")
     $export = @($buildAst.FindAll({ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
         $node.Name -eq 'Get-MiosUserTomlHelperSource'
@@ -209,6 +231,7 @@ function Get-GeneratedEntrypoints {
 function Invoke-PromotionFixture([string]$Name, [string]$Program, [string]$Failure = '') {
     $script:caseRoot = Join-Path $scratch ([guid]::NewGuid().ToString('N'))
     $env:USERPROFILE = $script:caseRoot
+    $env:LOCALAPPDATA = $script:fixtureLocalAppData
     # Generated Windows paths stay inside this fixture on every Native platform.
     $env:SystemDrive = $script:caseRoot
     $downloads = Join-Path $script:caseRoot 'Downloads'
@@ -479,5 +502,6 @@ function Update-MiosWindowsBuildCheckout {
 } finally {
     $env:USERPROFILE = $originalProfile
     $env:SystemDrive = $originalSystemDrive
+    $env:LOCALAPPDATA = $originalLocalAppData
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 }

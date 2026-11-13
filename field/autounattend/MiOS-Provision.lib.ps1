@@ -1,6 +1,6 @@
 # AI-hint: Shared MiOS install-time provisioning library (SSOT reader + hostname/account/branding/theme/layout/preferences emitters) dot-sourced by BOTH the MiOS-XBOX.iso path (ConvertTo-MiOSPreset.ps1 -> autounattend reg) AND the irm|iex / existing-Windows path (Invoke-MiOSProvision.ps1 -> live apply). One source => the two install paths stay in feature parity.
 # AI-related: mios-bootstrap, Get-MiOS.ps1, ConvertTo-MiOSPreset.ps1, Invoke-MiOSProvision.ps1, New-MiOSAutounattend.ps1
-# AI-functions: Read-MiosToml, ConvertFrom-MiosTomlFile, Merge-MiosTomlLayer, Resolve-MiOSCredentials, Write-MiOSPrivateText, Install-MiOSLivingWallpaperAssets, Get-Toml, Get-MiOSHostname, Get-MiOSAccounts, ConvertTo-PwPair, ConvertTo-AccentDword, New-MiOSGlobalPrefCommands, New-MiOSBrandingCommands, New-MiOSLinuxLayoutCommands, New-MiOSProvisionCommands, Invoke-MiOSHostCommands
+# AI-functions: Read-MiosToml, ConvertFrom-MiosTomlFile, Merge-MiosTomlLayer, Resolve-MiOSCredentials, Write-MiOSPrivateText, Install-MiOSLivingWallpaperAssets, Resolve-MiOSVendorCommit, Install-MiOSOemLogo, New-MiOSOemLogoCommands, Get-Toml, Get-MiOSHostname, Get-MiOSAccounts, ConvertTo-PwPair, ConvertTo-AccentDword, New-MiOSGlobalPrefCommands, New-MiOSBrandingCommands, New-MiOSLinuxLayoutCommands, New-MiOSProvisionCommands, Invoke-MiOSHostCommands
 #Requires -Version 5.1
 # =============================================================================
 # MiOS-Provision.lib.ps1 -- UNIFIED provisioning core.
@@ -95,12 +95,20 @@ function Find-MiosTomlMultilineEnd {
     return $null
 }
 function ConvertFrom-MiosTomlFile {
-    param([string]$Path, [switch]$ProjectedCredentials)
+    param([string]$Path, [switch]$ProjectedCredentials, [byte[]]$ContentBytes)
     $r = New-MiosTomlView
-    if ($Path -and -not [IO.Path]::IsPathRooted($Path)) { $Path = Join-Path (Get-Location).ProviderPath $Path }
-    if (-not $Path -or -not [IO.File]::Exists($Path)) { return $r }
+    if ($PSBoundParameters.ContainsKey('ContentBytes')) {
+        # Parse fetched vendor bytes without exposing them through a shared temporary path.
+        $content = [Text.UTF8Encoding]::new($false, $true).GetString($ContentBytes)
+        if ($content.StartsWith([string][char]0xFEFF)) { $content = $content.Substring(1) }
+        $lines = [regex]::Split($content, '\r\n|\n|\r')
+    } else {
+        if ($Path -and -not [IO.Path]::IsPathRooted($Path)) { $Path = Join-Path (Get-Location).ProviderPath $Path }
+        if (-not $Path -or -not [IO.File]::Exists($Path)) { return $r }
+        $lines = [IO.File]::ReadAllLines([IO.Path]::GetFullPath($Path), [Text.UTF8Encoding]::new($false, $true))
+    }
     $section = ''; $cur = $null; $multiDelimiter = $null; $multiKey = ''; $multiDiscard = $false; $multiText = [Text.StringBuilder]::new()
-    foreach ($raw in [IO.File]::ReadAllLines([IO.Path]::GetFullPath($Path), [Text.UTF8Encoding]::new($false, $true))) {
+    foreach ($raw in $lines) {
         if ($multiDelimiter) {
             $close = Find-MiosTomlMultilineEnd -Text $raw -Delimiter $multiDelimiter -Key $multiKey
             if ($null -eq $close) { [void]$multiText.AppendLine($raw); continue }
@@ -777,11 +785,279 @@ function Install-MiOSLivingWallpaperAssets {
     
 }
 
+function Get-MiOSSha256Hex {
+    param([byte[]]$Bytes)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+function Get-MiOSVendorBytes {
+    # Default vendor fetcher: one HTTPS GET over TLS 1.2 returning the exact response bytes.
+    param([string]$Uri, [hashtable]$Headers = @{})
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -UserAgent 'mios-bootstrap' -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+    $bytes = $response.RawContentStream.ToArray()
+    return ,$bytes
+}
+function Invoke-MiOSVendorFetch {
+    # Runs the injectable fetcher (default Get-MiOSVendorBytes); only a non-empty byte array is accepted.
+    param([scriptblock]$Fetch, [string]$Uri, [hashtable]$Headers = @{})
+    if (-not $Fetch) { $Fetch = ${function:Get-MiOSVendorBytes} }
+    try { $data = & $Fetch $Uri $Headers } catch { throw "fetch failed for $Uri ($($_.Exception.Message))" }
+    if ($data -isnot [byte[]] -or $data.Length -eq 0) { throw "fetch returned no bytes for $Uri" }
+    return ,$data
+}
+function Get-MiOSVendorSource {
+    # API/raw bases and ref from [bootstrap].mios_repo and mios_ref, the same keys build-mios.ps1 reads.
+    param($Toml)
+    if ($null -eq $Toml) { $Toml = New-MiosTomlView }
+    $repo = Get-Toml $Toml 'bootstrap.mios_repo' 'https://github.com/mios-dev/MiOS.git'
+    if ($repo -cnotmatch '^https://github\.com/(?<owner>[A-Za-z0-9][A-Za-z0-9-]*)/(?<name>[A-Za-z0-9_][A-Za-z0-9._-]*?)(?:\.git)?/?$') { throw "MiOS vendor: bootstrap.mios_repo '$repo' is not a github.com repository URL" }
+    $slug = $Matches['owner'] + '/' + $Matches['name']
+    return @{ Api = 'https://api.github.com/repos/' + $slug; Raw = 'https://raw.githubusercontent.com/' + $slug; Ref = (Get-Toml $Toml 'bootstrap.mios_ref' 'main') }
+}
+function Resolve-MiOSVendorCommit {
+    # Resolves the vendor ref (default main) to one concrete 40-hex commit, or throws.
+    [CmdletBinding()]
+    param($Toml, [scriptblock]$Fetch)
+    $source = Get-MiOSVendorSource -Toml $Toml
+    $ref = $source.Ref
+    if ($ref -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._/-]*$' -or $ref.Contains('..') -or $ref.Contains('//')) { throw "MiOS vendor: ref '$ref' is not a plain git ref" }
+    $body = Invoke-MiOSVendorFetch -Fetch $Fetch -Uri ($source.Api + '/commits/' + $ref) -Headers @{ Accept = 'application/vnd.github.sha' }
+    $sha = [Text.Encoding]::ASCII.GetString($body).Trim()
+    if ($sha -cnotmatch '^[0-9a-f]{40}$') { throw "MiOS vendor: ref '$ref' did not resolve to a 40-hex commit" }
+    return $sha
+}
+function Get-MiOSOemLogoPath {
+    param($Toml)
+    return (Get-Toml $Toml 'branding.oem_logo' 'C:\Windows\Web\MiOS\mios-logo.bmp')
+}
+function Get-MiOSOemLogoSystemRoot {
+    # Match the image renderer: system_root is image-relative; absolute Logo values use the C: image drive.
+    param($Toml, $Vendor)
+    $root = Get-Toml $Toml 'windows.xbox.identity.system_root'
+    if (-not $root -and $null -ne $Vendor) { $root = Get-Toml $Vendor 'windows.xbox.identity.system_root' }
+    if (-not $root -and $null -eq $Vendor) {
+        # Preliminary syntax checks precede the fetch; the pinned vendor supplies the authoritative root afterward.
+        $logo = Get-MiOSOemLogoPath -Toml $Toml
+        if ($logo -match '^(?i)C:\\(?<root>[^\\]+)\\') { $root = $Matches['root'] }
+    }
+    if (-not $root -or $root -match '[\\/:*?"<>|%\x00-\x1f\x7f]') { throw "system_root '$root' is not a declared image-relative Windows directory" }
+    return 'C:' + [char]92 + $root
+}
+function Get-MiOSOemLogoTargetGap {
+    # The Logo belongs below the declared image system root, with at least one subdirectory.
+    param([string]$Path, $Toml, $Vendor)
+    try { $root = Get-MiOSOemLogoSystemRoot -Toml $Toml -Vendor $Vendor } catch { return $_.Exception.Message }
+    $prefix = $root + '\'
+    if ($Path.Length -gt 256 -or -not $Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
+        $Path.Substring($prefix.Length) -notmatch '^[^\\]+\\.+\.bmp$') { return "target '$Path' is not below declared system_root '$root' with a folder and .bmp leaf (at most 256 characters)" }
+    if ($Path.Substring(3) -match '[/:*?"<>|%!\x00-\x1f\x7f]') { return "target '$Path' has a character a Windows path or cmd command cannot carry" }
+    if (@($Path.Split('\') | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' -or $_ -match '[. ]$' -or $_ -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)' }).Count) { return "target '$Path' has an empty, '.', '..' segment or a Windows-aliased segment" }
+    return ''
+}
+function Assert-MiOSOemLogoAcl {
+    param([string]$Path, [switch]$VolumeRoot)
+    $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trusted) { throw "destination '$Path' has an untrusted owner" }
+    $writeMask = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete -bor
+        [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
+    # A volume root may permit creating sibling directories; it must not permit rewriting existing children.
+    if ($VolumeRoot) { $writeMask = $writeMask -band (-bnot [Security.AccessControl.FileSystemRights]::AppendData) }
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+            -not ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and
+            ($rule.FileSystemRights -band $writeMask) -and $rule.IdentityReference.Value -notin $trusted) { throw "destination '$Path' grants write access outside system principals" }
+    }
+}
+function Assert-MiOSOemLogoWritePath {
+    # Reject every link ancestor. Live paths must also be owned and writable only by system principals.
+    # Create missing directories one level at a time after checking their existing parent.
+    param([string]$Path, [switch]$Fixture)
+    $full = [IO.Path]::GetFullPath($Path)
+    $chain = [Collections.Generic.List[string]]::new()
+    $cursor = [IO.Path]::GetDirectoryName($full)
+    while ($cursor) { $chain.Insert(0, $cursor); $parent = [IO.Path]::GetDirectoryName($cursor); if ($parent -eq $cursor) { break }; $cursor = $parent }
+    foreach ($dir in $chain) {
+        try { $attributes = [IO.File]::GetAttributes($dir) }
+        catch [IO.FileNotFoundException] { [void][IO.Directory]::CreateDirectory($dir); $attributes = [IO.File]::GetAttributes($dir) }
+        catch [IO.DirectoryNotFoundException] { [void][IO.Directory]::CreateDirectory($dir); $attributes = [IO.File]::GetAttributes($dir) }
+        if (($attributes -band [IO.FileAttributes]::ReparsePoint) -or -not ($attributes -band [IO.FileAttributes]::Directory)) { throw "destination ancestor '$dir' is a link or not a directory" }
+        if (-not $Fixture) { Assert-MiOSOemLogoAcl -Path $dir -VolumeRoot:($dir -eq [IO.Path]::GetPathRoot($full)) }
+    }
+    try {
+        $attributes = [IO.File]::GetAttributes($full)
+        if (($attributes -band [IO.FileAttributes]::ReparsePoint) -or ($attributes -band [IO.FileAttributes]::Directory)) { throw "destination '$full' is a directory or link" }
+        if (-not $Fixture) { Assert-MiOSOemLogoAcl -Path $full }
+    } catch [IO.FileNotFoundException] { } catch [IO.DirectoryNotFoundException] { }
+}
+function Set-MiOSOemLogoStreamAcl {
+    # Set the ACL through the exclusive open handle before writing. Consumers retain read access.
+    param([IO.FileStream]$Stream)
+    $acl = [Security.AccessControl.FileSecurity]::new(); $acl.SetAccessRuleProtection($true, $false)
+    $admin = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'); $acl.SetOwner($admin)
+    foreach ($sid in @($admin, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
+    }
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'), [Security.AccessControl.FileSystemRights]::ReadAndExecute, [Security.AccessControl.AccessControlType]::Allow))
+    if ($Stream.PSObject.Methods.Name -contains 'SetAccessControl') { $Stream.SetAccessControl($acl) }
+    else { [IO.FileSystemAclExtensions]::SetAccessControl($Stream, $acl) }
+}
+function Get-MiOSOemLogoBinding {
+    # Length-prefixed fields bind an in-process receipt to the effective inputs used when staging.
+    param($Toml, [string]$BackgroundKey)
+    $parts = foreach ($key in @('branding.oem_logo', 'windows.xbox.identity.system_root', 'windows.xbox.identity.background_color_ref', 'windows.xbox.identity.oem_logo_ref', 'bootstrap.mios_repo', 'bootstrap.mios_ref', $BackgroundKey)) {
+        $value = [string](Get-Toml $Toml $key); [string]$value.Length + ':' + $value
+    }
+    return Get-MiOSSha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes(($parts -join '|')))
+}
+function Test-MiOSOemLogoEvidence {
+    # A serialized/forged object is never staging evidence. A new staging attempt invalidates the previous receipt.
+    param($Toml, $OemLogo)
+    $receipt = Get-Variable -Name MiOSOemLogoReceipt -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -eq $OemLogo -or $null -eq $receipt -or $receipt.Fixture -or -not [object]::ReferenceEquals($receipt.Evidence, $OemLogo)) { return $false }
+    $logo = Get-MiOSOemLogoPath -Toml $Toml
+    $bound = $receipt.Binding -ceq (Get-MiOSOemLogoBinding -Toml $Toml -BackgroundKey $receipt.BackgroundKey) -and
+        [string]$OemLogo.Sha256 -ceq $receipt.Sha256 -and [string]$OemLogo.Commit -ceq $receipt.Commit -and $OemLogo.Size -eq $receipt.Size -and
+        [string]$OemLogo.Sha256 -cmatch '^[0-9a-f]{64}$' -and [string]$OemLogo.Commit -cmatch '^[0-9a-f]{40}$' -and
+        [string]::Equals([string]$OemLogo.Path, $logo, [StringComparison]::OrdinalIgnoreCase) -and
+        [string]::Equals([string]$OemLogo.Path, $receipt.Path, [StringComparison]::OrdinalIgnoreCase) -and
+        -not (Get-MiOSOemLogoTargetGap -Path $logo -Toml $Toml -Vendor $receipt.Vendor)
+    if (-not $bound) { return $false }
+    try {
+        $bytes = [IO.File]::ReadAllBytes($receipt.FilePath)
+        return $bytes.Length -eq $receipt.Size -and (Get-MiOSSha256Hex -Bytes $bytes) -ceq $receipt.Sha256
+    } catch { return $false }
+}
+function Assert-MiOSOemLogoBitmap {
+    # OEMInformation Logo: BM + BITMAPINFOHEADER, one plane, 32 bpp BI_RGB, square, 1..120 px. Returns px.
+    param([byte[]]$Bytes)
+    if ($Bytes.Length -lt 54 -or $Bytes[0] -ne 0x42 -or $Bytes[1] -ne 0x4D) { throw 'bitmap header: not a BM file' }
+    if ([BitConverter]::ToUInt32($Bytes, 2) -ne $Bytes.Length -or [BitConverter]::ToUInt32($Bytes, 10) -ne 54) { throw 'bitmap header: file size or pixel offset is wrong' }
+    if ([BitConverter]::ToUInt32($Bytes, 14) -ne 40) { throw 'bitmap header: not a 40-byte BITMAPINFOHEADER' }
+    if ([BitConverter]::ToUInt16($Bytes, 26) -ne 1) { throw 'bitmap header: not one plane' }
+    if ([BitConverter]::ToUInt16($Bytes, 28) -ne 32) { throw 'bitmap header: not 32 bits per pixel' }
+    if ([BitConverter]::ToUInt32($Bytes, 30) -ne 0) { throw 'bitmap header: not BI_RGB' }
+    $w = [BitConverter]::ToInt32($Bytes, 18); $h = [BitConverter]::ToInt32($Bytes, 22)
+    if ($w -ne $h) { throw "bitmap header: $w x $h is not square" }
+    if ($w -lt 1 -or $w -gt 120) { throw "bitmap header: $w px is outside 1..120" }
+    if ($Bytes.Length -ne 54 + $w * $h * 4) { throw 'bitmap header: pixel data length does not match the dimensions' }
+    return $w
+}
+function Install-MiOSOemLogo {
+    # Explicit elevated live apply: stages the vendor OEM logo from one resolved MiOS commit.
+    # Returns evidence only after full verification; else warns and returns $null.
+    [CmdletBinding()]
+    param($Toml, [scriptblock]$Fetch, [string]$Commit, [string]$DestinationPath)
+    $script:MiOSOemLogoReceipt = $null
+    if ((Get-Toml $Toml 'branding.windows.enable' 'true') -notmatch '^(?i:true|1|yes)$') { return $null }
+    $tmp = $null; $backup = $null; $keepBackup = $false
+    try {
+        $target = Get-MiOSOemLogoPath -Toml $Toml
+        $gap = Get-MiOSOemLogoTargetGap -Path $target -Toml $Toml
+        if ($gap) { throw $gap }
+        $dest = $target
+        if ($DestinationPath) {
+            $dest = [IO.Path]::GetFullPath($DestinationPath)
+            if ([string]::Equals($dest, $target, [StringComparison]::OrdinalIgnoreCase)) { throw 'fixture destination cannot be the configured live Logo path' }
+        }
+        elseif ($env:OS -ne 'Windows_NT' -or -not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'live staging requires an elevated Windows session' }
+        $source = Get-MiOSVendorSource -Toml $Toml
+        if (-not $Commit) { $Commit = Resolve-MiOSVendorCommit -Toml $Toml -Fetch $Fetch }
+        if ($Commit -cnotmatch '^[0-9a-f]{40}$') { throw "commit '$Commit' is not a concrete 40-hex sha" }
+        $base = $source.Raw + '/' + $Commit + '/'
+        $vendorBytes = Invoke-MiOSVendorFetch -Fetch $Fetch -Uri ($base + 'usr/share/mios/mios.toml')
+        # Projected mode skips credential planes, which this read never uses. No shared temp file is opened.
+        $vendor = ConvertFrom-MiosTomlFile -ContentBytes $vendorBytes -ProjectedCredentials
+        $gap = Get-MiOSOemLogoTargetGap -Path $target -Toml $Toml -Vendor $vendor
+        if ($gap) { throw $gap }
+        $logoKey = Get-Toml $vendor 'windows.xbox.identity.oem_logo_ref'
+        if ($logoKey -cne 'branding.oem_logo') { throw "vendor oem_logo_ref '$logoKey' is not branding.oem_logo" }
+        $hostLogoKey = Get-Toml $Toml 'windows.xbox.identity.oem_logo_ref' $logoKey
+        if ($hostLogoKey -cne $logoKey) { throw 'effective oem_logo_ref differs from the vendor branding binding' }
+        $rel = Get-Toml $vendor 'windows.xbox.identity.oem_logo_projection'
+        $parts = $rel.Split('/')
+        if ($rel -cnotmatch '^[A-Za-z0-9._/-]+\.bmp$' -or $rel.StartsWith('/') -or @($parts | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' }).Count) { throw "vendor oem_logo_projection '$rel' is not a tree-relative .bmp path" }
+        $leaf = $parts[-1]
+        $bgKey = Get-Toml $vendor 'windows.xbox.identity.background_color_ref'
+        if ($bgKey -cnotmatch '^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$') { throw "vendor background_color_ref '$bgKey' is not a dotted SSOT key" }
+        $bmp = Invoke-MiOSVendorFetch -Fetch $Fetch -Uri ($base + $rel)
+        $sidecarBytes = Invoke-MiOSVendorFetch -Fetch $Fetch -Uri ($base + $rel + '.json')
+        try { $sidecar = [Text.UTF8Encoding]::new($false, $true).GetString($sidecarBytes) | ConvertFrom-Json -ErrorAction Stop }
+        catch { throw 'sidecar is not UTF-8 JSON' }
+        if ($sidecar -isnot [Management.Automation.PSCustomObject]) { throw 'sidecar is not a JSON object' }
+        if ($sidecar.schema -cne 'mios-oem-logo/1') { throw "sidecar schema '$($sidecar.schema)' is not mios-oem-logo/1" }
+        if ($sidecar.file -cne $leaf) { throw "sidecar file '$($sidecar.file)' is not the projection leaf '$leaf'" }
+        if (($sidecar.size -isnot [int] -and $sidecar.size -isnot [long]) -or $sidecar.size -ne $bmp.Length) { throw "sidecar size '$($sidecar.size)' does not match the $($bmp.Length)-byte bitmap" }
+        $actual = Get-MiOSSha256Hex -Bytes $bmp
+        if ($actual -cne [string]$sidecar.sha256) { throw "sidecar sha256 does not match the fetched bitmap ($actual)" }
+        $px = Assert-MiOSOemLogoBitmap -Bytes $bmp
+        if (($sidecar.px -isnot [int] -and $sidecar.px -isnot [long]) -or $sidecar.px -ne $px) { throw "sidecar px '$($sidecar.px)' does not match the $px px bitmap" }
+        if ($sidecar.background_key -cne $bgKey) { throw "sidecar background_key '$($sidecar.background_key)' is not vendor background_color_ref '$bgKey'" }
+        $bg = [string]$sidecar.background; $vendorBg = Get-Toml $vendor $bgKey
+        if (-not $vendorBg) { throw "vendor required colour '$bgKey' is missing" }
+        if ($bg -cnotmatch '^#[0-9A-Fa-f]{6}$' -or $bg -ine $vendorBg) { throw "sidecar background '$bg' is not vendor $bgKey '$vendorBg'" }
+        $hostBgKey = Get-Toml $Toml 'windows.xbox.identity.background_color_ref' $bgKey
+        if ($hostBgKey -cne $bgKey) { throw 'effective background_color_ref differs from the vendor colour binding' }
+        $hostBg = Get-Toml $Toml $bgKey
+        if (-not $hostBg) { throw "effective required colour '$bgKey' is missing" }
+        if ($hostBg -ine $vendorBg) { throw "effective $bgKey '$hostBg' overrides vendor '$vendorBg', so the vendor bitmap is wrong for this host" }
+        Assert-MiOSOemLogoWritePath -Path $dest -Fixture:([bool]$DestinationPath)
+        $dir = [IO.Path]::GetDirectoryName($dest)
+        $tmp = [IO.Path]::Combine($dir, '.mios-oem-logo-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        $stream = [IO.FileStream]::new($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            if (-not $DestinationPath) { Set-MiOSOemLogoStreamAcl -Stream $stream }
+            else { Set-MiOSPrivateStream -Stream $stream }
+            $stream.Write($bmp, 0, $bmp.Length); $stream.Flush($true)
+        } finally { $stream.Dispose() }
+        # Recheck immediately before the rename as well as before creating the temporary file.
+        Assert-MiOSOemLogoWritePath -Path $dest -Fixture:([bool]$DestinationPath)
+        if ([IO.File]::Exists($dest)) {
+            $backup = [IO.Path]::Combine($dir, '.mios-oem-previous-' + [Guid]::NewGuid().ToString('N') + '.bmp')
+            [IO.File]::Replace($tmp, $dest, $backup)
+        }
+        else { [IO.File]::Move($tmp, $dest) }
+        $written = [IO.File]::ReadAllBytes($dest); $writtenSha = Get-MiOSSha256Hex -Bytes $written
+        if ($written.Length -ne $bmp.Length -or $writtenSha -cne $actual) { throw "re-read of '$dest' does not match the verified bitmap" }
+        $evidence = [pscustomobject]@{ Path = $dest; Sha256 = $writtenSha; Commit = $Commit; Size = $written.Length }
+        $script:MiOSOemLogoReceipt = @{ Evidence = $evidence; Path = $dest; FilePath = $dest; Fixture = [bool]$DestinationPath; Sha256 = $writtenSha; Commit = $Commit; Size = $written.Length;
+            BackgroundKey = $bgKey; Vendor = $vendor; Binding = (Get-MiOSOemLogoBinding -Toml $Toml -BackgroundKey $bgKey) }
+        return $evidence
+    } catch {
+        $gap = $_.Exception.Message
+        if ($backup -and [IO.File]::Exists($backup)) {
+            try { [IO.File]::Replace($backup, $dest, [System.Management.Automation.Language.NullString]::Value) }
+            catch { $keepBackup = $true; $gap += "; original bitmap retained at '$backup' because rollback failed: " + $_.Exception.Message }
+        }
+        Write-Warning ('MiOS OEM logo not staged: ' + $gap)
+        return $null
+    } finally {
+        if ($backup -and -not $keepBackup -and [IO.File]::Exists($backup)) { [IO.File]::Delete($backup) }
+        if ($tmp -and [IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
+    }
+}
+function New-MiOSOemLogoCommands {
+    # Logo only from current verified staging evidence; otherwise remove only our configured registry value.
+    # Quoting follows New-MiOSPortableAppsCommands (one double-quoted -Command).
+    param($Toml, $OemLogo)
+    $logo = Get-MiOSOemLogoPath -Toml $Toml
+    $hasEvidence = (Get-Toml $Toml 'branding.windows.enable' 'true') -match '^(?i:true|1|yes)$' -and (Test-MiOSOemLogoEvidence -Toml $Toml -OemLogo $OemLogo)
+    if ($hasEvidence) { return @(('reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation" /v Logo /t REG_SZ /d "{0}" /f' -f $logo)) }
+    # Transport the owned value as data, including invalid paths that still need safe cleanup.
+    $path64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($logo))
+    $literal = '[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(''' + $path64 + '''))'
+    $guard = '$k=''HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation''; $p=' + $literal + '; $v=(Get-ItemProperty -LiteralPath $k -Name Logo -ErrorAction SilentlyContinue).Logo; ' +
+        'if ($v -is [string] -and [string]::Equals($v, $p, [StringComparison]::OrdinalIgnoreCase)) { Remove-ItemProperty -LiteralPath $k -Name Logo -ErrorAction Stop }'
+    return @('powershell.exe -NoProfile -Command "' + $guard + '"')
+}
+
 function New-MiOSBrandingCommands {
     # FULL MiOS visual identity applied GLOBALLY (HKLM + Default hive + first
     # HKCU), ALL from SSOT ([branding], [colors].accent, [theme]).
-    param($Toml)
-    if ((Get-Toml $Toml 'branding.windows.enable' 'true') -notmatch '^(true|1|yes)$') { return @() }
+    param($Toml, $OemLogo)
+    if ((Get-Toml $Toml 'branding.windows.enable' 'true') -notmatch '^(?i:true|1|yes)$') { return @(New-MiOSOemLogoCommands -Toml $Toml) }
     $c = New-Object System.Collections.Generic.List[string]
     # OEM information (machine-wide).
     $oem = [ordered]@{
@@ -790,9 +1066,9 @@ function New-MiOSBrandingCommands {
         SupportURL   = Get-Toml $Toml 'branding.oem_support_url'  'https://github.com/mios-dev'
         SupportHours = Get-Toml $Toml 'branding.oem_support_hours' 'Always on'
         SupportPhone = Get-Toml $Toml 'branding.oem_support_phone' ''
-        Logo         = Get-Toml $Toml 'branding.oem_logo'         'C:\Windows\Web\MiOS\mios-logo.bmp'
     }
     foreach ($k in $oem.Keys) { if ("$($oem[$k])" -ne '') { $c.Add(('reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation" /v {0} /t REG_SZ /d "{1}" /f' -f $k,$oem[$k])) } }
+    foreach ($l in (New-MiOSOemLogoCommands -Toml $Toml -OemLogo $OemLogo)) { $c.Add($l) }
     # System UI font: Segoe UI -> Geist (machine-wide; Geist installed by bootstrap).
     if ((Get-Toml $Toml 'branding.font_substitute' 'true') -match '^(true|1|yes)$') {
         $uiFont = Get-Toml $Toml 'branding.ui_font' 'Geist'
@@ -1044,10 +1320,11 @@ function New-MiOSProvisionCommands {
     # The UNIFIED, ordered MiOS provisioning set (layout -> branding -> prefs -> portableapps).
     # Returns @( @{ Description; Commands=@(...) }, ... ). Consumed as
     # <FirstLogonCommands> (ISO) or run live (existing Windows) -- one source.
-    param($Toml)
+    # -OemLogo is Install-MiOSOemLogo evidence (live apply only); bake callers pass none.
+    param($Toml, $OemLogo)
     return @(
         @{ Description = 'MiOS unified Linux-like directory layout';                 Commands = @(New-MiOSLinuxLayoutCommands -Toml $Toml) }
-        @{ Description = 'MiOS global branding + theme (OEM/accent/wallpaper/RGB)';   Commands = @(New-MiOSBrandingCommands   -Toml $Toml) }
+        @{ Description = 'MiOS global branding + theme (OEM/accent/wallpaper/RGB)';   Commands = @(New-MiOSBrandingCommands   -Toml $Toml -OemLogo $OemLogo) }
         @{ Description = 'MiOS global user preferences';                              Commands = @(New-MiOSGlobalPrefCommands -Toml $Toml) }
         @{ Description = 'MiOS global PortableApps & SDIO integration';               Commands = @(New-MiOSPortableAppsCommands -Toml $Toml) }
         @{ Description = 'MiOS-XBOX: Xbox Full Screen Experience enablement';         Commands = @(New-MiOSXboxModeCommands   -Toml $Toml) }

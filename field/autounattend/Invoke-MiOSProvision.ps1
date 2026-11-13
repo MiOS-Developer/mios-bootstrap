@@ -85,9 +85,11 @@ foreach ($a in $accounts) {
 }
 
 Install-MiOSLivingWallpaperAssets -Toml $toml
+# Verified staging evidence or $null; only evidence lets branding write the OEM Logo value.
+$oemLogo = Install-MiOSOemLogo -Toml $toml
 
 # 2) LIVE-apply the SAME global branding/layout/prefs the ISO bakes ---------
-foreach ($grp in (New-MiOSProvisionCommands -Toml $toml)) {
+foreach ($grp in (New-MiOSProvisionCommands -Toml $toml -OemLogo $oemLogo)) {
     Invoke-MiOSHostCommands -Commands $grp.Commands -Label $grp.Description
 }
 

@@ -34,7 +34,7 @@ function Get-MiOSVirtFeatureMatch {
 # A case-sensitive compatibility view for render-only PowerShell consumers. Image
 # builds use the canonical MiOS resolver; its private win-json projection wins.
 function New-MiosTomlView {
-    @{ scalars = [Collections.Hashtable]::new([StringComparer]::Ordinal); accounts = @(); prefs = @{}; has_accounts = $false }
+    @{ scalars = [Collections.Hashtable]::new([StringComparer]::Ordinal); accounts = @(); prefs = @{}; has_accounts = $false; _resolved_credentials_authoritative = $false }
 }
 function ConvertFrom-MiosTomlValue {
     param([string]$Text, [string]$Key)
@@ -257,6 +257,7 @@ function Import-MiOSResolvedCredentials {
     foreach ($key in @($Toml.scalars.Keys)) { if ($key -cmatch '^(identity\.|autounattend\.|field\.sysrescue\.|auth\.password_hash$)') { [void]$Toml.scalars.Remove($key) } }
     Merge-MiosTomlLayer -Dst $Toml -Src $projection
     if (-not $projection.has_accounts) { $Toml.accounts = @(); $Toml.has_accounts = $false }
+    $Toml._resolved_credentials_authoritative = $true
 }
 function Read-MiosToml {
     param([string]$Path, [switch]$SingleFile, [string]$ResolvedJson)
@@ -354,6 +355,8 @@ function Apply-MiosEdition {
     foreach ($k in $keys) {
         if ($k.StartsWith($prefix)) {
             $baseKey = $k.Substring($prefix.Length)
+            # A validated private projection owns these complete planes, including absence.
+            if ($T._resolved_credentials_authoritative -is [bool] -and $T._resolved_credentials_authoritative -and $baseKey -cmatch '^(identity\.|autounattend\.|field\.sysrescue\.|auth\.password_hash$)') { continue }
             $T.scalars[$baseKey] = $T.scalars[$k]
             $found = $true
         }

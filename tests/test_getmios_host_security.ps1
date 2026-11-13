@@ -429,7 +429,7 @@ function Invoke-Checks([string]$Path, [switch]$SkipReceiverProtocol) {
     # Source order: the gate runs unguarded at top level before the MiOS-DEV hand-off, and only the gate applies the policy.
     $commands = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] }, $true))
     $unguarded = { param($node) for ($p = $node.Parent; $p; $p = $p.Parent) {
-        if ($p -is [Management.Automation.Language.FunctionDefinitionAst] -or $p -is [Management.Automation.Language.TryStatementAst]) { return $false } }
+        if ($p -is [Management.Automation.Language.TryStatementAst]) { return $false }; if ($p -is [Management.Automation.Language.FunctionDefinitionAst] -and $p.Name -ne 'Invoke-MiosMachinePreparationCore') { return $false } }
         return $true }
     $gateCalls = @($commands | Where-Object { $_.GetCommandName() -eq 'Invoke-MiosPlatformGate' })
     $handoff = @($commands | Where-Object { $_.CommandElements[0].Extent.Text -eq '$entry' })
@@ -441,7 +441,7 @@ function Invoke-Checks([string]$Path, [switch]$SkipReceiverProtocol) {
     Check (@($commands | Where-Object { $_.GetCommandName() -in @('Set-MiosWslFirewallPolicy', 'Enable-MiOSWindowsFeatures') -and -not (& $inGate $_) }).Count -eq 0) 'only the readiness gate enables features or applies the WSL firewall policy'
     $ifs = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.IfStatementAst] }, $true))
     $guard = @($ifs | Where-Object { $_.Clauses[0].Item1.Extent.Text -ceq '-not $_isAdmin -and $env:MIOS_GETMIOS_RELAUNCHED' })
-    $elevate = @($ifs | Where-Object { $_.Clauses[0].Item1.Extent.Text -ceq '-not $_isAdmin -and -not $env:MIOS_GETMIOS_RELAUNCHED' })
+    $elevate = @($commands | Where-Object { $_.GetCommandName() -eq 'Get-MiosOriginUserContext' })
     Check ($guard.Count -eq 1 -and $elevate.Count -eq 1 -and $guard[0].Extent.StartOffset -lt $elevate[0].Extent.StartOffset -and
            @($guard[0].Clauses[0].Item2.FindAll({ param($n) $n -is [Management.Automation.Language.ThrowStatementAst] }, $true)).Count -eq 1) 'a stale relaunch marker in an unelevated session stops before any admin step'
     if ($guard.Count -eq 1) {
@@ -472,8 +472,8 @@ function Invoke-Checks([string]$Path, [switch]$SkipReceiverProtocol) {
            $ctx[0].Extent.StartOffset -gt $guard[0].Extent.StartOffset -and $ctx[0].Extent.StartOffset -lt $elevate[0].Extent.StartOffset -and
            $ctx[0].Extent.Text.Contains('-OriginSid ([string]$env:MIOS_ORIGIN_SID)') -and
            $ctx[0].Extent.Text.Contains('-DesktopSids @(Get-MiosDesktopOwnerSids)')) 'an elevated run checks its account against the origin and desktop owner before any admin step'
-    Check ($elevate.Count -eq 1 -and $elevate[0].Extent.Text.Contains('`$env:MIOS_ORIGIN_SID=''$_originSid''') -and
-           $elevate[0].Extent.Text.Contains('$_originSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value')) 'the unelevated pass hands its own account SID to the elevated pass'
+    Check ($elevate.Count -eq 1 -and $ast.Extent.Text.Contains('Origin = $Context; OperatorToml = $operatorProjection') -and
+           $ast.Extent.Text.Contains('GetNamedPipeServerProcessId')) 'the unelevated pass hands its own account SID to the elevated pass'
     Check ($script:dismLocalizedProbes -eq 0) 'every dism state probe forces English output'
     $script:fixtureVendor = @'
 [[wsl2.inbound]]
@@ -710,7 +710,7 @@ try {
         @{ Name = 'origin mismatch accepted'; Expected = 'elevation into a different account is refused'; From = 'if ($OriginSid -and $OriginSid -ne $CurrentSid) {'; To = 'if ($false) {' },
         @{ Name = 'desktop owner ignored'; Expected = 'an elevated shell of another account on the operator desktop is refused'; From = 'if ($others.Count) {'; To = 'if ($false) {' },
         @{ Name = 'context refusal does not stop'; Expected = 'an elevated run checks its account against the origin and desktop owner before any admin step'; From = 'if ($_ctxError) {'; To = 'if ($false) {' },
-        @{ Name = 'origin not handed over'; Expected = 'the unelevated pass hands its own account SID to the elevated pass'; From = '`$env:MIOS_ORIGIN_SID=''$_originSid'''; To = '' }
+        @{ Name = 'origin not handed over'; Expected = 'the unelevated pass hands its own account SID to the elevated pass'; From = 'Origin = $Context; OperatorToml = $operatorProjection'; To = 'Origin = $null; OperatorToml = $operatorProjection' }
     )
     $caught = 0
     foreach ($plant in $plants) {

@@ -76,6 +76,24 @@ function ConvertFrom-MiosTomlValue {
     }
     return ($v -replace '\s*#.*$', '').Trim()
 }
+function Find-MiosTomlMultilineEnd {
+    param([string]$Text, [string]$Delimiter, [string]$Key)
+    # TOML permits one or two content quotes immediately before the closing three.
+    # In basic strings an escaped quote does not start a closing delimiter.
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        if ($Delimiter[0] -eq '"' -and $Text[$i] -eq '\') { $i++; continue }
+        if ($Text[$i] -ne $Delimiter[0]) { continue }
+        $run = 1
+        while ($i + $run -lt $Text.Length -and $Text[$i + $run] -eq $Delimiter[0]) { $run++ }
+        if ($run -ge 3) {
+            $tail = $Text.Substring($i + $run).Trim()
+            if ($run -gt 5 -or ($tail -and -not $tail.StartsWith('#'))) { throw "MiOS SSOT: invalid multiline TOML string at '$Key'" }
+            return @{ ContentLength = $i + $run - 3 }
+        }
+        $i += $run - 1
+    }
+    return $null
+}
 function ConvertFrom-MiosTomlFile {
     param([string]$Path, [switch]$ProjectedCredentials)
     $r = New-MiosTomlView
@@ -84,14 +102,12 @@ function ConvertFrom-MiosTomlFile {
     $section = ''; $cur = $null; $multiDelimiter = $null; $multiKey = ''; $multiDiscard = $false; $multiText = [Text.StringBuilder]::new()
     foreach ($raw in [IO.File]::ReadAllLines([IO.Path]::GetFullPath($Path), [Text.UTF8Encoding]::new($false, $true))) {
         if ($multiDelimiter) {
-            $end = $raw.IndexOf($multiDelimiter, [StringComparison]::Ordinal)
-            if ($end -lt 0) { [void]$multiText.AppendLine($raw); continue }
-            [void]$multiText.Append($raw.Substring(0, $end))
-            $tail = $raw.Substring($end + 3).Trim()
-            if ($tail -and -not $tail.StartsWith('#')) { throw "MiOS SSOT: invalid multiline TOML string at '$multiKey'" }
+            $close = Find-MiosTomlMultilineEnd -Text $raw -Delimiter $multiDelimiter -Key $multiKey
+            if ($null -eq $close) { [void]$multiText.AppendLine($raw); continue }
+            [void]$multiText.Append($raw.Substring(0, $close.ContentLength))
             if (-not $multiDiscard) { $r.scalars[$multiKey] = $multiText.ToString() }; $multiDelimiter = $null; [void]$multiText.Clear(); continue
         }
-        $line = $raw.Trim()
+        $line = $raw.TrimStart()
         if (-not $line -or $line.StartsWith('#')) { continue }
         if ($line -cmatch '^\[\[autounattend\.accounts\]\]\s*(?:#.*)?$') {
             if ($null -ne $cur) { $r.accounts += ,$cur }
@@ -103,17 +119,15 @@ function ConvertFrom-MiosTomlFile {
         }
         if ($line -match '^(?<k>[A-Za-z0-9_.-]+)\s*=\s*(?<v>.*)$') {
             $key = $Matches['k']; $text = $Matches['v']; $full = "$section.$key"
-            $trimmed = $text.Trim(); $triple = $null
+            $trimmed = $text.TrimStart(); $triple = $null
             if ($trimmed.StartsWith(('"' * 3))) { $triple = '"' * 3 }
             elseif ($trimmed.StartsWith(([string][char]39 * 3))) { $triple = [string][char]39 * 3 }
             if ($triple) {
                 $discardCredential = $section -ceq 'account' -or $full -cmatch '^(identity\.(username|default_password)|autounattend\.(autologon_user|service\.svc_(user|password))|field\.sysrescue\.(username|password))$'
                 if ($discardCredential -and -not $ProjectedCredentials) { throw "MiOS SSOT: credential key '$full' uses multiline TOML; use private -ResolvedJson" }
-                $body = $trimmed.Substring(3); $end = $body.IndexOf($triple, [StringComparison]::Ordinal)
-                if ($end -ge 0) {
-                    $tail = $body.Substring($end + 3).Trim()
-                    if ($tail -and -not $tail.StartsWith('#')) { throw "MiOS SSOT: invalid multiline TOML string at '$full'" }
-                    if (-not $discardCredential) { $r.scalars[$full] = $body.Substring(0, $end) }
+                $body = $trimmed.Substring(3); $close = Find-MiosTomlMultilineEnd -Text $body -Delimiter $triple -Key $full
+                if ($null -ne $close) {
+                    if (-not $discardCredential) { $r.scalars[$full] = $body.Substring(0, $close.ContentLength) }
                 } else {
                     $multiDelimiter = $triple; $multiKey = $full; $multiDiscard = $discardCredential
                     if ($body) { [void]$multiText.AppendLine($body) }
@@ -856,7 +870,8 @@ function Get-MiOSPerUserBrandingReg {
     if ((Get-Toml $Toml 'branding.windows.enable' 'true') -notmatch '^(true|1|yes)$') { return @() }
     $accentDword = ConvertTo-AccentDword (Get-Toml $Toml 'colors.accent' '#1A407F')
     $darkApps    = if ((Get-Toml $Toml 'theme.mode' 'dark') -match '^(?i)light$') { '1' } else { '0' }
-    $wallpaper   = Get-Toml $Toml 'branding.wallpaper'       'C:\Windows\Web\MiOS\mios-wallpaper.jpg'
+    $wallpaper   = Get-Toml $Toml 'branding.wallpaper'       ''
+    if ($wallpaper -match '["\x00-\x1f\x7f]') { throw 'MiOS SSOT: branding.wallpaper must not contain quotes or control characters' }
     $wallStyle   = Get-Toml $Toml 'branding.wallpaper_style' '10'
     $per = [ordered]@{
         'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize|AppsUseLightTheme|REG_DWORD'    = $darkApps
@@ -868,7 +883,7 @@ function Get-MiOSPerUserBrandingReg {
         'Software\Microsoft\Windows\DWM|ColorPrevalence|REG_DWORD'                                    = '1'
         'Software\Microsoft\Windows\CurrentVersion\Explorer\Accent|AccentColorMenu|REG_DWORD'         = $accentDword
         'Software\Microsoft\Windows\CurrentVersion\Explorer\Accent|StartColorMenu|REG_DWORD'          = $accentDword
-        'Control Panel\Desktop|WallPaper|REG_SZ'                                                       = ''
+        'Control Panel\Desktop|WallPaper|REG_SZ'                                                       = $wallpaper
         'Control Panel\Desktop|WallpaperStyle|REG_SZ'                                                  = $wallStyle
         'Control Panel\Colors|Background|REG_SZ'                                                       = '0 0 0'
         'Software\Microsoft\Lighting|UseSystemAccentColor|REG_DWORD'                                   = '1'

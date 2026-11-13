@@ -71,15 +71,22 @@ function Get-GeneratedEntrypoints {
         Check ($canonical.Count -eq 1 -and $emitted.Count -eq 1 -and
             $canonical[0].Extent.Text -ceq $emitted[0].Extent.Text) "canonical helper $name is embedded verbatim"
     }
-    $refresh = @($buildAst.FindAll({ param($node)
+    $refresh = @($getAst.FindAll({ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
         $node.Name -eq 'Update-MiosWindowsBuildCheckout'
     }, $true))
     if ($refresh.Count -ne 1) { throw 'The clean-only Windows refresh helper is missing.' }
     $script:windowsRefreshSource = $refresh[0].Extent.Text
     . ([scriptblock]::Create($script:windowsRefreshSource))
-    $windowsRefreshBlock = 'function Update-MiosWindowsBuildCheckout {' + (Get-Command Update-MiosWindowsBuildCheckout).Definition + "`r`n}"
-    $miosBuildRefLiteral = "'main'"
+    $windowsRefreshBlock = Get-MiosUserTomlHelperSource -Path $getPath -Names @('Update-MiosWindowsBuildCheckout')
+    $losslessShellHelper = Get-MiosUserTomlHelperSource -Path $getPath -Names @('Get-MiosLosslessPullShell')
+    $losslessPullShell = & ([scriptblock]::Create($losslessShellHelper + "`nGet-MiosLosslessPullShell"))
+    $script:nativePullShell = [string]$losslessPullShell
+    $script:nativeArgumentSource = Get-MiosUserTomlHelperSource -Path $getPath -Names @('ConvertTo-MiosNativeArgument')
+    $miosBuildRefLiteral = "'main'"; $miosBootstrapRefLiteral = "'main'"
+    $MiosBootstrapShadow = Join-Path $scratch 'bootstrap-source'
+    $bootstrapBuild = Join-Path $MiosBootstrapShadow 'build-mios.ps1'
+    $bootstrapFallback = Join-Path $scratch 'build-mios.ps1'
     # Only generator strings are expanded. Installer/profile statements are never invoked.
     $DevDistro = 'fixture-DEV'; $LegacyDevName = 'fixture-LEGACY'
     $devResolveBlock = & ([scriptblock]::Create((Get-HereString $buildAst 'devResolveBlock')))
@@ -91,6 +98,42 @@ function Get-GeneratedEntrypoints {
     $profile = [string](& ([scriptblock]::Create((Get-HereString $getAst 'miosScriptBody'))))
     $standaloneAst = Read-GeneratedAst $standalone
     $profileAst = Read-GeneratedAst $profile
+    $pull = [string](& ([scriptblock]::Create((Get-HereString $buildAst 'pullScript'))))
+    $update = [string](& ([scriptblock]::Create((Get-HereString $buildAst 'updateScript'))))
+    $pullAst = Read-GeneratedAst $pull
+    $updateAst = Read-GeneratedAst $update
+    foreach ($surface in @(@{ Name = 'standalone'; Ast = $standaloneAst },
+                            @{ Name = 'profile'; Ast = $profileAst },
+                            @{ Name = 'pull companion'; Ast = $pullAst },
+                            @{ Name = 'update companion'; Ast = $updateAst })) {
+        $embedded = @($surface.Ast.FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Update-MiosWindowsBuildCheckout'
+        }, $true))
+        Check ($embedded.Count -eq 1 -and $embedded[0].Extent.Text -ceq $script:windowsRefreshSource) "$($surface.Name) embeds the canonical lossless refresh helper"
+        $calls = @($surface.Ast.FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.CommandAst]
+        }, $true))
+        Check (@($calls | Where-Object { $_.GetCommandName() -eq 'Update-MiosWindowsBuildCheckout' }).Count -gt 0) "$($surface.Name) invokes the canonical refresh"
+        Check (-not @($calls | Where-Object {
+            $_.GetCommandName() -eq 'git' -and $_.Extent.Text -match '(--depth(?:=|\s)|reset\s+--hard|clean\s+-|stash\s+)'
+        }).Count) "$($surface.Name) contains no shallow fetch, force reset, clean, or stash"
+    }
+    $inline = @($pullAst.FindAll({ param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$inlinePull'
+    }, $true))
+    if ($inline.Count -ne 1) { throw 'Expected one contained native pull implementation.' }
+    $inlineValue = $inline[0].Right.Find({ param($node)
+        $node -is [System.Management.Automation.Language.StringConstantExpressionAst]
+    }, $true)
+    Check ($inlineValue -and $inlineValue.Value.Replace("`r`n", "`n") -ceq $script:nativePullShell.Replace("`r`n", "`n")) 'pull companion embeds the canonical native shell verbatim'
+    Check ($script:nativePullShell -notmatch '--depth|reset\s+--hard|git\s+clean|git\s+stash' -and
+        $script:nativePullShell.Contains('--ff-only') -and $script:nativePullShell.Contains('--no-autostash') -and
+        $script:nativePullShell.Contains('--no-overwrite-ignore')) 'native pull uses a complete safe fast-forward policy'
+    Check (-not $pull.Contains('/usr/bin/mios-pull')) 'pull companion does not bypass preservation through an external backend'
+    Check (-not @($updateAst.FindAll({ param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'robocopy'
+    }, $true)).Count) 'update companion does not overwrite the source through a blind overlay'
     foreach ($entry in @(@{ Name = 'standalone'; Ast = $standaloneAst; Text = $standalone },
                           @{ Name = 'profile'; Ast = $profileAst; Text = $profile })) {
         foreach ($name in $helperNames) {
@@ -222,7 +265,7 @@ function Invoke-PromotionFixture([string]$Name, [string]$Program, [string]$Failu
 }
 
 
-function Invoke-LosslessRefreshFixture([string]$Source) {
+function Invoke-LosslessRefreshFixture([string]$Source, [switch]$NativeShell) {
     $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop
     $fixtureGit = $gitCommand.Source
     $fixtureRoot = Join-Path $scratch ('git-' + [guid]::NewGuid().ToString('N'))
@@ -244,7 +287,33 @@ function Invoke-LosslessRefreshFixture([string]$Source) {
         if ($LASTEXITCODE -ne 0) { throw "Local git fixture setup failed: $($args[0])" }
         return $result
     }
-    . ([scriptblock]::Create($Source))
+    if ($NativeShell) {
+        $shellCommand = Get-Command sh -CommandType Application -ErrorAction Stop
+        if ($shellCommand.Name -notmatch '^sh(?:\.exe)?$') { throw 'A local POSIX sh executable is required; no WSL launcher may substitute.' }
+        . ([scriptblock]::Create($script:nativeArgumentSource))
+        function Update-MiosWindowsBuildCheckout {
+            param([string]$Path, [string]$Ref)
+            $psi = New-Object Diagnostics.ProcessStartInfo
+            $psi.FileName = $shellCommand.Source
+            $psi.Arguments = (@('-s', '--', $Path, $Ref) | ForEach-Object { ConvertTo-MiosNativeArgument $_ }) -join ' '
+            $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+            $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+            $psi.EnvironmentVariables['GIT_CONFIG_COUNT'] = '3'
+            $psi.EnvironmentVariables['GIT_CONFIG_KEY_0'] = 'core.hooksPath'; $psi.EnvironmentVariables['GIT_CONFIG_VALUE_0'] = $noHooks
+            $psi.EnvironmentVariables['GIT_CONFIG_KEY_1'] = 'merge.autoStash'; $psi.EnvironmentVariables['GIT_CONFIG_VALUE_1'] = 'false'
+            $psi.EnvironmentVariables['GIT_CONFIG_KEY_2'] = 'protocol.file.allow'; $psi.EnvironmentVariables['GIT_CONFIG_VALUE_2'] = 'always'
+            $process = New-Object Diagnostics.Process; $process.StartInfo = $psi
+            try {
+                if (-not $process.Start()) { throw 'Local shell fixture could not start.' }
+                $stdout = $process.StandardOutput.ReadToEndAsync(); $stderr = $process.StandardError.ReadToEndAsync()
+                $process.StandardInput.Write($Source.Replace("`r`n", "`n")); $process.StandardInput.Close()
+                if (-not $process.WaitForExit(60000)) { $process.Kill(); throw 'Local shell fixture timed out.' }
+                $null = $stdout.GetAwaiter().GetResult(); $null = $stderr.GetAwaiter().GetResult()
+                if ($process.ExitCode -ne 0) { throw 'Local native companion refused an unsafe refresh.' }
+            } finally { $process.Dispose() }
+        }
+    } else { . ([scriptblock]::Create($Source)) }
+    $kind = if ($NativeShell) { 'native companion' } else { 'Windows companion' }
     $null = Run-Git init --bare $origin
     $null = Run-Git init $seed
     $null = Run-Git -C $seed symbolic-ref HEAD refs/heads/main
@@ -261,7 +330,7 @@ function Invoke-LosslessRefreshFixture([string]$Source) {
     $remoteHead = (Run-Git -C $seed rev-parse HEAD) -join ''
     Update-MiosWindowsBuildCheckout -Path $clean -Ref main 6>$null
     Check (((Run-Git -C $clean rev-parse HEAD) -join '') -eq $remoteHead -and
-        [IO.File]::ReadAllText((Join-Path $clean 'source.txt')) -eq 'vendor-two') 'a clean Windows source checkout fast-forwards'
+        [IO.File]::ReadAllText((Join-Path $clean 'source.txt')) -eq 'vendor-two') "a clean $kind checkout fast-forwards"
 
     $localFile = Join-Path $clean 'source.txt'
     $untracked = Join-Path $clean 'operator-untracked.txt'
@@ -280,7 +349,7 @@ function Invoke-LosslessRefreshFixture([string]$Source) {
         ((Run-Git -C $clean status --porcelain=v1) -join "`n") -ceq $dirtyStatus -and
         [IO.File]::ReadAllText($localFile) -eq 'operator edit' -and
         [IO.File]::ReadAllText($untracked) -eq 'operator untracked' -and
-        [IO.File]::ReadAllText($staged) -eq 'operator staged') 'dirty Windows source preserves HEAD, staged edits, unstaged edits, and untracked files'
+        [IO.File]::ReadAllText($staged) -eq 'operator staged') "dirty $kind source preserves HEAD, staged edits, unstaged edits, and untracked files"
 
     $null = Run-Git clone --branch main $origin $diverged
     [IO.File]::WriteAllText((Join-Path $diverged 'source.txt'), 'local commit')
@@ -292,7 +361,21 @@ function Invoke-LosslessRefreshFixture([string]$Source) {
     Update-MiosWindowsBuildCheckout -Path $diverged -Ref main 6>$null
     Check (((Run-Git -C $diverged rev-parse HEAD) -join '') -eq $localHead -and
         [IO.File]::ReadAllText((Join-Path $diverged 'source.txt')) -eq 'local commit' -and
-        -not @((Run-Git -C $diverged status --porcelain=v1) | Where-Object { $_ }).Count) 'diverged Windows source preserves its local commit and current tree'
+        -not @((Run-Git -C $diverged status --porcelain=v1) | Where-Object { $_ }).Count) "diverged $kind source preserves its local commit and current tree"
+    $ignoredCheckout = Join-Path $fixtureRoot 'ignored'
+    $null = Run-Git clone --branch main $origin $ignoredCheckout
+    $ignoredFile = Join-Path $ignoredCheckout 'ignored-operator.txt'
+    [IO.File]::WriteAllText((Join-Path $ignoredCheckout '.git/info/exclude'), "ignored-operator.txt`n")
+    [IO.File]::WriteAllText($ignoredFile, 'ignored local operator content')
+    $ignoredHead = (Run-Git -C $ignoredCheckout rev-parse HEAD) -join ''
+    [IO.File]::WriteAllText((Join-Path $seed 'ignored-operator.txt'), 'remote newly tracked content')
+    $null = Run-Git -C $seed add ignored-operator.txt
+    $null = Run-Git -C $seed commit -m 'Add remote collision fixture'
+    $null = Run-Git -C $seed push origin main
+    $refused = $false
+    try { Update-MiosWindowsBuildCheckout -Path $ignoredCheckout -Ref main 6>$null } catch { $refused = $true }
+    Check ($refused -and ((Run-Git -C $ignoredCheckout rev-parse HEAD) -join '') -eq $ignoredHead -and
+        [IO.File]::ReadAllText($ignoredFile) -eq 'ignored local operator content') "$kind preserves ignored files when the remote starts tracking their paths"
     Check (-not @((Run-Git -C $clean stash list) | Where-Object { $_ }).Count -and
         -not @((Run-Git -C $diverged stash list) | Where-Object { $_ }).Count) 'source refresh never creates an automatic stash'
 }
@@ -348,7 +431,16 @@ function Update-MiosWindowsBuildCheckout {
         $caught = $script:failed -gt $before
         $script:failed = $before
         Check $caught 'local repository fixtures catch the former destructive Windows refresh'
-    } else { Invoke-LosslessRefreshFixture $script:windowsRefreshSource }
+        $before = $script:failed
+        $unsafeShell = 'set -eu; git -C "$1" fetch --depth=1 origin "$2" >/dev/null 2>&1; git -C "$1" reset --hard FETCH_HEAD >/dev/null 2>&1'
+        Invoke-LosslessRefreshFixture $unsafeShell -NativeShell
+        $caught = $script:failed -gt $before
+        $script:failed = $before
+        Check $caught 'local repository fixtures catch the former destructive native companion'
+    } else {
+        Invoke-LosslessRefreshFixture $script:windowsRefreshSource
+        Invoke-LosslessRefreshFixture $script:nativePullShell -NativeShell
+    }
     if ($script:failed) { Write-Host "RESULT: FAIL ($($script:failed) checks)"; exit 1 }
     Write-Host 'RESULT: PASS (both generated entrypoints)'
     exit 0

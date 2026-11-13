@@ -66,7 +66,7 @@ if (Test-Path $lib) {
             }
         }
         if ($TomlPath) { $toml = Read-MiosToml -Path $TomlPath }
-    } catch { Log "toml read failed: $($_.Exception.Message)" }
+    } catch { Log "SSOT read refused; no credential defaults are used."; throw }
 }
 function Cfg { param([string]$Key,[string]$Def)
     if ($toml -and (Get-Command Get-Toml -ErrorAction SilentlyContinue)) { return (Get-Toml $toml $Key $Def) }
@@ -77,8 +77,11 @@ $enabled       = (Cfg 'autounattend.provision.enable' 'true') -match '^(?i:true|
 $attemptCap    = [int](Cfg 'autounattend.provision.phase_attempt_cap' '3')
 $phaseTimeout  = [int](Cfg 'autounattend.provision.phase_timeout_sec' '1800')
 $autoLogonCnt  = [int](Cfg 'autounattend.provision.autologon_count' '6')
-$svcUser       = Cfg 'autounattend.service.svc_user' 'mios-sudo'
-$svcPass       = Cfg 'autounattend.service.svc_password' (Cfg 'identity.default_password' 'user')
+if (-not $toml) { throw 'MiOS SSOT: mios.toml is required; no credential defaults are used.' }
+$credentials = Resolve-MiOSCredentials -Toml $toml
+$svcUser = [string]$credentials.service.user
+$svcPass = [string]$credentials.service.password
+if (-not $credentials.service.enable) { throw 'MiOS SSOT: autounattend.service.enable is required for the provision driver.' }
 
 $seedDir       = Join-Path $StateDir 'seed'
 $seedRootfs    = Join-Path $seedDir (Cfg 'autounattend.seed.rootfs' 'mios-rootfs.tar')
@@ -330,9 +333,30 @@ function Phase-FirstBoot {
     try { & schtasks.exe /create /tn 'MiOS-Host'   /sc ONSTART      /rl HIGHEST /ru $svcUser /rp $svcPass /tr $hostTr   /f 2>&1 | Out-Null } catch {}
     try { & schtasks.exe /create /tn 'MiOS-Daemon' /sc MINUTE /mo 1 /rl HIGHEST /ru $svcUser /rp $svcPass /tr $daemonTr /f 2>&1 | Out-Null } catch {}
     Write-MiOSProgress -Step 'firstboot' -Pct 70 -State running -StateFile $stateFile | Out-Null
-    # Un-arm interactive auto-logon so the box does not auto-logon forever post-setup.
-    try { & reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' /v AutoLogonCount /t REG_DWORD /d 0 /f 2>&1 | Out-Null } catch {}
-    try { & reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' /v AutoAdminLogon /t REG_SZ /d 0 /f 2>&1 | Out-Null } catch {}
+    # The setup service account hands the console back to the exact SSOT account.
+    # Set-MiOSProvisionWiring created this key with SYSTEM/admin-only access.
+    $handoverPath = 'HKLM:\SOFTWARE\MiOS\AutoLogon'
+    $handover = Get-ItemProperty -LiteralPath $handoverPath -ErrorAction Stop
+    $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    if ([int]$handover.Enabled -eq 1) {
+        if (-not [string]$handover.User -or -not [string]$handover.Password) {
+            throw 'MiOS SSOT: the staged console AutoLogon credential is missing.'
+        }
+        Set-ItemProperty -LiteralPath $winlogon -Name DefaultUserName -Value ([string]$handover.User) -Type String -ErrorAction Stop
+        Set-ItemProperty -LiteralPath $winlogon -Name DefaultDomainName -Value '.' -Type String -ErrorAction Stop
+        Set-ItemProperty -LiteralPath $winlogon -Name DefaultPassword -Value ([string]$handover.Password) -Type String -ErrorAction Stop
+        if ([int]$handover.Persistent -eq 1) {
+            Remove-ItemProperty -Path $winlogon -Name AutoLogonCount -ErrorAction SilentlyContinue
+        } else {
+            if ([int]$handover.Count -lt 1) { throw 'MiOS SSOT: the staged AutoLogon count must be positive.' }
+            Set-ItemProperty -LiteralPath $winlogon -Name AutoLogonCount -Value ([int]$handover.Count) -Type DWord -ErrorAction Stop
+        }
+        Set-ItemProperty -LiteralPath $winlogon -Name AutoAdminLogon -Value '1' -Type String -ErrorAction Stop
+    } else {
+        Set-ItemProperty -LiteralPath $winlogon -Name AutoAdminLogon -Value '0' -Type String -ErrorAction Stop
+        Remove-ItemProperty -Path $winlogon -Name AutoLogonCount -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $winlogon -Name DefaultPassword -ErrorAction SilentlyContinue
+    }
     # Authoritatively de-arm the full-screen bar's relaunch (the app self-removes too,
     # but it runs unelevated so its HKLM write is best-effort; the RID-500 driver is sure).
     try { & reg.exe delete 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' /v 'MiOS-SetupExperience' /f 2>&1 | Out-Null } catch {}

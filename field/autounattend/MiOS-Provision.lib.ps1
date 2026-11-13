@@ -149,7 +149,13 @@ function Assert-MiOSPrivateFile {
         $current = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $allowed = @($current, 'S-1-5-18', 'S-1-5-32-544')
         $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        try { $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0) }
+        catch { throw 'MiOS SSOT: private projection security descriptor cannot be verified' }
+        if ($null -eq $descriptor.Owner -or $descriptor.Owner.Value -cnotin $allowed) { throw 'MiOS SSOT: private projection has an untrusted Windows owner' }
+        # A public credential-free template still needs a trusted owner; its exact
+        # bytes are checked before the writer tightens its descriptor.
         if ($AllowPublicTemplate) { return }
+        if (($descriptor.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -eq 0 -or $null -eq $descriptor.DiscretionaryAcl) { throw 'MiOS SSOT: private projection has a missing or null DACL' }
         foreach ($rule in $acl.Access) {
             if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
             try { $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }

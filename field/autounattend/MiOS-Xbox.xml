@@ -1258,7 +1258,7 @@
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>137</Order>
-            <CommandLine>cmd /c reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAl /t REG_DWORD /d 0 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAl /t REG_DWORD /d 1 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>
@@ -1313,32 +1313,32 @@
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>148</Order>
-            <CommandLine>cmd /c reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Start" /v Start_ShowSettings /t REG_DWORD /d 1 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Start" /v AllowPinnedFolderSettings /t REG_DWORD /d 1 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>149</Order>
-            <CommandLine>cmd /c reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Start" /v Start_ShowFileExplorer /t REG_DWORD /d 1 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Start" /v AllowPinnedFolderFileExplorer /t REG_DWORD /d 1 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>150</Order>
-            <CommandLine>cmd /c reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Start" /v Start_ShowNetwork /t REG_DWORD /d 1 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Start" /v AllowPinnedFolderNetwork /t REG_DWORD /d 1 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>151</Order>
-            <CommandLine>cmd /c reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Start" /v Start_ShowUserFiles /t REG_DWORD /d 1 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Start" /v AllowPinnedFolderPersonalFolder /t REG_DWORD /d 1 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>152</Order>
-            <CommandLine>cmd /c reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Start" /v Start_ShowDownloads /t REG_DWORD /d 1 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Start" /v AllowPinnedFolderDownloads /t REG_DWORD /d 0 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>153</Order>
-            <CommandLine>cmd /c reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Start" /v Start_ShowDocuments /t REG_DWORD /d 1 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Start" /v AllowPinnedFolderDocuments /t REG_DWORD /d 0 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>
@@ -1363,7 +1363,7 @@
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>158</Order>
-            <CommandLine>cmd /c reg add "HKU\MiOSDefault\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAl /t REG_DWORD /d 0 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKU\MiOSDefault\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAl /t REG_DWORD /d 1 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>
@@ -1418,32 +1418,32 @@
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>169</Order>
-            <CommandLine>cmd /c reg add "HKU\MiOSDefault\Software\Microsoft\Windows\CurrentVersion\Start" /v Start_ShowSettings /t REG_DWORD /d 1 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Start" /v AllowPinnedFolderSettings /t REG_DWORD /d 1 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>170</Order>
-            <CommandLine>cmd /c reg add "HKU\MiOSDefault\Software\Microsoft\Windows\CurrentVersion\Start" /v Start_ShowFileExplorer /t REG_DWORD /d 1 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Start" /v AllowPinnedFolderFileExplorer /t REG_DWORD /d 1 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>171</Order>
-            <CommandLine>cmd /c reg add "HKU\MiOSDefault\Software\Microsoft\Windows\CurrentVersion\Start" /v Start_ShowNetwork /t REG_DWORD /d 1 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Start" /v AllowPinnedFolderNetwork /t REG_DWORD /d 1 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>172</Order>
-            <CommandLine>cmd /c reg add "HKU\MiOSDefault\Software\Microsoft\Windows\CurrentVersion\Start" /v Start_ShowUserFiles /t REG_DWORD /d 1 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Start" /v AllowPinnedFolderPersonalFolder /t REG_DWORD /d 1 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>173</Order>
-            <CommandLine>cmd /c reg add "HKU\MiOSDefault\Software\Microsoft\Windows\CurrentVersion\Start" /v Start_ShowDownloads /t REG_DWORD /d 1 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Start" /v AllowPinnedFolderDownloads /t REG_DWORD /d 0 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>
             <Order>174</Order>
-            <CommandLine>cmd /c reg add "HKU\MiOSDefault\Software\Microsoft\Windows\CurrentVersion\Start" /v Start_ShowDocuments /t REG_DWORD /d 1 /f</CommandLine>
+            <CommandLine>cmd /c reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Start" /v AllowPinnedFolderDocuments /t REG_DWORD /d 0 /f</CommandLine>
             <Description>MiOS global user preferences</Description>
           </SynchronousCommand>
           <SynchronousCommand>

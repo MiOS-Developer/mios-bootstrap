@@ -42,7 +42,7 @@ function Get-MiOSKickstartPasswordHash {
         }
         return $value
     }
-    $openssl = Get-Command openssl -CommandType Application -ErrorAction SilentlyContinue
+    $openssl = Get-Command openssl -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $openssl) {
         throw 'MiOS SSOT: openssl is required to hash identity.default_password; no files were changed.'
     }

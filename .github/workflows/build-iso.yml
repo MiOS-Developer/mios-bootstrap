@@ -35,21 +35,55 @@ jobs:
           Start-Process $adkInstaller -ArgumentList "/features OptionId.DeploymentTools /quiet /norestart" -Wait
           Write-Host "ADK Deployment Tools installed."
 
-      - name: Run New-MiOSAutounattend XML Generation
+      - name: Render and validate private autounattend XML fixture
         shell: pwsh
         run: |
-          cd field/autounattend
-          ./New-MiOSAutounattend.ps1 -TomlPath ../../mios.toml -OutXml ./autounattend.xml
-
-      - name: Verify Generated autounattend.xml
-        shell: pwsh
-        run: |
-          cd field/autounattend
-          if (-not (Test-Path ./autounattend.xml)) {
-              throw "autounattend.xml was not generated!"
+          $ErrorActionPreference = 'Stop'
+          . ./field/autounattend/MiOS-Provision.lib.ps1
+          $fixtureDir = Join-Path $env:RUNNER_TEMP ('mios-unattend-' + [Guid]::NewGuid().ToString('N'))
+          $layerNames = @('MIOS_BOOTSTRAP_BASE_TOML', 'MIOS_VENDOR_TOML_D', 'MIOS_HOST_TOML', 'MIOS_HOST_TOML_D', 'MIOS_USER_TOML', 'MIOS_USER_TOML_D', 'MIOS_RESOLVED_JSON')
+          $savedLayers = @{}
+          foreach ($name in $layerNames) { $savedLayers[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+          try {
+              $null = New-Item -ItemType Directory -Path $fixtureDir -ErrorAction Stop
+              # Isolate CI from host/user configuration; vendor defaults stay unchanged.
+              foreach ($name in $layerNames) { [Environment]::SetEnvironmentVariable($name, (Join-Path $fixtureDir ($name + '.absent')), 'Process') }
+              $env:MIOS_BOOTSTRAP_BASE_TOML = '-'
+              $env:MIOS_RESOLVED_JSON = $null
+              $vendorPath = (Resolve-Path ./mios.toml).Path
+              $toml = Read-MiosToml -Path $vendorPath -SingleFile
+              $random = [byte[]]::new(32)
+              $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+              try { $rng.GetBytes($random) } finally { $rng.Dispose() }
+              $fixturePassword = 'CiOnly!' + [Convert]::ToBase64String($random)
+              if ($env:GITHUB_ACTIONS -ceq 'true') { Write-Output "::add-mask::$fixturePassword" }
+              $toml.scalars['identity.default_password'] = $fixturePassword
+              $toml.scalars['autounattend.service.svc_password'] = $fixturePassword
+              $toml.scalars['field.sysrescue.password'] = $fixturePassword
+              foreach ($account in $toml.accounts) { $account.password = $fixturePassword }
+              $null = Resolve-MiOSCredentials -Toml $toml
+              $scalars = @{}
+              foreach ($key in $toml.scalars.Keys) {
+                  if ($key -cmatch '^(identity\.|autounattend\.|field\.sysrescue\.|auth\.password_hash$)') { $scalars[$key] = $toml.scalars[$key] }
+              }
+              $projection = @{ schema = 'mios-resolved-credentials/1'; scalars = $scalars; accounts = @($toml.accounts); has_accounts = ($toml.accounts.Count -gt 0) }
+              $resolvedPath = Join-Path $fixtureDir 'resolved.json'
+              $xmlPath = Join-Path $fixtureDir 'autounattend.xml'
+              Write-MiOSPrivateText -Path $resolvedPath -Text ($projection | ConvertTo-Json -Depth 10)
+              ./field/autounattend/New-MiOSAutounattend.ps1 -TomlPath $vendorPath -ResolvedJson $resolvedPath -OutXml $xmlPath
+              Assert-MiOSPrivateFile -Path $resolvedPath
+              Assert-MiOSPrivateFile -Path $xmlPath
+              $xml = [xml]::new()
+              $xml.Load($xmlPath)
+              if ($xml.DocumentElement.LocalName -cne 'unattend' -or $xml.DocumentElement.NamespaceURI -cne 'urn:schemas-microsoft-com:unattend') { throw 'Unexpected autounattend XML root' }
+              Write-Host 'Private autounattend XML fixture is well-formed.'
+          } finally {
+              foreach ($name in $layerNames) { [Environment]::SetEnvironmentVariable($name, $savedLayers[$name], 'Process') }
+              if (Test-Path -LiteralPath $fixtureDir) { Remove-Item -LiteralPath $fixtureDir -Recurse -Force -ErrorAction Stop }
+              $fixturePassword = $null
+              $projection = $null
+              $toml = $null
           }
-          [xml]$xml = Get-Content ./autounattend.xml
-          Write-Host "autounattend.xml is well-formed XML."
 
   validate-linux:
     runs-on: ubuntu-24.04

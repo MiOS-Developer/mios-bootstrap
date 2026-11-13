@@ -9,8 +9,9 @@
     XML-only compatibility entry. MiOS-Xbox images use the canonical build.py
     pipeline. A validated private -ResolvedJson projection wins over credential
     fields in a Bootstrap vendor fork. Missing credentials refuse before output.
-    FirstLogon and specialize payloads are UTF-16LE encoded commands, also kept
-    in urn:mios:unattend extensions for inspection. Rendering never runs them.
+    FirstLogon and specialize payloads are UTF-16LE bytes in urn:mios:unattend
+    extensions. Short hash-bound launchers read the Windows Setup Panther cache.
+    Rendering never runs them; cache retention needs a Windows installation trial.
 .PARAMETER OutXml
     Credential-bearing output, restricted to the current user/system administrators.
 .PARAMETER ObfuscatePasswords
@@ -159,8 +160,8 @@ function New-MiOSAutounattendXml {
         [void]$_flc.AppendLine(('        <SynchronousCommand wcm:action="add"><Order>{0}</Order><CommandLine>{1}</CommandLine><Description>MiOS bootstrap (nested offline USB / irm|iex)</Description><RequiresUserInput>false</RequiresUserInput></SynchronousCommand>' -f $_flOrd, $cmd))
         $_flOrd++
     }
-    # Windows command payloads are encoded once, and the same bytes remain
-    # inspectable in the namespaced extension. Rendering never executes them.
+    # Complete ordered scripts stay in the namespaced extension, rather than in
+    # a command line that can exceed CreateProcessW's UTF-16 length limit.
     [xml]$firstCommands = ('<Commands xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">' + $_flc.ToString() + '</Commands>')
     $firstScriptLines = @('$ErrorActionPreference = ''Stop''')
     foreach ($entry in @($firstCommands.Commands.SynchronousCommand)) {
@@ -170,8 +171,9 @@ function New-MiOSAutounattendXml {
         $firstScriptLines += '& $env:ComSpec /d /s /c ''reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoLogonCount /f'''
     }
     $firstScript = ($firstScriptLines -join "`r`n") + "`r`n"
-    $firstScriptB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($firstScript))
-    $firstLogonXml = ('      <FirstLogonCommands><SynchronousCommand wcm:action="add"><Order>1</Order><CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand {0}</CommandLine><Description>MiOS first logon from the layered SSOT</Description></SynchronousCommand></FirstLogonCommands>' -f $firstScriptB64)
+    $firstPayload = New-MiOSUnattendPayload -Name FirstLogonScript -Script $firstScript
+    $firstScriptB64 = $firstPayload.Base64
+    $firstLogonXml = ('      <FirstLogonCommands><SynchronousCommand wcm:action="add"><Order>1</Order><CommandLine>{0}</CommandLine><Description>MiOS first logon from the layered SSOT</Description></SynchronousCommand></FirstLogonCommands>' -f [Security.SecurityElement]::Escape($firstPayload.CommandLine))
 
     # --- Optional Win11 hardware-check bypass (windowsPE) -------------------
     $bypassXml = ''
@@ -264,8 +266,9 @@ function New-MiOSAutounattendXml {
         $specialScriptLines += ('& $env:ComSpec /d /s /c ''' + $command.Replace("'", "''") + '''')
     }
     $specialScript = ($specialScriptLines -join "`r`n") + "`r`n"
-    $specialScriptB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($specialScript))
-    $preOobeXml = ('        <RunSynchronousCommand wcm:action="add"><Order>5</Order><Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand {0}</Path><Description>MiOS service commands from the layered SSOT</Description></RunSynchronousCommand>' -f $specialScriptB64)
+    $specialPayload = New-MiOSUnattendPayload -Name SpecializeScript -Script $specialScript
+    $specialScriptB64 = $specialPayload.Base64
+    $preOobeXml = ('        <RunSynchronousCommand wcm:action="add"><Order>5</Order><Path>{0}</Path><Description>MiOS service commands from the layered SSOT</Description></RunSynchronousCommand>' -f [Security.SecurityElement]::Escape($specialPayload.CommandLine))
 
     # Boot-into-Xbox FSE: the Microsoft-Windows-Gaming-Configuration component
     # (StartupToGamingHome + GamingHomeApp) launches the full-screen Xbox home on

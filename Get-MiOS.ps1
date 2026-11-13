@@ -841,12 +841,18 @@ function Sync-MiosUserTomlToBuilder {
         if (-not $proc.Start()) { throw 'Could not start the private builder handoff.' }
         $stdout = $proc.StandardOutput.ReadToEndAsync(); $stderr = $proc.StandardError.ReadToEndAsync()
         $bytes = [IO.File]::ReadAllBytes($Path)
-        $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+        $write = $proc.StandardInput.BaseStream.WriteAsync($bytes, 0, $bytes.Length)
+        if (-not $write.Wait(60000)) { throw 'Private builder handoff stdin timed out; the saved file was retained.' }
+        $null = $write.GetAwaiter().GetResult()
         $proc.StandardInput.Close()
         if (-not $proc.WaitForExit(60000)) { $proc.Kill(); throw 'Private builder handoff timed out.' }
         if ($proc.ExitCode -ne 0) { throw "Private builder handoff failed (exit $($proc.ExitCode)); the saved file was not archived." }
         $null = $stdout.GetAwaiter().GetResult(); $null = $stderr.GetAwaiter().GetResult()
-    } finally { $proc.Dispose() }
+    } finally {
+        # An input error/timeout can happen before WaitForExit. Do not leave a blocked writer child behind.
+        try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+        $proc.Dispose()
+    }
 }
 
 function Get-MiosTomlTableArray {

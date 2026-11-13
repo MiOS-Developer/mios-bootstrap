@@ -267,7 +267,7 @@ $ErrorActionPreference='Stop';try{$r=[Xml.XmlReaderSettings]::new();$r.DtdProces
     # argument. Encoding the launcher would itself exceed Setup's 1,024-unit
     # FirstLogon CommandLine cap, even below CreateProcessW's 32,767-unit limit.
     $command = 'powershell.exe -NoProfile -NonInteractive -Command "' + $launcher + '"'
-    if ($command.Length -gt 1024) { throw 'MiOS unattended launcher exceeds the Windows Setup command-line limit' }
+    if ($command.Length -ge 1024) { throw 'MiOS unattended launcher exceeds the Windows Setup command-line limit' }
     return @{ Base64 = [Convert]::ToBase64String($bytes); CommandLine = $command }
 }
 

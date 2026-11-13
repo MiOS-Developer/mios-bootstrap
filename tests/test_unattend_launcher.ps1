@@ -78,7 +78,7 @@ try {
     foreach ($name in @('FirstLogonScript','SpecializeScript')) {
         $payload = New-MiOSUnattendPayload -Name $name -Script $large
         Assert-True ($payload.Base64.Length -gt 32767) 'large payload would overflow the old encoded command'
-        Assert-True ($payload.CommandLine.Length -le 1024) 'large payload fits the Windows Setup command-line field cap'
+        Assert-True ($payload.CommandLine.Length -lt 1024) 'large payload fits the Windows Setup command-line field cap'
         Assert-SameBytes ($unicode.GetBytes($large)) ([Convert]::FromBase64String($payload.Base64)) 'complete UTF-16LE payload bytes survive exactly'
         Assert-True (-not $payload.CommandLine.Contains($secret)) 'launcher contains no plaintext credential'
         Set-FixtureAnswer $name $payload.Base64
@@ -100,6 +100,17 @@ try {
         [IO.File]::Delete($answer)
         Assert-Refused $payload 'missing Panther cache refuses without network or media fallback'
     }
+    # Local element names alone are insufficient, and the namespace must not
+    # make two separate extension containers appear as one executable payload.
+    $namespacePayload = New-MiOSUnattendPayload -Name FirstLogonScript -Script $large
+    $xmlPrefix = '<unattend xmlns="urn:schemas-microsoft-com:unattend">'
+    $extension = '<Extensions xmlns="urn:mios:unattend"><FirstLogonScript>' + $namespacePayload.Base64 + '</FirstLogonScript></Extensions>'
+    Write-MiOSPrivateText -Path $answer -Text ($xmlPrefix + $extension.Replace('<FirstLogonScript>', '<FirstLogonScript xmlns="urn:fixture:other">') + '</unattend>')
+    Assert-Refused $namespacePayload 'same payload local name in another namespace refuses'
+    Write-MiOSPrivateText -Path $answer -Text ($xmlPrefix + $extension.Replace('xmlns="urn:mios:unattend"', 'xmlns=""') + '</unattend>')
+    Assert-Refused $namespacePayload 'missing extension namespace refuses'
+    Write-MiOSPrivateText -Path $answer -Text ($xmlPrefix + $extension + $extension + '</unattend>')
+    Assert-Refused $namespacePayload 'duplicate extension containers refuse before payload invocation'
     $throwing = New-MiOSUnattendPayload -Name FirstLogonScript -Script ('throw ''' + $secret + '''')
     Set-FixtureAnswer FirstLogonScript $throwing.Base64
     Assert-Refused $throwing 'terminating script failure returns nonzero without logging its credential-bearing exception'
@@ -153,7 +164,7 @@ try {
             $selector = if ($name -ceq 'FirstLogonScript') { '//u:FirstLogonCommands/u:SynchronousCommand/u:CommandLine' } else { '//u:settings[@pass="specialize"]//u:RunSynchronousCommand[u:Order="5"]/u:Path' }
             $launcherNode = $document.SelectSingleNode($selector, $ns)
             Assert-True ($null -ne $launcherNode -and $launcherNode.InnerText -ceq $expectedPayload.CommandLine) 'renderer binds each launch phase to its complete exact extension payload'
-            Assert-True ($launcherNode.InnerText.Length -le 1024) 'both real Setup phase launchers fit the stricter field cap'
+            Assert-True ($launcherNode.InnerText.Length -lt 1024) 'both real Setup phase launchers fit the stricter field cap'
             $nativeTokens = $null; $nativeErrors = $null
             $nativeAst = [Management.Automation.Language.Parser]::ParseInput($scriptText, [ref]$nativeTokens, [ref]$nativeErrors)
             Assert-True ($nativeErrors.Count -eq 0) 'full vendor ordered payload parses'

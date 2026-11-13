@@ -1,4 +1,4 @@
-# AI-hint: Primary entry point for MiOS installation; handles admin elevation, environment validation, and fresh-clone of the bootstrap repo to initiate the preflight, VM setup, and OCI build pipeline.
+# AI-hint: Primary entry point for MiOS installation; handles admin elevation, environment validation, and lossless refresh of the bootstrap repo to initiate the preflight, VM setup, and OCI build pipeline.
 # AI-related: /usr/share/mios/mios.toml, /etc/mios/mios.toml, /etc/mios/., /usr/share/mios/branding/mios.txt, /usr/share/mios/branding/mios, mios-dev, mios-bootstrap, mios-pull, mios-launch, mios-install
 # AI-functions: Disable-ConsoleQuickEdit, Resolve-MiosTomlText, Get-MiosTomlValue, Show-MiOSBanner, Show-MiOSAgreement, Invoke-MiOSAgreementGate, _Center-MiOSGateConsole, Get-MiosPalette, _hex, Test-MiOSFontInstalled, Wait-MiOSWindowsTerminalReady, Ensure-MiOSWinget
 <#
@@ -14,9 +14,9 @@
       2. Resizes the host window to ~100x40 so the build dashboard
          frame (80 cols + breathing room) fits without wrapping.
       3. Verifies Git + Podman are present.
-      4. Force-cleans + fresh-clones the mios-bootstrap repo into
-         $env:TEMP\mios-bootstrap. Every run is fresh; no persistent
-         working tree, no fetch/pull update branch.
+      4. Refreshes clean source checkouts only by fast-forward; local
+         commits, staged edits, untracked files and ignored files are
+         preserved. New clones never replace existing source trees.
       5. Hands off to bootstrap.ps1 -- the new split-bootstrap entry
          (default: -BootstrapOnly = preflight + dev VM + Windows
          install; the deployable OCI image is built later via the
@@ -37,17 +37,9 @@
     Branch to clone (default: main).
 
 .PARAMETER RepoDir
-    Temp clone target. Default: $env:TEMP\mios-bootstrap-<random8>.
-    Each invocation gets a fresh GUID-suffixed dir so a locked
-    leftover from a previous run never blocks a new start. Operators
-    who genuinely want to point at a local checkout (e.g. for
-    development) can pass an explicit -RepoDir; the script will
-    refuse to delete it if it's outside %TEMP%. There is NO update /
-    fetch / pull branch here -- always fresh-clone. A persistent path
-    like $env:USERPROFILE\MiOS-bootstrap is FORBIDDEN as the bootstrap
-    working tree (it accumulates stale state across runs and was the
-    root cause of every "FATAL: From https://...", "FATAL: Cloning
-    into ...", and "FATAL: vm already exists" surface we kept fixing).
+    Bootstrap checkout path. Existing local changes and local commits are
+    preserved; clean checkouts fast-forward only. A failed fresh clone is
+    retained for inspection rather than deleted before retrying.
 
 .PARAMETER FullBuild
     Run the full pipeline in one shot (preflight + dev VM + Windows
@@ -112,29 +104,114 @@ Disable-ConsoleQuickEdit
 # mios-bootstrap repo isn't cloned yet -- the Default bootstrap clones it, but these actions run
 # FIRST (this router precedes the bootstrap). Fetch it here (git if present, else a GitHub zip)
 # so a factory Windows can go straight from the web one-liner to a build/flash with no manual clone.
-function Ensure-MiosBootstrapRepo {
-    $root = 'C:\mios-bootstrap'
-    if (Test-Path (Join-Path $root 'field\autounattend\Build-MiOSXboxISO.ps1')) { return $root }
-    Write-Host "  [*] mios-bootstrap not present -- fetching it for this action (bare-Windows path)..." -ForegroundColor Cyan
-    if (Get-Command git -ErrorAction SilentlyContinue) {
-        try { & git clone --depth 1 'https://github.com/mios-dev/mios-bootstrap.git' $root 2>&1 | Out-Null } catch {}
+function New-MiosFieldPrivateSourceStaging {
+    $path = Join-Path ([IO.Path]::GetTempPath()) ('mios-field-source-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $path -ErrorAction Stop
+    try {
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl = New-Object Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.SetOwner($sid)
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+        Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction Stop
+        return $path
+    } catch {
+        # This directory was created by this invocation and has never held operator data.
+        Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+        throw
     }
-    if (-not (Test-Path (Join-Path $root 'field\autounattend\Build-MiOSXboxISO.ps1'))) {
-        $zip = Join-Path $env:TEMP 'mios-bootstrap.zip'
-        $tmp = Join-Path $env:TEMP ('mios-bs-' + [System.Guid]::NewGuid().ToString('N').Substring(0,8))
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri 'https://codeload.github.com/mios-dev/mios-bootstrap/zip/refs/heads/main' -OutFile $zip -UseBasicParsing -ErrorAction Stop
-            Expand-Archive -Path $zip -DestinationPath $tmp -Force
-            $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
-            if ($inner) { New-Item -ItemType Directory -Force -Path $root | Out-Null; Copy-Item -Path (Join-Path $inner.FullName '*') -Destination $root -Recurse -Force }
-        } catch {
-            Write-Host "  [!] Could not fetch mios-bootstrap: $($_.Exception.Message)" -ForegroundColor Yellow
-        } finally {
-            Remove-Item $zip,$tmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function Expand-MiosFieldSourceArchive {
+    param([Parameter(Mandatory)][string]$Archive, [Parameter(Mandatory)][string]$Destination)
+    # Fixed safety ceilings for a source archive, independent of installer/profile preferences.
+    if ((Get-Item -LiteralPath $Archive -ErrorAction Stop).Length -gt 256MB) { throw 'Field source archive exceeds the compressed size limit.' }
+    if (Test-Path -LiteralPath $Destination) { throw 'Field source extraction requires a new private destination.' }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        if ($zip.Entries.Count -gt 50000) { throw 'Field source archive exceeds the entry limit.' }
+        $root = [IO.Path]::GetFullPath($Destination).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+        $total = [long]0
+        foreach ($entry in $zip.Entries) {
+            $name = $entry.FullName.Replace('\', '/')
+            $mode = ($entry.ExternalAttributes -shr 16) -band 0xF000
+            if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('/') -or $name.Contains(':') -or
+                $name.IndexOf([char]0) -ge 0 -or $name -match '(^|/)\.\.?(/|$)' -or $mode -notin @(0, 0x4000, 0x8000)) {
+                throw 'Field source archive contains an unsafe path or entry type.'
+            }
+            foreach ($segment in ($name -split '/' | Where-Object { $_ })) {
+                if ($segment -match '[<>"|?*\x00-\x1f]' -or $segment -match '[. ]$' -or
+                    $segment -match '^(?i:CON|PRN|AUX|NUL|COM[0-9\u00b9\u00b2\u00b3]|LPT[0-9\u00b9\u00b2\u00b3])(?:\.|$)') {
+                    throw 'Field source archive contains an unsafe path or entry type.'
+                }
+            }
+            $target = [IO.Path]::GetFullPath((Join-Path $Destination $name))
+            if (-not $target.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw 'Field source archive escapes its extraction directory.' }
+            $total += $entry.Length
+            if ($entry.Length -gt 256MB -or $total -gt 1GB) { throw 'Field source archive exceeds the expanded size limit.' }
         }
+        $null = [IO.Directory]::CreateDirectory($Destination)
+        $buffer = New-Object byte[] 65536
+        foreach ($entry in $zip.Entries) {
+            $name = $entry.FullName.Replace('\', '/')
+            $target = [IO.Path]::GetFullPath((Join-Path $Destination $name))
+            if ($name.EndsWith('/')) { $null = [IO.Directory]::CreateDirectory($target); continue }
+            $null = [IO.Directory]::CreateDirectory((Split-Path $target -Parent))
+            $entryInputStream = $null; $entryOutputStream = $null
+            try {
+                $entryInputStream = $entry.Open()
+                $entryOutputStream = [IO.File]::Open($target, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                $copied = [long]0
+                while (($read = $entryInputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    $copied += $read
+                    if ($copied -gt $entry.Length -or $copied -gt 256MB) { throw 'Field source archive entry exceeded its declared size.' }
+                    $entryOutputStream.Write($buffer, 0, $read)
+                }
+                if ($copied -ne $entry.Length) { throw 'Field source archive entry was truncated.' }
+            } finally {
+                if ($entryOutputStream) { $entryOutputStream.Dispose() }
+                if ($entryInputStream) { $entryInputStream.Dispose() }
+            }
+        }
+    } finally { $zip.Dispose() }
+}
+
+function Ensure-MiosBootstrapRepo {
+    param([string]$Root = 'C:\mios-bootstrap')
+    if (Test-Path -LiteralPath (Join-Path $Root 'field\autounattend\Build-MiOSXboxISO.ps1')) { return $Root }
+    if ((Test-Path -LiteralPath $Root) -and
+        (-not (Test-Path -LiteralPath $Root -PathType Container) -or @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction Stop).Count)) {
+        throw 'The Field source directory contains an incomplete or existing tree; it was preserved. Select a separate complete checkout.'
     }
-    return $root
+    Write-Host '  [*] Fetching a new bootstrap checkout for this action...' -ForegroundColor Cyan
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        try { & git clone -- 'https://github.com/mios-dev/mios-bootstrap.git' $Root 2>&1 | Out-Null } catch {}
+    }
+    if (Test-Path -LiteralPath (Join-Path $Root 'field\autounattend\Build-MiOSXboxISO.ps1')) { return $Root }
+    if (Test-Path -LiteralPath $Root) {
+        throw 'The Field clone did not complete; its target was preserved. Review it or choose a new source path before retrying.'
+    }
+    $staging = New-MiosFieldPrivateSourceStaging
+    try {
+        $archive = Join-Path $staging 'source.zip'
+        $expanded = Join-Path $staging 'expanded'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri 'https://codeload.github.com/mios-dev/mios-bootstrap/zip/refs/heads/main' -OutFile $archive -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+        Expand-MiosFieldSourceArchive -Archive $archive -Destination $expanded
+        $roots = @(Get-ChildItem -LiteralPath $expanded -Force)
+        if ($roots.Count -ne 1 -or -not $roots[0].PSIsContainer -or
+            -not (Test-Path -LiteralPath (Join-Path $roots[0].FullName 'field\autounattend\Build-MiOSXboxISO.ps1') -PathType Leaf)) {
+            throw 'The Field source archive does not contain a complete bootstrap checkout.'
+        }
+        # Directory.Move refuses an existing destination, including a checkout created during download.
+        [IO.Directory]::Move($roots[0].FullName, [IO.Path]::GetFullPath($Root))
+    } finally {
+        # Only private staging created by this invocation is removed; source targets are never deleted.
+        Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    return $Root
 }
 
 # Consolidated Action Router
@@ -3757,6 +3834,10 @@ function Install-MiOSPowerShellProfile {
         }) -join ', '
     ) + ')'
 
+    $windowsRefreshBlock = Get-MiosFieldCheckoutProfileBlock
+    $miosBuildRef = [string](Get-MiosTomlValue -Section 'bootstrap' -Key 'mios_ref' -Default 'main')
+    $miosBuildRefLiteral = "'" + $miosBuildRef.Replace("'", "''") + "'"
+
     $miosScriptBody = @"
 # MiOS PowerShell profile -- PSReadLine reload + fastfetch MOTD +
 # oh-my-posh init.
@@ -4444,6 +4525,8 @@ if (`$true) {
 
 `$Script:MiosBootstrapRaw = '$($Script:MiosBootstrapRaw)'
 
+$windowsRefreshBlock
+
 function mios-build {
     [CmdletBinding()]
     param([Parameter(ValueFromRemainingArguments)]`$Args)
@@ -4554,11 +4637,7 @@ function mios-build {
         }
     }
 
-    # -- Step 3: sync overlay so the build sees the latest mios.toml -
-    # Note: this runs AFTER the Downloads-promote step so mios-pull
-    # sees the just-promoted files in M:\etc\mios. mios-pull's git
-    # reset --hard would otherwise blow away the operator's changes
-    # if they lived in the tracked tree.
+    # -- Step 3: refresh only a clean fast-forward; saved operator edits remain in place.
     if (-not `$skipPull) {
         Write-Host ''
         Write-Host '  [3/4] Syncing M:\ overlay (mios.git + mios-bootstrap)...' -ForegroundColor Cyan
@@ -4587,16 +4666,7 @@ function mios-pull {
         Write-Host '  [!] M:\ is not a git working tree -- run mios-build first.' -ForegroundColor Yellow
         return
     }
-    Push-Location 'M:\'
-    try {
-        git fetch --depth=1 origin main
-        if (`$LASTEXITCODE -eq 0) {
-            git reset --hard FETCH_HEAD
-            Write-Host '  [+] M:\ overlay synced to origin/main.' -ForegroundColor Green
-        } else {
-            Write-Host '  [!] git fetch failed -- check network.' -ForegroundColor Yellow
-        }
-    } finally { Pop-Location }
+    Update-MiosWindowsBuildCheckout -Path 'M:\' -Ref $miosBuildRefLiteral
 }
 
 function mios-config {
@@ -4750,7 +4820,7 @@ function mios-help {
     Write-Host '                  or use mios-<verb> directly:' -ForegroundColor DarkGray
     Write-Host '  mios build    run the full MiOS OS bootstrap (WSL2 + podman + dev VM)' -ForegroundColor White
     Write-Host '  mios update   re-run Get-MiOS.ps1 (refresh terminal install)' -ForegroundColor White
-    Write-Host '  mios pull     git fetch + hard reset M:\ to origin/main' -ForegroundColor White
+    Write-Host '  mios pull     clean fast-forward of M:\; preserve local work' -ForegroundColor White
     Write-Host '  mios config   open the HTML configurator (mios.toml editor)' -ForegroundColor White
     Write-Host '  mios ai       open Open WebUI (rich LLM interface) in your browser' -ForegroundColor White
     Write-Host '  mios dev      wsl into the MiOS-DEV distro (root /, user mios)' -ForegroundColor White
@@ -5162,7 +5232,7 @@ function Get-MiosFieldCanonicalFunctions {
     $names = @('Split-MiosTomlKeyLine', 'Get-MiosTomlTableArray', 'Get-MiosTomlValue',
         'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Test-MiosElevated', 'Enable-MiOSWindowsFeatures',
         'Test-MiosWslVmCreator', 'Register-MiosWslVmCreator', 'Set-MiosWslFirewallPolicy',
-        'Invoke-MiosPlatformGate', 'Get-MiosWslConfigText', 'Invoke-MiOSFullReap')
+        'Invoke-MiosPlatformGate', 'Get-MiosWslConfigText', 'Invoke-MiOSFullReap', 'Update-MiosWindowsBuildCheckout')
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names
     }, $true))
@@ -5170,6 +5240,49 @@ function Get-MiosFieldCanonicalFunctions {
         if (@($definitions | Where-Object Name -eq $name).Count -ne 1) { throw "Missing or duplicate canonical platform helper: $name" }
     }
     return [scriptblock]::Create((($definitions | ForEach-Object { $_.Extent.Text }) -join "`n"))
+}
+
+function Update-MiosFieldCheckout {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Ref,
+        [string]$CanonicalPath = (Get-MiosFieldCanonicalPath))
+    $definitions = Get-MiosFieldCanonicalFunctions -Path $CanonicalPath
+    & {
+        param([scriptblock]$Definitions, [string]$Checkout, [string]$SourceRef)
+        . $Definitions
+        Update-MiosWindowsBuildCheckout -Path $Checkout -Ref $SourceRef
+    } $definitions $Path $Ref
+}
+
+function Get-MiosFieldCheckoutProfileBlock {
+    param([string]$CanonicalPath = (Get-MiosFieldCanonicalPath))
+    $definitions = Get-MiosFieldCanonicalFunctions -Path $CanonicalPath
+    $refresh = @($definitions.Ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Update-MiosWindowsBuildCheckout'
+    }, $true))
+    if ($refresh.Count -ne 1) { throw 'The canonical source refresh helper is unavailable; profile preparation stopped.' }
+    return $refresh[0].Extent.Text
+}
+
+function Initialize-MiosFieldSourceCheckout {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$RepoUrl,
+        [Parameter(Mandatory)][string]$Ref, [string]$CanonicalPath = (Get-MiosFieldCanonicalPath))
+    if (Test-Path -LiteralPath $Path) {
+        if (Test-Path -LiteralPath (Join-Path $Path '.git')) {
+            Update-MiosFieldCheckout -Path $Path -Ref $Ref -CanonicalPath $CanonicalPath
+            return
+        }
+        if (-not (Test-Path -LiteralPath $Path -PathType Container) -or
+            @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop).Count) {
+            throw 'The selected Field source path contains existing non-checkout data; preserve it and choose an empty path.'
+        }
+    }
+    $valid = Invoke-GitProc -ArgList @('check-ref-format', '--branch', $Ref)
+    if ($valid.ExitCode -ne 0) { throw 'The selected Field source ref is invalid; no source was changed.' }
+    # Clone once without deleting a partial target. A failed clone may contain work saved concurrently.
+    $clone = Invoke-GitProc -ArgList @('clone', '--branch', $Ref, '--', $RepoUrl, $Path)
+    if ($clone.ExitCode -ne 0) {
+        throw 'Field source clone failed; the target was preserved. Review it or select another empty path before retrying.'
+    }
 }
 
 function Invoke-MiosFieldPlatformGate {
@@ -6223,20 +6336,8 @@ Write-Good "Prerequisites OK (git, podman)"
 $miosRepoDir = "M:\MiOS\repo"
 New-Item -ItemType Directory -Path $miosRepoDir -Force -ErrorAction SilentlyContinue | Out-Null
 
-# 5. Fresh-clone the mios-bootstrap repo to M:\MiOS\repo\mios-bootstrap.
-#
-# CONTRACT (per feedback_mios_irm_iex_always_temp_clone.md +
-# feedback_mios_entry_m_drive_clone.md): irm|iex ALWAYS clones a
-# fresh copy. There is NO update / fetch / pull branch. The clone
-# target is M:\MiOS\repo\mios-bootstrap (the canonical Windows-entry
-# working tree), NOT %TEMP% or %USERPROFILE%.
-#
-# Existing installation state is preserved by platform admission. The checks below handle
-# the selected checkout separately; a failed or pending platform gate cannot reach them.
-if ((Test-Path $RepoDir) -and ($RepoDir -ne 'M:\MiOS\repo\mios-bootstrap')) {
-    Write-Err "-RepoDir $RepoDir already exists. Either delete it manually, or re-run without -RepoDir to use the canonical M:\MiOS\repo\mios-bootstrap."
-    exit 1
-}
+# 5. Refresh the selected bootstrap checkout without discarding local work.
+# Existing dirty/staged/untracked/diverged trees stay in place; ignored collisions fail closed.
 
 # Helper: run git with all streams drained via System.Diagnostics.Process
 # so PowerShell's pipeline never sees stderr (no EAP=Stop trap on git's
@@ -6275,83 +6376,7 @@ function Invoke-GitProc {
     }
 }
 
-# If $RepoDir already exists with a .git subdir from a prior run, do an
-# in-place fetch + reset --hard to bring it to origin/main. NEVER delete
-# operator-side files (per feedback_mios_entry_full_reset.md). If it
-# exists but isn't a git repo, fail with an actionable message rather
-# than silently nuking it.
-if (Test-Path $RepoDir) {
-    if (Test-Path (Join-Path $RepoDir '.git')) {
-        Write-Info "Updating existing bootstrap clone at $RepoDir (fetch + hard reset to origin/$Branch) ..."
-        $fr = Invoke-GitProc -ArgList @('fetch','--depth=1','origin',$Branch) -Cwd $RepoDir
-        if ($fr.ExitCode -ne 0) {
-            Write-Warning "git fetch in $RepoDir failed (exit $($fr.ExitCode)). Network may be unreachable."
-            Write-Warning "Using existing staged offline clone at $RepoDir without updating."
-        } else {
-            $rr = Invoke-GitProc -ArgList @('reset','--hard','FETCH_HEAD') -Cwd $RepoDir
-            if ($rr.ExitCode -ne 0) {
-                Write-Err "git reset --hard in $RepoDir failed (exit $($rr.ExitCode))."
-                Write-Err "Stderr: $($rr.Stderr.Trim())"
-                exit 1
-            }
-            Write-Good "Bootstrap clone updated to origin/$Branch in place at $RepoDir"
-        }
-    } elseif (@(Get-ChildItem -LiteralPath $RepoDir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
-        # Exists but EMPTY: a prior uninstall emptied it, yet a lingering WSL2 /
-        # minifilter handle can leave the now-empty dir undeletable (rmdir ->
-        # "device or resource busy", no Restart-Manager holder). git clone into
-        # an existing EMPTY dir succeeds, so don't abort the whole install over
-        # an empty leftover -- clone in place.
-        Write-Info "$RepoDir exists but is empty (undeletable leftover) -- cloning $RepoUrl into it in place ..."
-        $cr = $null
-        for ($_cattempt = 1; $_cattempt -le 3; $_cattempt++) {
-            $cr = Invoke-GitProc -ArgList @('clone','--branch',$Branch,'--depth','1',$RepoUrl,$RepoDir)
-            if ($cr.ExitCode -eq 0) { break }
-            if ($_cattempt -lt 3) { Start-Sleep -Seconds @(2,5,10)[$_cattempt-1] }
-        }
-        if ($cr.ExitCode -ne 0) {
-            Write-Err "git clone into empty $RepoDir failed (exit $($cr.ExitCode)). Stderr: $($cr.Stderr.Trim())"
-            exit 1
-        }
-        Write-Good "Fresh bootstrap clone into empty $RepoDir"
-    } else {
-        Write-Err "$RepoDir exists, is not a git repository, and is NOT empty."
-        Write-Err "I won't delete it -- contents may be operator-managed. Either:"
-        Write-Err "  - Move it aside:   Rename-Item `"$RepoDir`" `"$RepoDir.bak`""
-        Write-Err "  - Or pass -RepoDir <other-path> to use a different target."
-        exit 1
-    }
-} else {
-    Write-Info "Cloning $RepoUrl ($Branch, depth=1) -> $RepoDir ..."
-    # Ensure parent dir exists so git clone has a place to write.
-    $parent = Split-Path $RepoDir -Parent
-    if ($parent -and -not (Test-Path $parent)) {
-        New-Item -ItemType Directory -Path $parent -Force -ErrorAction SilentlyContinue | Out-Null
-    }
-    # Install-robustness retry the clone 3x with backoff. A single
-    # transient network blip (raw.githubusercontent / GitHub TLS reset) otherwise
-    # aborted the ENTIRE irm|iex install at the entry. Each retry wipes the partial
-    # clone so it starts clean.
-    $cr = $null
-    for ($_cattempt = 1; $_cattempt -le 3; $_cattempt++) {
-        if (Test-Path $RepoDir) { Remove-Item -Recurse -Force $RepoDir -ErrorAction SilentlyContinue }
-        $cr = Invoke-GitProc -ArgList @('clone','--branch',$Branch,'--depth','1',$RepoUrl,$RepoDir)
-        if ($cr.ExitCode -eq 0) { break }
-        if ($_cattempt -lt 3) {
-            $_cbk = @(2,5,10)[$_cattempt-1]
-            Write-Info "git clone attempt $_cattempt failed (exit $($cr.ExitCode)); retrying in ${_cbk}s (transient network?)..."
-            Start-Sleep -Seconds $_cbk
-        }
-    }
-    if ($cr.ExitCode -ne 0) {
-        Write-Err "git clone $RepoUrl -> $RepoDir failed after 3 attempts (exit $($cr.ExitCode))."
-        Write-Err "Stderr: $($cr.Stderr.Trim())"
-        Write-Err "Re-run manually to see git's diagnostic output:"
-        Write-Err "  git clone --branch $Branch --depth 1 $RepoUrl `"$RepoDir`""
-        exit 1
-    }
-    Write-Good "Fresh bootstrap clone at $RepoDir"
-}
+Initialize-MiosFieldSourceCheckout -Path $RepoDir -RepoUrl $RepoUrl -Ref $Branch
 
 # 6. Hand off to bootstrap.ps1 (canonical split-bootstrap entry).
 # Defaults to -BootstrapOnly: stops after dev VM + Windows install.

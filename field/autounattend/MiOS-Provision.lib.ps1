@@ -34,7 +34,7 @@ function Get-MiOSVirtFeatureMatch {
 # A case-sensitive compatibility view for render-only PowerShell consumers. Image
 # builds use the canonical MiOS resolver; its private win-json projection wins.
 function New-MiosTomlView {
-    @{ scalars = [Collections.Hashtable]::new([StringComparer]::Ordinal); accounts = @(); prefs = @{}; has_accounts = $false }
+    @{ scalars = [Collections.Hashtable]::new([StringComparer]::Ordinal); accounts = @(); prefs = @{}; has_accounts = $false; _resolved_credentials_authoritative = $false }
 }
 function ConvertFrom-MiosTomlValue {
     param([string]$Text, [string]$Key)
@@ -149,7 +149,13 @@ function Assert-MiOSPrivateFile {
         $current = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $allowed = @($current, 'S-1-5-18', 'S-1-5-32-544')
         $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        try { $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0) }
+        catch { throw 'MiOS SSOT: private projection security descriptor cannot be verified' }
+        if ($null -eq $descriptor.Owner -or $descriptor.Owner.Value -cnotin $allowed) { throw 'MiOS SSOT: private projection has an untrusted Windows owner' }
+        # A public credential-free template still needs a trusted owner; its exact
+        # bytes are checked before the writer tightens its descriptor.
         if ($AllowPublicTemplate) { return }
+        if (($descriptor.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -eq 0 -or $null -eq $descriptor.DiscretionaryAcl) { throw 'MiOS SSOT: private projection has a missing or null DACL' }
         foreach ($rule in $acl.Access) {
             if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
             try { $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
@@ -251,6 +257,7 @@ function Import-MiOSResolvedCredentials {
     foreach ($key in @($Toml.scalars.Keys)) { if ($key -cmatch '^(identity\.|autounattend\.|field\.sysrescue\.|auth\.password_hash$)') { [void]$Toml.scalars.Remove($key) } }
     Merge-MiosTomlLayer -Dst $Toml -Src $projection
     if (-not $projection.has_accounts) { $Toml.accounts = @(); $Toml.has_accounts = $false }
+    $Toml._resolved_credentials_authoritative = $true
 }
 function Read-MiosToml {
     param([string]$Path, [switch]$SingleFile, [string]$ResolvedJson)
@@ -348,6 +355,8 @@ function Apply-MiosEdition {
     foreach ($k in $keys) {
         if ($k.StartsWith($prefix)) {
             $baseKey = $k.Substring($prefix.Length)
+            # A validated private projection owns these complete planes, including absence.
+            if ($T._resolved_credentials_authoritative -is [bool] -and $T._resolved_credentials_authoritative -and $baseKey -cmatch '^(identity\.|autounattend\.|field\.sysrescue\.|auth\.password_hash$)') { continue }
             $T.scalars[$baseKey] = $T.scalars[$k]
             $found = $true
         }

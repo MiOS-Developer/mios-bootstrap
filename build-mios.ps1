@@ -4625,6 +4625,62 @@ function Install-MiOSTmuxProfile {
     return $null
 }
 
+function Update-MiosWindowsBuildCheckout {
+    param([Parameter(Mandatory = $true)][string]$Path,
+          [Parameter(Mandatory = $true)][string]$Ref)
+    # Keep local operator work and commits. Only a clean checkout can advance.
+    # Native stderr is not a terminating PowerShell error on Windows PowerShell 5.1.
+    $ErrorActionPreference = 'Continue'
+    $changes = @(& git -C $Path status --porcelain=v1 --untracked-files=normal 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the Windows MiOS checkout; no source was changed.' }
+    if (@($changes | Where-Object { $_ }).Count) {
+        Write-Host '  [pull] Windows checkout has local changes; preserving them and building the current tree.' -ForegroundColor Yellow
+        return
+    }
+    & git check-ref-format --branch $Ref *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'The configured MiOS source ref is invalid; no source was changed.' }
+    & git -C $Path fetch origin $Ref *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host '  [pull] Windows source fetch failed; preserving and building the current tree. Retry when the remote is available.' -ForegroundColor Yellow
+        return
+    }
+    # A local editor may have saved while fetch was running.
+    $changes = @(& git -C $Path status --porcelain=v1 --untracked-files=normal 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the Windows MiOS checkout after fetch; no local source was changed.' }
+    if (@($changes | Where-Object { $_ }).Count) {
+        Write-Host '  [pull] Windows checkout changed during fetch; preserving it and building the current tree.' -ForegroundColor Yellow
+        return
+    }
+    & git -C $Path merge-base --is-ancestor HEAD FETCH_HEAD *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host '  [pull] Windows checkout has local commits that differ from the remote; preserving and building the current tree. Reconcile the branches before updating.' -ForegroundColor Yellow
+        return
+    }
+    & git -C $Path merge --ff-only --no-edit --no-autostash FETCH_HEAD *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'The Windows MiOS checkout could not fast-forward safely; local work was preserved. Reconcile it before retrying.' }
+    Write-Host '  [pull] Windows checkout is current after a clean fast-forward.' -ForegroundColor Green
+}
+
+function Get-MiosUserTomlHelperSource {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    # The Windows entrypoint owns private user-tier publication and transfer.
+    # Embed its definitions without executing installation or maintaining a second policy.
+    $tokens = $null; $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count) { throw 'The canonical MiOS user configuration helpers do not parse.' }
+    $required = @('Assert-MiosNoReparsePath', 'Set-MiosPrivateUserTomlAcl', 'Import-MiosUserToml',
+                  'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder')
+    $definitions = @($ast.FindAll({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+    }, $true))
+    $source = foreach ($name in $required) {
+        $definition = @($definitions | Where-Object { $_.Name -eq $name })
+        if ($definition.Count -ne 1) { throw "The canonical MiOS user configuration helper is missing or ambiguous: $name" }
+        $definition[0].Extent.Text
+    }
+    return $source -join "`r`n`r`n"
+}
+
 function Install-WindowsBranding {
     if ($env:MIOS_SKIP_WINDOWS_BRANDING -in @('1','true','TRUE','yes')) {
         Log-Warn "MIOS_SKIP_WINDOWS_BRANDING set -- Windows branding install skipped"
@@ -5310,7 +5366,7 @@ Verb 'mios config'  'Open the HTML configurator (mios.toml editor) in your brows
 Note '               Edit identity, AI, packages, ports, services, theme, etc.'
 Verb 'mios dash'    'Render the framed MiOS dashboard (banner + fastfetch + verbs).'
 Verb 'mios dev'     'Drop into the MiOS-DEV podman machine as user `mios` at /.'
-Verb 'mios pull'    'git fetch + hard reset root overlay to origin/main (no rebuild).'
+Verb 'mios pull'    'Refresh the native root overlay (no rebuild).'
 Verb 'mios update'  'Re-run the bootstrap (cache-busted) -- refresh terminal + dev VM.'
 Verb 'mios help'    'This list.'
 Note ''
@@ -5327,7 +5383,7 @@ Verb 'MiOS-DEV'     'Drops you into the MiOS-DEV podman machine immediately.'
 Verb 'MiOS Config'  'Opens mios.html (the configurator) in the default browser.'
 Note '                Edit identity, AI, packages, ports, services, theme. Save'
 Note '                writes mios.toml to %USERPROFILE%\Downloads; `mios build`'
-Note '                step 2 promotes it into the root overlay automatically.'
+Note '                step 2 imports it into the private user configuration tier.'
 Verb 'MiOS Help'    'This help screen, as a clickable app.'
 Verb 'Uninstall MiOS' 'Remove MiOS (preserves per-user config).'
 
@@ -5338,7 +5394,8 @@ Note '   C:\mios-bootstrap              The mios-bootstrap.git sub-repo tree'
 Note '   C:\mios-micro                  The mios-micro.git sub-repo tree'
 Note '   C:\MiOS-RnD                    The MiOS-RnD.git sub-repo tree'
 Note '   C:\-dev-loop                   The -dev-loop.git sub-repo tree'
-Note '   C:\etc\mios\mios.toml          Host overlay (operator overrides)'
+Note '   ~/.config/mios/mios.toml        Private operator configuration (Windows and MiOS-DEV)'
+Note '   C:\etc\mios\mios.toml          Credential-free host overrides'
 Note '   C:\usr\share\mios\mios.toml    Vendor SSOT (default values)'
 Note '   C:\MiOS\bin\                   Verb scripts (mios-build, mios-dev, mios-help, ...)'
 Note '   C:\MiOS\themes\mios.omp.json   oh-my-posh theme (MiOS palette)'
@@ -5353,8 +5410,8 @@ Note '          -> register MiOS as a native Windows app (Start Menu + Desktop)'
 Note '          -> STOP. Operator opens the MiOS app and types `mios build`.'
 Note ''
 Note '   `mios build` (operator-typed) -- triggers the full build pipeline:'
-Note '          -> promote Downloads/mios.toml edits to C:\etc\mios\mios.toml'
-Note '          -> mios-pull (sync root overlay to origin/main)'
+Note '          -> import Downloads/mios.toml privately into both user configuration tiers'
+Note '          -> clean-only Windows fast-forward, then mios-pull for the native root'
 Note '          -> SSH into MiOS-DEV -> /usr/libexec/mios/mios-build-driver'
 Note '          -> overlay -> account -> install -> smoketest -> build -> deploy'
 Note '          -> bootc switch + reboot -> MiOS-DEV IS MiOS (full parity)'
@@ -5385,60 +5442,54 @@ Note '   Press any key to close...'
     Set-Content -Path $helpPath -Value $helpScript -Encoding UTF8
     Log-Ok "mios-help.ps1 (full verb + functionality reference) staged at $helpPath"
 
-    $buildPath  = Join-Path $MiosBinDir 'mios-build.ps1'
-    $miosEtcDir = Join-Path $MiosRepoDir 'etc\mios'
-    $miosShareDirInRepo = Join-Path $MiosRepoDir 'mios\usr\share\mios'
+    $buildPath = Join-Path $MiosBinDir 'mios-build.ps1'
+    $userTomlHelperPath = @(
+        (Join-Path $PSScriptRoot 'Get-MiOS.ps1')
+        (Join-Path $MiosBootstrapShadow 'Get-MiOS.ps1')
+        (Join-Path $MiosRepoDir 'Get-MiOS.ps1')
+    ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $userTomlHelperPath) { throw 'The canonical MiOS private user configuration helpers are unavailable.' }
+    $userTomlHelperBlock = Get-MiosUserTomlHelperSource -Path $userTomlHelperPath
+    $windowsRefreshBlock = 'function Update-MiosWindowsBuildCheckout {' + (Get-Command Update-MiosWindowsBuildCheckout).Definition + "`r`n}"
+    $miosBuildRefLiteral = "'" + ([string]$MiosRef).Replace("'", "''") + "'"
     $buildScript = @"
 $devResolveBlock
-`$ErrorActionPreference = 'Continue'
+$userTomlHelperBlock
+$windowsRefreshBlock
+`$ErrorActionPreference = 'Stop'
+# Saved operator TOML remains in the private USER tier on both hosts.
+# Do not refresh any overlay or archive the download before both private writes succeed.
 `$downloads = Join-Path `$env:USERPROFILE 'Downloads'
-`$promoteTargets = @(
-    @{ Pattern = 'mios*.toml';  TargetDir = "$miosEtcDir";       Filename = 'mios.toml' }
-)
-`$promoted = `$false
-foreach (`$pt in `$promoteTargets) {
-    `$candidates = Get-ChildItem -Path `$downloads -Filter `$pt.Pattern -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending
-    if (-not `$candidates) { continue }
-    `$src = `$candidates[0]
-    if (-not (Test-Path `$pt.TargetDir)) {
-        New-Item -ItemType Directory -Path `$pt.TargetDir -Force | Out-Null
+`$tomlDst = Join-Path `$env:USERPROFILE '.config\mios\mios.toml'
+`$tomlSrc = Get-ChildItem -LiteralPath `$downloads -Filter 'mios*.toml' -File -ErrorAction SilentlyContinue |
+    Where-Object { `$_.Name -notmatch '\.imported-' } |
+    Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+try {
+    `$distro = Resolve-MiosDevDistro
+    if (`$tomlSrc) { `$tomlDst = Import-MiosUserToml -SourcePath `$tomlSrc.FullName -DestinationPath `$tomlDst }
+    if (Test-Path -LiteralPath `$tomlDst -PathType Leaf) {
+        Sync-MiosUserTomlToBuilder -Path `$tomlDst -Distro `$distro -User mios
     }
-    `$dst = Join-Path `$pt.TargetDir `$pt.Filename
-    Copy-Item -Path `$src.FullName -Destination `$dst -Force
-    `$ts  = Get-Date -Format 'yyyyMMdd-HHmmss'
-    `$archive = Join-Path `$src.DirectoryName ("{0}.imported-{1}" -f `$src.Name, `$ts)
-    Move-Item -Path `$src.FullName -Destination `$archive -Force
-    Write-Host ("  [promote] {0} -> {1}" -f `$src.Name, `$dst) -ForegroundColor Green
-    Write-Host ("            archived as {0}" -f (Split-Path `$archive -Leaf)) -ForegroundColor DarkGray
-    `$promoted = `$true
+    if (`$tomlSrc) {
+        `$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        `$archive = Join-Path `$tomlSrc.DirectoryName (`$tomlSrc.BaseName + '.imported-' + `$stamp + '.toml')
+        Move-Item -LiteralPath `$tomlSrc.FullName -Destination `$archive -ErrorAction Stop
+        Write-Host '  [promote] saved config imported into the private Windows and MiOS-DEV user tiers.' -ForegroundColor Green
+    } else {
+        Write-Host '  [promote] no saved mios*.toml in Downloads -- using the current user configuration.' -ForegroundColor DarkGray
+    }
+} catch {
+    throw 'Private MiOS user configuration import or builder handoff failed; any saved download is preserved. Build stopped.'
 }
-if (-not `$promoted) {
-    Write-Host '  [promote] no mios*.toml / *mios*.html in Downloads -- proceeding with current overlay' -ForegroundColor DarkGray
-}
+# END PRIVATE USER CONFIGURATION HANDOFF
+`$ErrorActionPreference = 'Continue'
 
 `$sysLetter = if (`$env:SystemDrive) { `$env:SystemDrive } else { 'C:' }
 `$miosRoot = if (Test-Path "`$sysLetter\.git") { "`$sysLetter\" } elseif (Test-Path "`$sysLetter\MiOS\.git") { "`$sysLetter\MiOS" } elseif (Test-Path 'M:\.git') { 'M:\' } else { "`$sysLetter\" }
 if ((Test-Path (Join-Path `$miosRoot '.git')) -and (Get-Command git -ErrorAction SilentlyContinue)) {
-    Write-Host ("  [pull] Windows-side: git fetch + reset --hard origin/main on {0}..." -f `$miosRoot) -ForegroundColor Cyan
-    try {
-        & git -C `$miosRoot fetch --depth=1 origin main 2>&1 | ForEach-Object { Write-Host ('    ' + `$_) -ForegroundColor DarkGray }
-        if (`$LASTEXITCODE -eq 0) {
-            & git -C `$miosRoot reset --hard origin/main 2>&1 | ForEach-Object { Write-Host ('    ' + `$_) -ForegroundColor DarkGray }
-            if (`$LASTEXITCODE -eq 0) {
-                `$_head = (& git -C `$miosRoot rev-parse --short HEAD 2>`$null)
-                Write-Host ("  [pull] {0} now at origin/main HEAD = {1}" -f `$miosRoot, `$_head) -ForegroundColor Green
-            } else {
-                Write-Host ("  [pull] {0} git reset --hard failed -- build will run against possibly-stale overlay" -f `$miosRoot) -ForegroundColor Yellow
-            }
-        } else {
-            Write-Host ("  [pull] {0} git fetch failed (offline?) -- build will run against possibly-stale overlay" -f `$miosRoot) -ForegroundColor Yellow
-        }
-    } catch {
-        Write-Host ("  [pull] {0} git refresh threw: {1}" -f `$miosRoot, `$_.Exception.Message) -ForegroundColor Yellow
-    }
+    Update-MiosWindowsBuildCheckout -Path `$miosRoot -Ref $miosBuildRefLiteral
 } else {
-    Write-Host ("  [pull] {0} is not a git working tree OR git is missing -- skipping Windows-side refresh" -f `$miosRoot) -ForegroundColor Yellow
+    Write-Host '  [pull] Windows source checkout or git is unavailable -- using the current staged tree.' -ForegroundColor Yellow
 }
 
 # Now refresh the dev VM root (/) via mios-pull.ps1.

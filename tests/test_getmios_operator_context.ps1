@@ -48,6 +48,8 @@ function Run-Checks([string]$Text) {
     [IO.File]::WriteAllText($adminPath, $adminToml)
     $script:opSid = 'S-1-5-21-1-2-3-1001'; $script:adminSid = 'S-1-5-21-1-2-3-1002'
     $script:registeredProfile = $operator; $script:registeredLocal = Join-Path $operator 'local'
+    $script:rawRegisteredLocal = '%USERPROFILE%' + [IO.Path]::DirectorySeparatorChar + 'local'
+    $script:rawReadOption = ''
     $script:processSid = $script:opSid; $script:processSession = 17
     function global:Get-CimInstance { param($ClassName, $Filter, $ErrorAction) [pscustomobject]@{ ProcessId = 4242; SessionId = $script:processSession } }
     function global:Invoke-CimMethod { param($InputObject, $MethodName, $ErrorAction) [pscustomobject]@{ ReturnValue = 0; Sid = $script:processSid } }
@@ -55,8 +57,23 @@ function Run-Checks([string]$Text) {
     function global:Get-ItemProperty {
         param($LiteralPath, $ErrorAction)
         if ($LiteralPath -like '*ProfileList*') { return [pscustomobject]@{ ProfileImagePath = $script:registeredProfile } }
-        if ($LiteralPath -like '*User Shell Folders') { return [pscustomobject]@{ 'Local AppData' = $script:registeredLocal } }
+        if ($LiteralPath -like '*User Shell Folders') { return [pscustomobject]@{ 'Local AppData' = [Environment]::ExpandEnvironmentVariables($script:rawRegisteredLocal) } }
         throw 'Unexpected registry fixture read.'
+    }
+    function global:Get-Item {
+        [CmdletBinding()]param([string]$LiteralPath, [switch]$Force)
+        if ($LiteralPath -like 'Registry::*User Shell Folders') {
+            $key = [pscustomobject]@{}
+            $key | Add-Member -MemberType ScriptMethod -Name GetValue -Value {
+                param($Name, $Default, $Options)
+                $script:rawReadOption = [string]$Options
+                if ($Options -eq [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) { return $script:rawRegisteredLocal }
+                return [Environment]::ExpandEnvironmentVariables($script:rawRegisteredLocal)
+            }
+            $key | Add-Member -MemberType ScriptMethod -Name Close -Value {}
+            return $key
+        }
+        Microsoft.PowerShell.Management\Get-Item @PSBoundParameters
     }
     function global:Set-MiosHostTierAcl { param($Path, [switch]$Private) }
     $origin = [pscustomobject]@{ Sid = $script:opSid; Profile = $operator; LocalAppData = $script:registeredLocal
@@ -87,6 +104,7 @@ function Run-Checks([string]$Text) {
         Check ($script:_MiosTomlCache['_source'] -eq $origin.ConfigPath) 'machine configuration provenance names the validated operator file'
         Check ([IO.File]::ReadAllText($opPath) -ceq $opToml -and [IO.File]::ReadAllText($adminPath) -ceq $adminToml) 'both private TOML sentinels remain untouched'
     }
+    Check ($script:rawReadOption -eq 'DoNotExpandEnvironmentNames') 'raw known-folder values expand only against the validated operator profile'
     $before = $script:coreCalls
     foreach ($change in @(@('Sid', $script:adminSid), @('Profile', $admin), @('LocalAppData', (Join-Path $admin 'local')),
         @('ConfigPath', $adminPath), @('ProcessId', 9999), @('SessionId', 23))) {

@@ -1504,8 +1504,13 @@ function Assert-MiosOriginContext {
     $registered = [string](Get-ItemProperty -LiteralPath ("Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\" + $Context.Sid) -ErrorAction Stop).ProfileImagePath
     $registered = [Environment]::ExpandEnvironmentVariables($registered)
     if (-not $registered -or [IO.Path]::GetFullPath($registered).TrimEnd('\') -ine [IO.Path]::GetFullPath([string]$Context.Profile).TrimEnd('\')) { throw 'Origin profile does not match ProfileList.' }
-    $folder = [string](Get-ItemProperty -LiteralPath ("Registry::HKEY_USERS\" + $Context.Sid + '\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders') -ErrorAction Stop).'Local AppData'
-    $folder = $folder -ireplace '%USERPROFILE%', [string]$Context.Profile
+    # REG_EXPAND_SZ must be read raw: the registry provider would expand it using the UAC account's environment.
+    $shellFolders = Get-Item -LiteralPath ("Registry::HKEY_USERS\" + $Context.Sid + '\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders') -ErrorAction Stop
+    try { $folder = [string]$shellFolders.GetValue('Local AppData', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+    finally { $shellFolders.Close() }
+    $profileMarker = '%USERPROFILE%'
+    $markerIndex = $folder.IndexOf($profileMarker, [StringComparison]::OrdinalIgnoreCase)
+    if ($markerIndex -ge 0) { $folder = $folder.Substring(0, $markerIndex) + [string]$Context.Profile + $folder.Substring($markerIndex + $profileMarker.Length) }
     if (-not $folder -or $folder.Contains('%') -or [IO.Path]::GetFullPath($folder).TrimEnd('\') -ine [IO.Path]::GetFullPath([string]$Context.LocalAppData).TrimEnd('\')) { throw 'Origin Local AppData does not match the loaded user hive.' }
     if ([string]$Context.ConfigPath -ine (Join-Path $Context.Profile '.config\mios\mios.toml')) { throw 'Origin config path is not the operator user layer.' }
     Assert-MiosNoReparsePath $Context.Profile
@@ -5064,7 +5069,7 @@ function Invoke-MiosMachinePreparationCore {
             $_resumeUrl = [string](Get-MiosTomlValue -Section 'bootstrap' -Key 'oneliner_url' -Default 'https://raw.githubusercontent.com/mios-dev/mios-bootstrap/main/Get-MiOS.ps1')
             if ($_resumeUrl -notmatch '^https://raw\.githubusercontent\.com/[A-Za-z0-9_./%-]+/Get-MiOS\.ps1$') { throw 'Invalid bootstrap resume URL.' }
             $_ps        = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            $_resumeArg = "-NoProfile -ExecutionPolicy Bypass -Command `"irm '$_resumeUrl' | iex`""
+            $_resumeArg = "-NoProfile -Command `"irm '$_resumeUrl' | iex`""
             $_runHiddenVbs = Join-Path $env:ProgramData 'MiOS\bin\run-hidden.vbs'
             if (-not (Test-Path -LiteralPath $_runHiddenVbs)) { $_runHiddenVbs = Join-Path $env:ProgramData 'MiOS\run-hidden.vbs' }
             if (-not (Test-Path -LiteralPath $_runHiddenVbs) -and $miosRoot) {

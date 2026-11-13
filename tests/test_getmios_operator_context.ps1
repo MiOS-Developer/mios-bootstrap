@@ -38,7 +38,7 @@ function Run-Checks([string]$Text) {
     Import-Functions $ast @('Assert-MiosNoReparsePath', 'Assert-MiosOriginContext', 'Get-MiosTomlAssignments', 'Get-MiosTomlCredentialKeys',
         'ConvertTo-MiosCredentialFreeToml', 'Resolve-MiosTomlText', 'Resolve-MiosVendorTomlText', 'Initialize-MiosHostTierDirectory',
         'Write-MiosHostToml', 'Invoke-MiosMachinePreparationRequest', 'Read-MiosPipeLine', 'Get-MiosMachineWorkerScript', 'Get-MiosWslConfigText',
-        'New-MiosGetChildArguments', 'Get-MiosWindowsInstallRoot', 'Get-MiosWindowsBootstrapRoot')
+        'New-MiosGetChildArguments', 'Get-MiosWindowsInstallRoot', 'Get-MiosWindowsBootstrapRoot', 'Get-MiosTerminalProfileCommand')
     $operator = Join-Path $scratch 'operator'
     $admin = Join-Path $scratch 'different-admin'
     foreach ($profile in @($operator, $admin)) { New-Item -ItemType Directory -Path (Join-Path $profile '.config/mios') -Force | Out-Null; New-Item -ItemType Directory -Path (Join-Path $profile 'local') -Force | Out-Null }
@@ -198,13 +198,24 @@ function Run-Checks([string]$Text) {
         $index = [Array]::IndexOf($args, '-RepoDir')
         Check ($index -ge 0 -and $args[$index + 1] -eq (Join-Path $scratch 'explicit-checkout')) 'actual child arguments and resolution preserve an explicit checkout'
     }
+    $apostropheProfile = Join-Path $scratch "O'Brien/powershell/profile.ps1"
+    New-Item -ItemType Directory -Path (Split-Path -Parent $apostropheProfile) -Force | Out-Null
+    [IO.File]::WriteAllText($apostropheProfile, '$global:MiosApostropheFixtureLoaded = $true')
+    $command = Get-MiosTerminalProfileCommand -ShellPath 'powershell.exe' -ProfilePath $apostropheProfile
+    $prefix = '-Command "'; $offset = $command.IndexOf($prefix) + $prefix.Length
+    $body = $command.Substring($offset, $command.Length - $offset - 1)
+    $null = Parse-Source $body
+    $oldAppContext = $env:MIOS_APP_CONTEXT
+    try { & ([scriptblock]::Create($body)); Check ($global:MiosApostropheFixtureLoaded -eq $true) 'actual generated terminal command loads an apostrophe profile path' }
+    finally { $env:MIOS_APP_CONTEXT = $oldAppContext; Remove-Variable MiosApostropheFixtureLoaded -Scope Global -ErrorAction SilentlyContinue }
     # No mutation below can execute an actual Windows action.
 }
 function Invoke-WindowsBoundaryFixture {
     if ($env:OS -ne 'Windows_NT') { throw '-WindowsAcl requires Windows.' }
     if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw '-WindowsAcl requires an elevated scratch-only fixture process.' }
     $ast = Parse-Source $source
-    Import-Functions $ast @('Assert-MiosNoReparsePath', 'Set-MiosHostTierAcl', 'Assert-MiosMachineWriteBoundary', 'Initialize-MiosVendorTierDirectory', 'Write-MiosVendorToml')
+    Import-Functions $ast @('Assert-MiosNoReparsePath', 'Set-MiosHostTierAcl', 'Assert-MiosMachineWriteBoundary', 'Initialize-MiosVendorTierDirectory', 'Write-MiosVendorToml',
+        'New-MiosMachineCreationAcl', 'New-MiosProtectedMachineDirectory', 'Write-MiosPrivateMachineFile')
     $machine = Join-Path $scratch 'windows-machine'
     $vendorPath = Join-Path $machine 'usr/share/mios/mios.toml'
     New-Item -ItemType Directory -Path $machine -Force | Out-Null
@@ -219,6 +230,17 @@ function Invoke-WindowsBoundaryFixture {
     Microsoft.PowerShell.Security\Set-Acl -LiteralPath $vendorDirectory -AclObject $unsafeAcl
     Must-Throw { Write-MiosVendorToml -Path $vendorPath -Text 'REJECTED' } 'Windows vendor staging rejects a writable child boundary'
     Check ([IO.File]::ReadAllText($vendorPath) -ceq $vendorText) 'Windows rejected vendor write preserves existing bytes'
+    Microsoft.PowerShell.Security\Set-Acl -LiteralPath $vendorDirectory -AclObject $savedAcl
+    $inheritAcl = Get-Acl -LiteralPath $vendorDirectory
+    $inheritAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($untrusted, 'Modify', 'ContainerInherit,ObjectInherit', 'InheritOnly', 'Allow')))
+    Microsoft.PowerShell.Security\Set-Acl -LiteralPath $vendorDirectory -AclObject $inheritAcl
+    $probe = Join-Path $vendorDirectory '.atomic-acl-probe'
+    Write-MiosPrivateMachineFile -Path $probe -Bytes ([Text.Encoding]::UTF8.GetBytes('ATOMIC-SENTINEL'))
+    $probeAcl = Get-Acl -LiteralPath $probe
+    $probeRules = @($probeAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    Check ($probeAcl.AreAccessRulesProtected -and @($probeRules | Where-Object { $_.IdentityReference.Value -eq $untrusted.Value }).Count -eq 0) 'Windows atomic file creation excludes InheritOnly write grants from its first handle'
+    Write-MiosVendorToml -Path $vendorPath -Text $vendorText
+    Check ([IO.File]::ReadAllText($vendorPath) -ceq $vendorText -and (Get-Acl -LiteralPath $vendorPath).AreAccessRulesProtected) 'Windows vendor staging handles InheritOnly parent grants without an inherited child DACL'
     Microsoft.PowerShell.Security\Set-Acl -LiteralPath $vendorDirectory -AclObject $savedAcl
     $packages = Join-Path $machine 'winget/MachinePackages'
     New-Item -ItemType Directory -Path $packages -Force | Out-Null

@@ -780,6 +780,61 @@ function Write-MiosHostToml {
     }
 }
 
+function New-MiosMachineCreationAcl {
+    param([switch]$Directory, [switch]$Private)
+    $acl = if ($Directory) { New-Object Security.AccessControl.DirectorySecurity } else { New-Object Security.AccessControl.FileSecurity }
+    $acl.SetAccessRuleProtection($true, $false)
+    $groups = @(@('S-1-5-18', 'FullControl'), @('S-1-5-32-544', 'FullControl'))
+    if (-not $Private) { $groups += ,@('S-1-5-32-545', 'ReadAndExecute') }
+    foreach ($group in $groups) {
+        $sid = New-Object Security.Principal.SecurityIdentifier $group[0]
+        $rule = if ($Directory) { New-Object Security.AccessControl.FileSystemAccessRule($sid, $group[1], 'ContainerInherit,ObjectInherit', 'None', 'Allow') }
+                else { New-Object Security.AccessControl.FileSystemAccessRule($sid, $group[1], 'Allow') }
+        $acl.AddAccessRule($rule)
+    }
+    $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544'))
+    return $acl
+}
+
+function New-MiosProtectedMachineDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+    Assert-MiosNoReparsePath $Path
+    $acl = New-MiosMachineCreationAcl -Directory
+    if ($PSVersionTable.PSEdition -eq 'Desktop') { $null = [IO.Directory]::CreateDirectory($Path, $acl) }
+    else {
+        # Core exposes ACL creation as an extension; support both documented directory overload shapes.
+        $methods = @([IO.FileSystemAclExtensions].GetMethods())
+        $method = @($methods | Where-Object { $_.Name -eq 'CreateDirectory' -and $_.GetParameters().Count -eq 2 -and
+            $_.GetParameters()[0].ParameterType -eq [Security.AccessControl.DirectorySecurity] -and $_.GetParameters()[1].ParameterType -eq [string] }) | Select-Object -First 1
+        if ($method) { $null = $method.Invoke($null, @($acl, $Path)) }
+        else {
+            $method = @($methods | Where-Object { $_.Name -eq 'Create' -and $_.GetParameters().Count -eq 2 -and
+                $_.GetParameters()[0].ParameterType -eq [IO.DirectoryInfo] -and $_.GetParameters()[1].ParameterType -eq [Security.AccessControl.DirectorySecurity] }) | Select-Object -First 1
+            if (-not $method) { throw 'Atomic directory creation with a protected ACL is unavailable.' }
+            $null = $method.Invoke($null, @((New-Object IO.DirectoryInfo $Path), $acl))
+        }
+    }
+    # A concurrent pre-existing directory must pass the same boundary checks; never take over its ACL or owner.
+    Assert-MiosMachineWriteBoundary $Path
+}
+
+function Write-MiosPrivateMachineFile {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$Bytes)
+    Assert-MiosNoReparsePath $Path
+    $acl = New-MiosMachineCreationAcl -Private
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        $stream = New-Object IO.FileStream($Path, [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write,
+            [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $acl)
+    } else {
+        $method = @([IO.FileSystemAclExtensions].GetMethods() | Where-Object { $_.Name -eq 'Create' -and $_.GetParameters().Count -eq 7 -and
+            $_.GetParameters()[0].ParameterType -eq [IO.FileInfo] -and $_.GetParameters()[6].ParameterType -eq [Security.AccessControl.FileSecurity] }) | Select-Object -First 1
+        if (-not $method) { throw 'Atomic file creation with a protected ACL is unavailable.' }
+        $stream = $method.Invoke($null, @((New-Object IO.FileInfo $Path), [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write,
+            [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $acl))
+    }
+    try { $stream.Write($Bytes, 0, $Bytes.Length); $stream.Flush() } finally { $stream.Dispose() }
+}
+
 function Assert-MiosMachineWriteBoundary {
     param([Parameter(Mandatory)][string]$Path)
     Assert-MiosNoReparsePath $Path
@@ -791,6 +846,7 @@ function Assert-MiosMachineWriteBoundary {
         [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
         [Security.AccessControl.FileSystemRights]::TakeOwnership
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        # InheritOnly has no rights on this existing object. Every new child is created atomically with a protected DACL.
         if ($rule.AccessControlType -ne 'Allow' -or ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
         if (($rule.FileSystemRights -band $write) -and $rule.IdentityReference.Value -notin $trusted) {
             throw 'An existing machine TOML path allows an untrusted account to modify or replace it.'
@@ -807,9 +863,7 @@ function Initialize-MiosVendorTierDirectory {
     foreach ($directory in @($usr, $share, $mios)) {
         if (Test-Path -LiteralPath $directory) { Assert-MiosMachineWriteBoundary $directory }
         else {
-            New-Item -ItemType Directory -Path $directory -ErrorAction Stop | Out-Null
-            Set-MiosHostTierAcl $directory
-            Assert-MiosMachineWriteBoundary $directory
+            New-MiosProtectedMachineDirectory $directory
         }
     }
     if (Test-Path -LiteralPath $Path) { Assert-MiosMachineWriteBoundary $Path }
@@ -820,9 +874,7 @@ function Write-MiosVendorToml {
     Initialize-MiosVendorTierDirectory $Path
     $pending = Join-Path (Split-Path -Parent $Path) ('.vendor-' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
-        New-Item -ItemType File -Path $pending -ErrorAction Stop | Out-Null
-        Set-MiosHostTierAcl -Path $pending -Private
-        [IO.File]::WriteAllText($pending, $Text, (New-Object Text.UTF8Encoding($false)))
+        Write-MiosPrivateMachineFile -Path $pending -Bytes ((New-Object Text.UTF8Encoding($false)).GetBytes($Text))
         Assert-MiosNoReparsePath $Path
         if (Test-Path -LiteralPath $Path) {
             Assert-MiosMachineWriteBoundary $Path
@@ -1682,6 +1734,7 @@ function Get-MiosMachineWorkerScript {
         'ConvertTo-MiosCredentialFreeToml', 'Resolve-MiosTomlText', 'Resolve-MiosVendorTomlText', 'Get-MiosTomlValue',
         'Set-MiosHostTierAcl', 'Initialize-MiosHostTierDirectory', 'Write-MiosHostToml', 'Repair-MiosHostTierCredentials',
         'Assert-MiosMachineWriteBoundary', 'Initialize-MiosVendorTierDirectory', 'Write-MiosVendorToml',
+        'New-MiosMachineCreationAcl', 'New-MiosProtectedMachineDirectory', 'Write-MiosPrivateMachineFile',
         'Write-Info', 'Write-Good', 'Write-Err', 'Initialize-DataDisk',
         'Test-MiosElevated', 'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Enable-MiOSWindowsFeatures',
         'Get-MiosTomlTableArray', 'ConvertTo-MiosWindowsPath', 'Test-MiosDefenderExclusionRefused', 'Get-MiosDefenderExclusionPlan',
@@ -2245,6 +2298,12 @@ function Get-MiOSTerminalSettingsPath {
 # settings file (root-level "launchMode": "focus") -- passing --focus on
 # the wt.exe command line ALONE only hides tabs but keeps the title bar
 # unless launchMode is also set in JSON. We set both for belt-and-braces.
+function Get-MiosTerminalProfileCommand {
+    param([Parameter(Mandatory)][string]$ShellPath, [Parameter(Mandatory)][string]$ProfilePath)
+    $literalProfile = $ProfilePath.Replace("'", "''")
+    return '"' + $ShellPath + '" -NoLogo -NoExit -NoProfile -Command "$env:MIOS_APP_CONTEXT=''1''; if (Test-Path ''' + $literalProfile + ''') { . ''' + $literalProfile + ''' }"'
+}
+
 function Install-MiOSTerminalProfile {
     # Defensive readiness wait: even if Install-MiOSWindowsTerminal
     # already waited, AppX deployment can still be propagating user-state
@@ -2328,7 +2387,7 @@ function Install-MiOSTerminalProfile {
     }
     $_sysDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
     $miosProfilePath = Join-Path (Get-MiosWindowsInstallRoot) 'powershell/profile.ps1'
-    $profileCmdline = '"' + $defaultPwsh + '" -NoLogo -NoExit -NoProfile -Command "$env:MIOS_APP_CONTEXT=''1''; if (Test-Path ''' + $miosProfilePath + ''') { . ''' + $miosProfilePath + ''' }"'
+    $profileCmdline = Get-MiosTerminalProfileCommand -ShellPath $defaultPwsh -ProfilePath $miosProfilePath
 
     $_themeFontFace    = Get-MiosTomlValue -Section 'theme.font' -Key 'family'             -Default 'GeistMono Nerd Font Mono'
     if ([string]::IsNullOrWhiteSpace($_themeFontFace)) { $_themeFontFace = 'GeistMono Nerd Font Mono' }
@@ -5094,15 +5153,13 @@ function Register-MiosBootstrapResume {
         foreach ($directory in @($_resumeRoot, $_vbsDir)) {
             Assert-MiosNoReparsePath $directory
             if (Test-Path -LiteralPath $directory) { Assert-MiosMachineWriteBoundary $directory }
-            else { New-Item -ItemType Directory -Path $directory -ErrorAction Stop | Out-Null; Set-MiosHostTierAcl $directory }
+            else { New-MiosProtectedMachineDirectory $directory }
         }
         $_runHiddenVbs = Join-Path $_vbsDir 'run-hidden.vbs'
         Assert-MiosNoReparsePath $_runHiddenVbs
         if (Test-Path -LiteralPath $_runHiddenVbs) { Assert-MiosMachineWriteBoundary $_runHiddenVbs }
         else {
-            New-Item -ItemType File -Path $_runHiddenVbs -ErrorAction Stop | Out-Null
-            Set-MiosHostTierAcl -Path $_runHiddenVbs -Private
-            @'
+            $_vbsText = @'
 ' MiOS Run-Hidden launcher: executes processes in hidden window mode without spawning console frames or Windows Terminal popups
 Option Explicit
 Dim WshShell, args, cmd, i, arg
@@ -5123,7 +5180,8 @@ For i = 0 To args.Count - 1
 Next
 WshShell.Run cmd, 0, False
 End If
-'@ | Set-Content -Path $_runHiddenVbs -Encoding ASCII -Force
+'@
+            Write-MiosPrivateMachineFile -Path $_runHiddenVbs -Bytes ([Text.Encoding]::ASCII.GetBytes($_vbsText))
             Set-MiosHostTierAcl $_runHiddenVbs
         }
         $_wscript     = Join-Path $env:SystemRoot 'System32\wscript.exe'

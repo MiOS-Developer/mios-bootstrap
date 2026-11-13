@@ -251,6 +251,7 @@ try {
         Write-Host 'RESULT: PASS (operator context source fixtures; Windows APIs mocked)'
     } else {
         $plants = @(
+            @{ Name = 'shared package redirect reintroduced'; From = '$script:MiosMachineOrigin = $Context'; To = '$script:MiosMachineOrigin = $Context; Set-WingetStorageOnM'; Expected = 'actual ready machine dispatch performs zero profile or shared package redirects' },
             @{ Name = 'pending exit removed'; From = "            exit 0`r`n        }`r`n        default { throw 'Machine preparation did not report ready"; To = "            # exit removed`r`n        }`r`n        default { throw 'Machine preparation did not report ready"; Expected = 'actual pending dispatch halts before downstream bootstrap' },
             @{ Name = 'origin profile comparison removed'; From = 'if (-not $registered -or '; To = 'if ($false -and '; Expected = 'reject mismatched origin Profile' },
             @{ Name = 'origin config comparison removed'; From = 'if ([string]$Context.ConfigPath -ine '; To = 'if ($false -and '; Expected = 'reject mismatched origin ConfigPath' },

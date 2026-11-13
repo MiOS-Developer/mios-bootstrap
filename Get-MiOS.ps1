@@ -3496,6 +3496,8 @@ function Install-MiOSPowerShellProfile {
     if (-not (Test-Path $miosPsRoot)) { New-Item -ItemType Directory -Path $miosPsRoot -Force | Out-Null }
     $miosProfileScript = Join-Path $miosPsRoot 'profile.ps1'
     $safeInstallRoot = (Get-MiosWindowsInstallRoot).Replace("'", "''")
+    $operatorRepoRoot = if (Test-MiosElevated) { Get-MiosWindowsInstallRoot } else { Join-Path (Get-MiosWindowsInstallRoot) 'repo' }
+    $safeOperatorRepoRoot = $operatorRepoRoot.Replace("'", "''")
 
     # Resolve $PROFILE.CurrentUserAllHosts even if outer script blocks
     # have torn down standard host context.
@@ -3733,7 +3735,11 @@ function mios-build {
         `$_sysDrive = if (`$env:SystemDrive) { `$env:SystemDrive } else { 'C:' }
         `$cfgHtml = `$null
         foreach (`$c in @(
-            (Join-Path `$_sysDrive 'usr\share\mios\configurator\mios.html'),
+            (Join-Path '$safeOperatorRepoRoot' 'usr\share\mios\configurator\mios.html'),
+            (Join-Path '$safeInstallRoot' 'usr\share\mios\configurator\mios.html'),
+            (Join-Path '$safeOperatorRepoRoot' 'usr\share\mios\configurator\mios.html'),
+        (Join-Path '$safeInstallRoot' 'usr\share\mios\configurator\mios.html'),
+        (Join-Path `$_sysDrive 'usr\share\mios\configurator\mios.html'),
             (Join-Path `$_sysDrive 'MiOS\usr\share\mios\configurator\mios.html'),
             'M:\usr\share\mios\configurator\mios.html',
             'M:\MiOS\usr\share\mios\configurator\mios.html'
@@ -3785,7 +3791,7 @@ function mios-build {
                 Where-Object { `$_.Name -notmatch '\.imported-' } |
                 Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
             if (`$htmlSrc) {
-                `$htmlDst = if (Test-Path 'M:\usr\share\mios\configurator') { 'M:\usr\share\mios\configurator\mios.html' } else { Join-Path `$_sysDrive 'usr\share\mios\configurator\mios.html' }
+                `$htmlDst = Join-Path '$safeOperatorRepoRoot' 'usr\share\mios\configurator\mios.html'
                 `$htmlPar = Split-Path -Parent `$htmlDst
                 if (-not (Test-Path -LiteralPath `$htmlPar)) {
                     New-Item -ItemType Directory -Path `$htmlPar -Force | Out-Null
@@ -3832,10 +3838,7 @@ function mios-update {
 
 function mios-pull {
     `$_sysDrive = if (`$env:SystemDrive) { `$env:SystemDrive } else { 'C:' }
-    `$_targetRoot = if (Test-Path 'M:\.git') { 'M:\' }
-                   elseif (Test-Path (Join-Path `$_sysDrive '.git')) { "`$_sysDrive\" }
-                   elseif (Test-Path (Join-Path `$_sysDrive 'MiOS\.git')) { Join-Path `$_sysDrive 'MiOS' }
-                   else { "`$_sysDrive\" }
+    `$_targetRoot = '$safeOperatorRepoRoot'
     if (-not (Test-Path (Join-Path `$_targetRoot '.git'))) {
         Write-Host "  [!] `$_targetRoot is not a git working tree -- run mios-build first." -ForegroundColor Yellow
         return
@@ -3914,11 +3917,11 @@ function mios-mini {
     if (Get-Command Show-MiosDashboard -ErrorAction SilentlyContinue) {
         `$_sysDrive = if (`$env:SystemDrive) { `$env:SystemDrive } else { 'C:' }
         `$cfg  = ''
-        foreach (`$_c in @((Join-Path `$_sysDrive 'MiOS\fastfetch\config.jsonc'), 'M:\MiOS\fastfetch\config.jsonc')) {
+        foreach (`$_c in @((Join-Path '$safeInstallRoot' 'fastfetch\config.jsonc'), (Join-Path `$_sysDrive 'MiOS\fastfetch\config.jsonc'), 'M:\MiOS\fastfetch\config.jsonc')) {
             if (Test-Path -LiteralPath `$_c) { `$cfg = `$_c; break }
         }
         `$logo = ''
-        foreach (`$_l in @((Join-Path `$_sysDrive 'MiOS\fastfetch\mios.txt'), 'M:\MiOS\fastfetch\mios.txt')) {
+        foreach (`$_l in @((Join-Path '$safeInstallRoot' 'fastfetch\mios.txt'), (Join-Path `$_sysDrive 'MiOS\fastfetch\mios.txt'), 'M:\MiOS\fastfetch\mios.txt')) {
             if (Test-Path -LiteralPath `$_l) { `$logo = `$_l; break }
         }
         Show-MiosDashboard -ConfigPath `$cfg -LogoPath `$logo
@@ -3935,11 +3938,11 @@ function mios-metal {
     if (Get-Command Show-MiosDashboard -ErrorAction SilentlyContinue) {
         `$_sysDrive = if (`$env:SystemDrive) { `$env:SystemDrive } else { 'C:' }
         `$cfg  = ''
-        foreach (`$_c in @((Join-Path `$_sysDrive 'MiOS\fastfetch\config.jsonc'), 'M:\MiOS\fastfetch\config.jsonc')) {
+        foreach (`$_c in @((Join-Path '$safeInstallRoot' 'fastfetch\config.jsonc'), (Join-Path `$_sysDrive 'MiOS\fastfetch\config.jsonc'), 'M:\MiOS\fastfetch\config.jsonc')) {
             if (Test-Path -LiteralPath `$_c) { `$cfg = `$_c; break }
         }
         `$logo = ''
-        foreach (`$_l in @((Join-Path `$_sysDrive 'MiOS\fastfetch\mios.txt'), 'M:\MiOS\fastfetch\mios.txt')) {
+        foreach (`$_l in @((Join-Path '$safeInstallRoot' 'fastfetch\mios.txt'), (Join-Path `$_sysDrive 'MiOS\fastfetch\mios.txt'), 'M:\MiOS\fastfetch\mios.txt')) {
             if (Test-Path -LiteralPath `$_l) { `$logo = `$_l; break }
         }
         Show-MiosDashboard -ConfigPath `$cfg -LogoPath `$logo
@@ -5524,7 +5527,8 @@ if ($_bootstrapExit -eq 0) {
     }
     # Reconcile after the legacy app registrar so its per-action links cannot
     # reappear at the end of a fresh install. Uninstall remains in Windows Settings.
-    $_nativeProjection = Join-Path $env:ProgramData 'MiOS\bin\mios-native-client-setup.ps1'
+    $_nativeProjection = Join-Path (Get-MiosWindowsInstallRoot) 'bin\mios-native-client-setup.ps1'
+    if (-not (Test-Path -LiteralPath $_nativeProjection)) { $_nativeProjection = Join-Path $env:ProgramData 'MiOS\bin\mios-native-client-setup.ps1' }
     if (Test-Path -LiteralPath $_nativeProjection) {
         & $_nativeProjection -RuntimeOnly -BinDirectory (Split-Path -Parent $_nativeProjection)
     }

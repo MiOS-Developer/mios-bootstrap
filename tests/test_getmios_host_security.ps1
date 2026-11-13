@@ -64,7 +64,7 @@ function Import-MiosFunctions([string]$Path) {
         'Get-MiosDefenderExclusionPlan', 'Add-MiosDefenderExclusions', 'Set-MiosWslFirewallPolicy', 'Set-MiosPrivateUserTomlAcl',
         'Import-MiosUserToml', 'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder', 'Get-MiosUserTomlReceiverScript', 'Get-MiosWslConfigText',
         'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Enable-MiOSWindowsFeatures', 'Test-MiosWslVmCreator', 'Register-MiosWslVmCreator',
-        'Invoke-MiosPlatformGate')
+        'Invoke-MiosPlatformGate', 'Get-MiosElevationContextError')
     $defs = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) |
         Where-Object { $want -contains $_.Name })
     foreach ($name in $want) { if (@($defs | Where-Object Name -eq $name).Count -ne 1) { throw "Missing/duplicate canonical function $name" } }
@@ -230,6 +230,7 @@ function Install-ApiMocks {
     # Windows features: dism state per feature, the exit code an enable returns, Store wsl.exe, elevation, SSOT overrides.
     $script:elevated = $true
     $script:toml = @{}
+    $script:dismLocalizedProbes = 0
     function global:Test-MiosElevated { return $script:elevated }
     function global:Get-MiosTomlValue {
         param([string]$Section, [string]$Key, $Default)
@@ -241,7 +242,12 @@ function Install-ApiMocks {
         $argText = $args -join ' '
         $script:dismCalls.Add($argText)
         $name = if ($argText -match '/featurename:(\S+)') { $Matches[1] } else { '' }
-        if ($argText -match '/get-featureinfo') { $global:LASTEXITCODE = 0; return @("Feature Name : $name", "State : $($script:dismState[$name])") }
+        if ($argText -match '/get-featureinfo') {
+            $global:LASTEXITCODE = 0
+            # Without /English a localized Windows answers in its own language (here de-DE).
+            if ($argText -notmatch '(^|\s)/English(\s|$)') { $script:dismLocalizedProbes++; return @("Funktionsname : $name", 'Status : Aktiviert') }
+            return @("Feature Name : $name", "State : $($script:dismState[$name])")
+        }
         if ($argText -match '/enable-feature') {
             $global:LASTEXITCODE = [int]$script:dismEnableExit[$name]
             if ($global:LASTEXITCODE -eq 0) { $script:dismState[$name] = 'Enabled' }
@@ -438,6 +444,37 @@ function Invoke-Checks([string]$Path, [switch]$SkipReceiverProtocol) {
     $elevate = @($ifs | Where-Object { $_.Clauses[0].Item1.Extent.Text -ceq '-not $_isAdmin -and -not $env:MIOS_GETMIOS_RELAUNCHED' })
     Check ($guard.Count -eq 1 -and $elevate.Count -eq 1 -and $guard[0].Extent.StartOffset -lt $elevate[0].Extent.StartOffset -and
            @($guard[0].Clauses[0].Item2.FindAll({ param($n) $n -is [Management.Automation.Language.ThrowStatementAst] }, $true)).Count -eq 1) 'a stale relaunch marker in an unelevated session stops before any admin step'
+    if ($guard.Count -eq 1) {
+        $guardText = $guard[0].Extent.Text
+        $runGuard = { param($admin, $marker)
+            $_isAdmin = $admin
+            if ($marker) { $env:MIOS_GETMIOS_RELAUNCHED = $marker } else { Remove-Item Env:MIOS_GETMIOS_RELAUNCHED -ErrorAction SilentlyContinue }
+            try { . ([scriptblock]::Create($guardText)); 'continued' } catch { 'stopped' }
+            finally { Remove-Item Env:MIOS_GETMIOS_RELAUNCHED -ErrorAction SilentlyContinue } }
+        Check ((& $runGuard $false '1') -eq 'stopped' -and (& $runGuard $true '1') -eq 'continued' -and
+               (& $runGuard $false '') -eq 'continued') 'executed: the relaunch marker stops only an unelevated run'
+    }
+    # Elevation context: the elevated account must be the origin account and the owner of this desktop, else stop.
+    $op = 'S-1-5-21-1-2-3-1001'; $other = 'S-1-5-21-1-2-3-1002'
+    Check ((Get-MiosElevationContextError -CurrentSid $op -OriginSid $op -DesktopSids @($op)) -eq '' -and
+           (Get-MiosElevationContextError -CurrentSid $op -OriginSid '' -DesktopSids @()) -eq '') 'the operator elevating its own run, or a headless run, continues'
+    Check ((Get-MiosElevationContextError -CurrentSid $other -OriginSid $op -DesktopSids @($op)) -match '^elevation switched') 'elevation into a different account is refused'
+    Check ((Get-MiosElevationContextError -CurrentSid $other -OriginSid '' -DesktopSids @($op)) -match '^this desktop belongs') 'an elevated shell of another account on the operator desktop is refused'
+    Check ((Get-MiosElevationContextError -CurrentSid $op -OriginSid "$op;x" -DesktopSids @($op)) -match 'malformed') 'a malformed origin marker is refused'
+    $ctx = @($ifs | Where-Object { $_.Clauses[0].Item1.Extent.Text -ceq '$_isAdmin' -and
+        @($_.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-MiosElevationContextError' }, $true)).Count -eq 1 })
+    $ctxThrow = 0
+    if ($ctx.Count -eq 1) {
+        $ctxThrow = @($ctx[0].FindAll({ param($n) $n -is [Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -ceq '$_ctxError' -and
+            @($n.Clauses[0].Item2.FindAll({ param($m) $m -is [Management.Automation.Language.ThrowStatementAst] }, $true)).Count -eq 1 }, $true)).Count
+    }
+    Check ($ctx.Count -eq 1 -and $ctxThrow -eq 1 -and $guard.Count -eq 1 -and $elevate.Count -eq 1 -and
+           $ctx[0].Extent.StartOffset -gt $guard[0].Extent.StartOffset -and $ctx[0].Extent.StartOffset -lt $elevate[0].Extent.StartOffset -and
+           $ctx[0].Extent.Text.Contains('-OriginSid ([string]$env:MIOS_ORIGIN_SID)') -and
+           $ctx[0].Extent.Text.Contains('-DesktopSids @(Get-MiosDesktopOwnerSids)')) 'an elevated run checks its account against the origin and desktop owner before any admin step'
+    Check ($elevate.Count -eq 1 -and $elevate[0].Extent.Text.Contains('`$env:MIOS_ORIGIN_SID=''$_originSid''') -and
+           $elevate[0].Extent.Text.Contains('$_originSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value')) 'the unelevated pass hands its own account SID to the elevated pass'
+    Check ($script:dismLocalizedProbes -eq 0) 'every dism state probe forces English output'
     $script:fixtureVendor = @'
 [[wsl2.inbound]]
 name = 'fixture'
@@ -668,7 +705,12 @@ try {
         @{ Name = 'stale relaunch guard removed'; Expected = 'a stale relaunch marker in an unelevated session stops before any admin step'; From = 'if (-not $_isAdmin -and $env:MIOS_GETMIOS_RELAUNCHED) {'; To = 'if ($false) {' },
         @{ Name = 'partition verb in the gate'; Expected = 'no disk/partition verb, dummy firewall object, or MiOS-DEV start was invoked'; From = "'ready'   { `$null = Set-MiosWslFirewallPolicy;"; To = "'ready'   { New-Partition -DiskNumber 0 -UseMaximumSize; `$null = Set-MiosWslFirewallPolicy;" },
         @{ Name = 'dummy firewall object'; Expected = 'no disk/partition verb, dummy firewall object, or MiOS-DEV start was invoked'; From = 'Set-NetFirewallHyperVVMSetting -Name $creator @policy -ErrorAction Stop'; To = 'New-NetFirewallHyperVVMSetting -Name $creator @policy -ErrorAction Stop' },
-        @{ Name = 'MiOS-DEV started while pending'; Expected = 'no disk/partition verb, dummy firewall object, or MiOS-DEV start was invoked'; From = "'pending' { return `$result }"; To = "'pending' { & wsl.exe -d MiOS-DEV -- true; return `$result }" }
+        @{ Name = 'MiOS-DEV started while pending'; Expected = 'no disk/partition verb, dummy firewall object, or MiOS-DEV start was invoked'; From = "'pending' { return `$result }"; To = "'pending' { & wsl.exe -d MiOS-DEV -- true; return `$result }" },
+        @{ Name = 'dism probe localized'; Expected = 'every dism state probe forces English output'; From = '/online /English /get-featureinfo'; To = '/online /get-featureinfo' },
+        @{ Name = 'origin mismatch accepted'; Expected = 'elevation into a different account is refused'; From = 'if ($OriginSid -and $OriginSid -ne $CurrentSid) {'; To = 'if ($false) {' },
+        @{ Name = 'desktop owner ignored'; Expected = 'an elevated shell of another account on the operator desktop is refused'; From = 'if ($others.Count) {'; To = 'if ($false) {' },
+        @{ Name = 'context refusal does not stop'; Expected = 'an elevated run checks its account against the origin and desktop owner before any admin step'; From = 'if ($_ctxError) {'; To = 'if ($false) {' },
+        @{ Name = 'origin not handed over'; Expected = 'the unelevated pass hands its own account SID to the elevated pass'; From = '`$env:MIOS_ORIGIN_SID=''$_originSid'''; To = '' }
     )
     $caught = 0
     foreach ($plant in $plants) {

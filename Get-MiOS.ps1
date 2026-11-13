@@ -1459,11 +1459,37 @@ function Invoke-MiOSAgreementGate {
         }
     }
 }
+function Get-MiosDesktopOwnerSids {
+    # Owners of this session's desktop shell; another elevated account inside it is an over-the-shoulder elevation.
+    $session = (Get-Process -Id $PID).SessionId
+    foreach ($shell in @(Get-CimInstance Win32_Process -Filter "Name = 'explorer.exe' AND SessionId = $session" -ErrorAction SilentlyContinue)) {
+        $owner = Invoke-CimMethod -InputObject $shell -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+        if ($owner -and $owner.ReturnValue -eq 0 -and $owner.Sid) { [string]$owner.Sid }
+    }
+}
+
+function Get-MiosElevationContextError([string]$CurrentSid, [string]$OriginSid, [string[]]$DesktopSids) {
+    # The operator's user layer and user-scope settings belong to one account; any other answer is ambiguous.
+    $label = { param($sid) try { ([Security.Principal.SecurityIdentifier]$sid).Translate([Security.Principal.NTAccount]).Value } catch { $sid } }
+    if ($OriginSid -and $OriginSid -notmatch '^S-1-[0-9]+(-[0-9]+)+$') { return 'the origin account marker is malformed' }
+    if ($OriginSid -and $OriginSid -ne $CurrentSid) { return "elevation switched from $(& $label $OriginSid) to $(& $label $CurrentSid)" }
+    $others = @($DesktopSids | Where-Object { $_ -and $_ -ne $CurrentSid } | Sort-Object -Unique)
+    if ($others.Count) { return "this desktop belongs to $(@($others | ForEach-Object { & $label $_ }) -join ', '), not the elevated $(& $label $CurrentSid)" }
+    return ''
+}
+
 $_isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
             ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $_isAdmin -and $env:MIOS_GETMIOS_RELAUNCHED) {
     # The marker belongs to the elevated child; unelevated, it would skip elevation and reach the admin steps.
     throw 'MIOS_GETMIOS_RELAUNCHED is set in a non-elevated session; refusing to continue. Open a new PowerShell window and re-run the one-liner.'
+}
+if ($_isAdmin) {
+    $_ctxError = Get-MiosElevationContextError -CurrentSid ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) `
+        -OriginSid ([string]$env:MIOS_ORIGIN_SID) -DesktopSids @(Get-MiosDesktopOwnerSids)
+    if ($_ctxError) {
+        throw "Refusing to continue: $_ctxError. MiOS reads the operator's user layer and applies user-scope settings for the account that runs it; run the one-liner from the operator's own administrator-capable account."
+    }
 }
 if (-not $_isAdmin -and -not $env:MIOS_GETMIOS_RELAUNCHED) {
     Write-Host ''
@@ -1502,8 +1528,12 @@ if (-not $_isAdmin -and -not $env:MIOS_GETMIOS_RELAUNCHED) {
     $_p2ProfileFailed    = (Get-MiosTomlValue -Section 'messages.pass2_exit' -Key 'profile_load_failed'  -Default '  [!] MiOS profile load failed: ') -replace "'", "''"
     $_p2ProfileFailedHnt = (Get-MiosTomlValue -Section 'messages.pass2_exit' -Key 'profile_load_hint'    -Default '      Open a fresh MiOS shortcut to retry.') -replace "'", "''"
     $_p2ProfileMissing   = (Get-MiosTomlValue -Section 'messages.pass2_exit' -Key 'profile_missing'      -Default "  [!] $(if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' })\MiOS\powershell\profile.ps1 not found -- open the MiOS shortcut to launch the app window.") -replace "'", "''"
+    # The elevated pass compares its own account against this one (Get-MiosElevationContextError).
+    $_originSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($_originSid -notmatch '^S-1-[0-9]+(-[0-9]+)+$') { throw 'Could not capture the origin account before elevation.' }
     $_innerCmd = @"
 `$env:MIOS_GETMIOS_RELAUNCHED='1'
+`$env:MIOS_ORIGIN_SID='$_originSid'
 `$env:MIOS_CACHE_BUSTED='1'
 `$env:TERM_PROGRAM='mios'
 try { & chcp.com 65001 *> `$null } catch {}
@@ -4232,7 +4262,7 @@ function Enable-MiOSWindowsFeatures {
         $name = $feature.Name; $label = $feature.Label
         $state = 'unknown'
         try {
-            $info = & dism.exe /online /get-featureinfo /featurename:$name 2>$null
+            $info = & dism.exe /online /English /get-featureinfo /featurename:$name 2>$null   # English: the state text is parsed
             if ($LASTEXITCODE -eq 0) { $state = Get-MiosFeatureState $info }
         } catch {}
 

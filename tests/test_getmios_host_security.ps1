@@ -2,8 +2,10 @@
 # Default/PlantDefect use scratch files and mocked Windows APIs only, including on Native MiOS-DEV.
 # -WindowsAcl additionally exercises real ACLs on an isolated Windows scratch tree (never C:\etc or M:).
 [CmdletBinding()]
-param([switch]$PlantDefect, [switch]$WindowsAcl, [string]$CanonicalVendorPath)
+param([switch]$PlantDefect, [switch]$WindowsAcl, [switch]$VerifyReceiverBaselineGuard, [string]$CanonicalVendorPath)
 $ErrorActionPreference = 'Stop'
+if ($VerifyReceiverBaselineGuard -and ($PlantDefect -or $WindowsAcl)) { throw '-VerifyReceiverBaselineGuard is a standalone source fixture control.' }
+$PlantReceiverFailure = $false
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $realScript = Join-Path $repoRoot 'Get-MiOS.ps1'
 if (-not $CanonicalVendorPath) {
@@ -13,10 +15,10 @@ if (-not $CanonicalVendorPath) {
 if (-not (Test-Path -LiteralPath $CanonicalVendorPath -PathType Leaf)) { throw 'A tracked canonical vendor TOML is required for the grammar fixture.' }
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('mios-getmios-security-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $scratch -ErrorAction Stop | Out-Null
-$script:fail = 0; $script:checks = 0
+$script:fail = 0; $script:checks = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
 function Check([bool]$Ok, [string]$What) {
     $script:checks++
-    if ($Ok) { Write-Host "  PASS $What" } else { Write-Host "  FAIL $What"; $script:fail++ }
+    if ($Ok) { Write-Host "  PASS $What" } else { Write-Host "  FAIL $What"; $script:fail++; $script:failedChecks.Add($What) }
 }
 function Expect-Throw([scriptblock]$Action, [string]$What) {
     $caught = $false
@@ -164,8 +166,8 @@ function Install-ApiMocks {
         $script:firewallAdded.Add(@{ Name = $Name; Remote = $RemoteAddresses; Ports = $LocalPorts })
     }
 }
-function Invoke-Checks([string]$Path) {
-    $script:fail = 0; $script:checks = 0
+function Invoke-Checks([string]$Path, [switch]$SkipReceiverProtocol) {
+    $script:fail = 0; $script:checks = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
     $null = Import-MiosFunctions $Path
     Install-ApiMocks
     $script:fixtureUser = ''; $script:fixtureVendor = $ruleVendor
@@ -254,13 +256,17 @@ reason = 'Fixture only'
     Check ($updated.Contains('custom=value') -and $updated.Contains('[experimental]') -and $updated.Contains('customExperimental=keep')) 'unmanaged WSL keys and sections remain'
     Check ((Get-MiosWslConfigText -Existing $updated -ManagedLines $managed -Firewall $true) -ceq $updated) 'WSL firewall reconciliation is stable on retry'
     Expect-Throw { Get-MiosWslConfigText -Existing $existing -ManagedLines $managed -Firewall $false } 'an explicit insecure SSOT firewall=false fails closed'
-    Invoke-ReceiverProtocolChecks
+    if (-not $SkipReceiverProtocol) { Invoke-ReceiverProtocolChecks }
     Write-Host "SOURCE_FIXTURE_ASSERTIONS $($script:checks)"
     return $script:fail
 }
 function Invoke-ReceiverProtocolChecks {
+    $protocolStartFailures = $script:fail
     $shell = Get-Command sh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $shell) { Write-Host 'SOURCE_RECEIVER_PROTOCOL_UNRUN (sh unavailable)'; return }
+    if (-not $shell) {
+        if ($PlantReceiverFailure) { throw 'A POSIX shell is required to exercise the receiver baseline control.' }
+        Write-Host 'SOURCE_RECEIVER_PROTOCOL_UNRUN (sh unavailable)'; return
+    }
     $receiverHome = Join-Path $scratch 'receiver-home'
     $receiverDirectory = Join-Path (Join-Path $receiverHome '.config') 'mios'
     New-Item -ItemType Directory -Path $receiverDirectory -Force -ErrorAction Stop | Out-Null
@@ -270,7 +276,9 @@ function Invoke-ReceiverProtocolChecks {
     foreach ($mode in @('complete', 'short', 'interrupted')) {
         Get-ChildItem -LiteralPath $receiverDirectory -Filter '.mios.*' -Force | Remove-Item -Force -ErrorAction Stop
         [IO.File]::WriteAllBytes($target, $old)
-        $program = Get-MiosUserTomlReceiverScript -ExpectedBytes $content.LongLength
+        $expected = $content.LongLength
+        if ($PlantReceiverFailure -and $mode -eq 'complete') { $expected++ }
+        $program = Get-MiosUserTomlReceiverScript -ExpectedBytes $expected
         $psi = New-Object Diagnostics.ProcessStartInfo
         $psi.FileName = $shell.Source
         $psi.Arguments = (@('-c', $program) | ForEach-Object { ConvertTo-MiosNativeArgument $_ }) -join ' '
@@ -279,7 +287,18 @@ function Invoke-ReceiverProtocolChecks {
         $psi.EnvironmentVariables['HOME'] = $receiverHome
         $process = New-Object Diagnostics.Process
         $process.StartInfo = $psi
+        $callerEncoding = [Console]::InputEncoding
+        $callerSignature = $callerEncoding.CodePage.ToString() + ':' + [Convert]::ToBase64String($callerEncoding.GetPreamble())
+        $savedInputEncoding = $null; $changedInputEncoding = $false
         try {
+            # Deliberately hostile caller state reproduces the Desktop StreamWriter BOM regression.
+            if ($PSVersionTable.PSEdition -eq 'Desktop') {
+                [Console]::InputEncoding = New-Object Text.UTF8Encoding($true)
+                $savedInputEncoding = [Console]::InputEncoding; $changedInputEncoding = $true
+                [Console]::InputEncoding = New-Object Text.UTF8Encoding($false)
+            } elseif ($psi.PSObject.Properties['StandardInputEncoding']) {
+                $psi.StandardInputEncoding = New-Object Text.UTF8Encoding($false)
+            }
             if (-not $process.Start()) { throw 'Fixture receiver could not start.' }
             $stdout = $process.StandardOutput.ReadToEndAsync(); $stderr = $process.StandardError.ReadToEndAsync()
             $count = if ($mode -eq 'complete') { $content.Length } else { [int][math]::Floor($content.Length / 2) }
@@ -309,55 +328,124 @@ function Invoke-ReceiverProtocolChecks {
             }
         } finally {
             try { if (-not $process.HasExited) { $process.Kill() } } catch {}
-            $process.Dispose()
+            try { $process.Dispose() }
+            finally {
+                try { if ($changedInputEncoding) { [Console]::InputEncoding = $savedInputEncoding } }
+                finally { [Console]::InputEncoding = $callerEncoding }
+            }
         }
+        $restoredEncoding = [Console]::InputEncoding
+        $restoredSignature = $restoredEncoding.CodePage.ToString() + ':' + [Convert]::ToBase64String($restoredEncoding.GetPreamble())
+        Check ($restoredSignature -ceq $callerSignature) 'receiver harness restores caller console input encoding'
     }
-    Write-Host 'SOURCE_RECEIVER_PROTOCOL PASS'
+    if ($script:fail -eq $protocolStartFailures) { Write-Host 'SOURCE_RECEIVER_PROTOCOL PASS' }
+    else { Write-Host 'SOURCE_RECEIVER_PROTOCOL FAIL' }
 }
 
-function Invoke-WindowsAclChecks {
+function Assert-SourceDefectBaseline {
+    $baselineFailures = Invoke-Checks $realScript
+    if ($baselineFailures) { throw 'SOURCE_DEFECT_BASELINE_FAILED' }
+}
+function Invoke-WindowsAclChecks([string]$ProductPath = $realScript) {
     if ($env:OS -ne 'Windows_NT') { throw '-WindowsAcl requires a Windows host; no Windows API acceptance is claimed.' }
-    $null = Import-MiosFunctions $realScript
-    $source = Join-Path $scratch 'download.toml'
-    $userPath = Join-Path (Join-Path $scratch 'user') 'mios.toml'
-    [IO.File]::WriteAllText($source, $fixture, (New-Object Text.UTF8Encoding($false)))
-    $null = Import-MiosUserToml -SourcePath $source -DestinationPath $userPath
-    # Exercise existing-file replacement as well as first publication (the PS 5.1 genuine-null backup case).
-    $null = Import-MiosUserToml -SourcePath $source -DestinationPath $userPath
-    Check ([Convert]::ToBase64String([IO.File]::ReadAllBytes($source)) -ceq [Convert]::ToBase64String([IO.File]::ReadAllBytes($userPath))) 'Windows private import preserves exact bytes on replacement'
-    $acl = Get-Acl -LiteralPath $userPath
-    $allowed = @('S-1-5-18', 'S-1-5-32-544', [string][Security.Principal.WindowsIdentity]::GetCurrent().User)
-    $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
-    Check ($acl.AreAccessRulesProtected -and @($rules | Where-Object { $_.IdentityReference.Value -notin $allowed }).Count -eq 0) 'Windows user TOML grants no other principals access'
-    $hostRoot = Join-Path $scratch 'acl-etc'
+    $script:fail = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
+    $null = Import-MiosFunctions $ProductPath
+    $runRoot = Join-Path $scratch ('windows-acl-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $runRoot -ErrorAction Stop | Out-Null
+    $source = Join-Path $runRoot 'download.toml'
+    $userPath = Join-Path (Join-Path $runRoot 'user') 'mios.toml'
+    $owner = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $allowed = @('S-1-5-18', 'S-1-5-32-544', [string]$owner)
+    foreach ($generation in 1..3) {
+        $text = $fixture + "`r`n# fixture generation $generation " + [char]0x03bb
+        [IO.File]::WriteAllText($source, $text, (New-Object Text.UTF8Encoding($false)))
+        $null = Import-MiosUserToml -SourcePath $source -DestinationPath $userPath
+        Check ([Convert]::ToBase64String([IO.File]::ReadAllBytes($source)) -ceq [Convert]::ToBase64String([IO.File]::ReadAllBytes($userPath))) 'Windows private first/repeated replacement preserves exact bytes'
+        $acl = Get-Acl -LiteralPath $userPath
+        $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+        Check ($acl.AreAccessRulesProtected -and @($rules | Where-Object { $_.IdentityReference.Value -notin $allowed }).Count -eq 0 -and
+               $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $owner.Value) 'Windows user TOML grants no other principals access'
+    }
+    if ($script:fail -eq 0) { Write-Host 'WINDOWS_PRIVATE_ACL_FIXTURE PASS' }
+    $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Host 'WINDOWS_HOST_ACL_FIXTURE UNRUN (elevation required for Administrators ownership)'
+        throw 'Private ACL checks completed; full Windows ACL acceptance requires an elevated scratch-only host-tier run.'
+    }
+    $hostRoot = Join-Path $runRoot 'host-tier'
     New-Item -ItemType Directory -Path $hostRoot -ErrorAction Stop | Out-Null
     $hostPath = Join-Path (Join-Path $hostRoot 'etc') 'mios/mios.toml'
-    Write-MiosHostToml -Path $hostPath -Text $fixture
-    foreach ($path in @($hostPath, (Split-Path -Parent $hostPath), (Split-Path -Parent (Split-Path -Parent $hostPath)))) {
-        $acl = Get-Acl -LiteralPath $path
-        $users = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-545' })
-        $write = [Security.AccessControl.FileSystemRights]'Write,Delete,DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership'
-        Check ($acl.AreAccessRulesProtected -and @($users | Where-Object { ($_.FileSystemRights -band $write) -ne 0 }).Count -eq 0) 'Windows host file and parent directories grant Users no write/delete rights'
+    foreach ($generation in 1..3) {
+        $text = $fixture + "`r`n[fixture_generation]`r`nvalue = $generation`r`n"
+        Write-MiosHostToml -Path $hostPath -Text $text
+        Check ([IO.File]::ReadAllText($hostPath) -ceq (ConvertTo-MiosCredentialFreeToml $text)) 'Windows host first/repeated replacement publishes only the expected projection'
+        foreach ($path in @($hostPath, (Split-Path -Parent $hostPath), (Split-Path -Parent (Split-Path -Parent $hostPath)))) {
+            $acl = Get-Acl -LiteralPath $path
+            $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+            $users = @($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-545' })
+            $write = [Security.AccessControl.FileSystemRights]'Write,Delete,DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership'
+            Check ($acl.AreAccessRulesProtected -and $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-32-544' -and
+                   @($rules | Where-Object { $_.IdentityReference.Value -notin @('S-1-5-18','S-1-5-32-544','S-1-5-32-545') }).Count -eq 0 -and
+                   @($users | Where-Object { ($_.FileSystemRights -band $write) -ne 0 }).Count -eq 0) 'Windows host file and parent directories grant Users no write/delete rights'
+        }
     }
-    Write-Host 'WINDOWS_ACL_FIXTURE_ONLY PASS'
+    if ($script:fail -eq 0) { Write-Host 'WINDOWS_HOST_ACL_FIXTURE PASS' }
+    return $script:fail
 }
+
 $savedEnvironment = @{}
 foreach ($name in @('TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','SystemRoot')) { $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name) }
 try {
     $env:TEMP = 'C:\Users\Fixture\AppData\Local\Temp'; $env:TMP = $env:TEMP
     $env:USERPROFILE = 'C:\Users\Fixture'; $env:LOCALAPPDATA = 'C:\Users\Fixture\AppData\Local'; $env:APPDATA = 'C:\Users\Fixture\AppData\Roaming'; $env:SystemRoot = 'C:\Windows'
-    if ($WindowsAcl) { Invoke-WindowsAclChecks; if ($script:fail) { exit 1 }; exit 0 }
+    if ($VerifyReceiverBaselineGuard) {
+        $PlantReceiverFailure = $true
+        $rejected = $false
+        try { Assert-SourceDefectBaseline }
+        catch {
+            if ($_.Exception.Message -ceq 'SOURCE_DEFECT_BASELINE_FAILED' -and
+                $script:failedChecks.Contains('complete receiver publishes exact UTF8 bytes without an added newline')) { $rejected = $true }
+            else { throw }
+        }
+        if (-not $rejected) { throw 'A broken receiver baseline was accepted by the defect tally guard.' }
+        Write-Host 'SOURCE_DEFECT_BASELINE_GUARD PASS'
+        exit 0
+    }
+    if ($WindowsAcl) {
+        $baselineFailures = Invoke-WindowsAclChecks $realScript
+        if ($baselineFailures) { Write-Host 'WINDOWS_ACL_BASELINE_FAILED'; exit 1 }
+        if (-not $PlantDefect) { Write-Host 'WINDOWS_ACL_FIXTURE_ONLY PASS'; exit 0 }
+        $source = [IO.File]::ReadAllText($realScript)
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+        $aclCaught = 0
+        foreach ($name in @('Set-MiosPrivateUserTomlAcl', 'Set-MiosHostTierAcl')) {
+            $definition = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true))[0].Extent.Text
+            $anchor = '$acl.SetAccessRuleProtection($true, $false)'
+            if (-not $definition.Contains($anchor)) { throw 'Missing ACL mutation anchor.' }
+            $broken = $definition.Replace($anchor, '$acl.SetAccessRuleProtection($false, $true)')
+            $copy = Join-Path $scratch ($name + '-planted.ps1')
+            [IO.File]::WriteAllText($copy, $source.Replace($definition, $broken), (New-Object Text.UTF8Encoding($false)))
+            $null = Invoke-WindowsAclChecks $copy
+            $expected = if ($name -eq 'Set-MiosPrivateUserTomlAcl') { 'Windows user TOML grants no other principals access' } else { 'Windows host file and parent directories grant Users no write/delete rights' }
+            if ($script:failedChecks.Contains($expected)) { $aclCaught++ } else { throw 'The Windows ACL mutation was not detected by its intended policy assertion.' }
+        }
+        if ($aclCaught -eq 2) { Write-Host 'WINDOWS_ACL_PLANTS PASS (2/2)'; exit 0 }
+        exit 1
+    }
     if (-not $PlantDefect) {
         $failures = Invoke-Checks $realScript
         if ($failures) { Write-Host "RESULT: FAIL ($failures checks)"; exit 1 }
         Write-Host 'RESULT: PASS (source fixtures; Windows APIs mocked)'; exit 0
     }
+    # A planted defect is meaningful only after the complete, unmodified baseline (including receiver) passes.
+    Assert-SourceDefectBaseline
     $plants = @(
-        @{ Name = 'raw host projection'; From = '$proj = ConvertTo-MiosCredentialFreeToml $Text'; To = '$proj = $Text' },
-        @{ Name = 'canonical alias pass omitted'; From = 'password|passwd|pass|passphrase'; To = 'password|passwd|passphrase' },
-        @{ Name = 'inbound Allow'; From = '-DefaultInboundAction Block'; To = '-DefaultInboundAction Allow' },
-        @{ Name = 'path canonicalization omitted'; From = 'try { $p = ConvertTo-MiosWindowsPath $Path }'; To = 'try { $p = $Path }' },
-        @{ Name = 'stale inbound removal omitted'; From = 'Remove-NetFirewallHyperVRule -Name $old.Name -ErrorAction Stop'; To = '$null = $old.Name' }
+        @{ Name = 'raw host projection'; ExpectedException = 'The host projection still contains credential fields; refusing to write.'; From = '$proj = ConvertTo-MiosCredentialFreeToml $Text'; To = '$proj = $Text' },
+        @{ Name = 'canonical alias pass omitted'; Expected = 'canonical alias pgvector.pass is recognized'; From = 'password|passwd|pass|passphrase'; To = 'password|passwd|passphrase' },
+        @{ Name = 'inbound Allow'; Expected = 'WSL inbound remains Block by default'; From = '-DefaultInboundAction Block'; To = '-DefaultInboundAction Allow' },
+        @{ Name = 'path canonicalization omitted'; Expected = 'Defender refuses C:/'; From = 'try { $p = ConvertTo-MiosWindowsPath $Path }'; To = 'try { $p = $Path }' },
+        @{ Name = 'stale inbound removal omitted'; Expected = 'deleted owned allow rules are removed and other rules preserved'; From = 'Remove-NetFirewallHyperVRule -Name $old.Name -ErrorAction Stop'; To = '$null = $old.Name' }
     )
     $caught = 0
     foreach ($plant in $plants) {
@@ -366,7 +454,13 @@ try {
         $copy = Join-Path $scratch ('planted-' + $caught + '.ps1')
         [IO.File]::WriteAllText($copy, $text.Replace($plant.From, $plant.To), (New-Object Text.UTF8Encoding($false)))
         $detected = $false
-        try { $detected = (Invoke-Checks $copy) -gt 0 } catch { $detected = $true }
+        try {
+            $null = Invoke-Checks $copy -SkipReceiverProtocol
+            $detected = $plant.Expected -and $script:failedChecks.Contains($plant.Expected)
+        } catch {
+            if ($plant.ExpectedException -and $_.Exception.Message -ceq $plant.ExpectedException) { $detected = $true }
+            else { throw }
+        }
         Check $detected ("planted defect caught: " + $plant.Name)
         if ($detected) { $caught++ }
     }

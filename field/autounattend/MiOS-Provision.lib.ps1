@@ -77,11 +77,11 @@ function ConvertFrom-MiosTomlValue {
     return ($v -replace '\s*#.*$', '').Trim()
 }
 function ConvertFrom-MiosTomlFile {
-    param([string]$Path)
+    param([string]$Path, [switch]$ProjectedCredentials)
     $r = New-MiosTomlView
     if ($Path -and -not [IO.Path]::IsPathRooted($Path)) { $Path = Join-Path (Get-Location).ProviderPath $Path }
     if (-not $Path -or -not [IO.File]::Exists($Path)) { return $r }
-    $section = ''; $cur = $null; $multiDelimiter = $null; $multiKey = ''; $multiText = [Text.StringBuilder]::new()
+    $section = ''; $cur = $null; $multiDelimiter = $null; $multiKey = ''; $multiDiscard = $false; $multiText = [Text.StringBuilder]::new()
     foreach ($raw in [IO.File]::ReadAllLines([IO.Path]::GetFullPath($Path), [Text.UTF8Encoding]::new($false, $true))) {
         if ($multiDelimiter) {
             $end = $raw.IndexOf($multiDelimiter, [StringComparison]::Ordinal)
@@ -89,11 +89,11 @@ function ConvertFrom-MiosTomlFile {
             [void]$multiText.Append($raw.Substring(0, $end))
             $tail = $raw.Substring($end + 3).Trim()
             if ($tail -and -not $tail.StartsWith('#')) { throw "MiOS SSOT: invalid multiline TOML string at '$multiKey'" }
-            $r.scalars[$multiKey] = $multiText.ToString(); $multiDelimiter = $null; [void]$multiText.Clear(); continue
+            if (-not $multiDiscard) { $r.scalars[$multiKey] = $multiText.ToString() }; $multiDelimiter = $null; [void]$multiText.Clear(); continue
         }
         $line = $raw.Trim()
         if (-not $line -or $line.StartsWith('#')) { continue }
-        if ($line -match '^\[\[autounattend\.accounts\]\]\s*(?:#.*)?$') {
+        if ($line -cmatch '^\[\[autounattend\.accounts\]\]\s*(?:#.*)?$') {
             if ($null -ne $cur) { $r.accounts += ,$cur }
             $cur = [Collections.Hashtable]::new([StringComparer]::Ordinal); $section = 'account'; $r.has_accounts = $true; continue
         }
@@ -107,20 +107,24 @@ function ConvertFrom-MiosTomlFile {
             if ($trimmed.StartsWith(('"' * 3))) { $triple = '"' * 3 }
             elseif ($trimmed.StartsWith(([string][char]39 * 3))) { $triple = [string][char]39 * 3 }
             if ($triple) {
-                if ($section -ceq 'account' -or $full -cmatch '^(identity\.(username|default_password)|autounattend\.(autologon_user|service\.svc_(user|password))|field\.sysrescue\.(username|password))$') { throw "MiOS SSOT: credential key '$full' uses multiline TOML; use private -ResolvedJson" }
+                $discardCredential = $section -ceq 'account' -or $full -cmatch '^(identity\.(username|default_password)|autounattend\.(autologon_user|service\.svc_(user|password))|field\.sysrescue\.(username|password))$'
+                if ($discardCredential -and -not $ProjectedCredentials) { throw "MiOS SSOT: credential key '$full' uses multiline TOML; use private -ResolvedJson" }
                 $body = $trimmed.Substring(3); $end = $body.IndexOf($triple, [StringComparison]::Ordinal)
                 if ($end -ge 0) {
                     $tail = $body.Substring($end + 3).Trim()
                     if ($tail -and -not $tail.StartsWith('#')) { throw "MiOS SSOT: invalid multiline TOML string at '$full'" }
-                    $r.scalars[$full] = $body.Substring(0, $end)
+                    if (-not $discardCredential) { $r.scalars[$full] = $body.Substring(0, $end) }
                 } else {
-                    $multiDelimiter = $triple; $multiKey = $full
+                    $multiDelimiter = $triple; $multiKey = $full; $multiDiscard = $discardCredential
                     if ($body) { [void]$multiText.AppendLine($body) }
                 }
                 continue
             }
             if ($section -ceq 'autounattend' -and $key -ceq 'accounts') {
-                if (($text -replace '\s*#.*$', '').Trim() -ne '[]') { throw "MiOS SSOT: unsupported 'autounattend.accounts' syntax; use private -ResolvedJson" }
+                if (($text -replace '\s*#.*$', '').Trim() -ne '[]') {
+                    if ($ProjectedCredentials) { continue }
+                    throw "MiOS SSOT: unsupported 'autounattend.accounts' syntax; use private -ResolvedJson"
+                }
                 $r.accounts = @(); $r.has_accounts = $true; continue
             }
             $value = ConvertFrom-MiosTomlValue -Text $text -Key $full
@@ -190,7 +194,10 @@ function Write-MiOSPrivateText {
         Set-MiOSPrivateStream -Stream $stream
         $bytes = $Encoding.GetBytes($Text); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true); $stream.Dispose(); $stream = $null
         if ([IO.File]::Exists($target) -or [IO.Directory]::Exists($target)) {
-            if ($PublicTemplateSha256) {
+            $alreadyPrivate = $false
+            try { Assert-MiOSPrivateFile -Path $target; $alreadyPrivate = $true }
+            catch { if (-not $PublicTemplateSha256) { throw } }
+            if (-not $alreadyPrivate -and $PublicTemplateSha256) {
                 if ($PublicTemplateSha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'MiOS SSOT: invalid public template seal' }
                 Assert-MiOSPrivateFile -Path $target -AllowPublicTemplate
                 $item = Get-Item -LiteralPath $target -Force -ErrorAction Stop
@@ -240,12 +247,15 @@ function Import-MiOSResolvedCredentials {
     if ($doc.has_accounts -or $accounts.Count -ne 0) { $projection.accounts = $accounts; $projection.has_accounts = $true }
     else { $projection.accounts = @(); $projection.has_accounts = $false }
     [void](Resolve-MiOSCredentials -Toml $projection)
+    # The canonical projection owns these complete planes, including key absence.
+    foreach ($key in @($Toml.scalars.Keys)) { if ($key -cmatch '^(identity\.|autounattend\.|field\.sysrescue\.|auth\.password_hash$)') { [void]$Toml.scalars.Remove($key) } }
     Merge-MiosTomlLayer -Dst $Toml -Src $projection
     if (-not $projection.has_accounts) { $Toml.accounts = @(); $Toml.has_accounts = $false }
 }
 function Read-MiosToml {
     param([string]$Path, [switch]$SingleFile, [string]$ResolvedJson)
     if ($SingleFile) { return (ConvertFrom-MiosTomlFile -Path $Path) }
+    if (-not $ResolvedJson) { $ResolvedJson = $env:MIOS_RESOLVED_JSON }
     if (-not $Path) { $Path = $env:MIOS_VENDOR_TOML }
     if (-not $Path) { $Path = $env:MIOS_TOML }
     $r = New-MiosTomlView; $layers = [Collections.Generic.List[string]]::new()
@@ -274,7 +284,7 @@ function Read-MiosToml {
             foreach ($f in $files) { $layers.Add($f) }
         }
     }
-    foreach ($layer in $layers) { Merge-MiosTomlLayer -Dst $r -Src (ConvertFrom-MiosTomlFile -Path $layer) }
+    foreach ($layer in $layers) { Merge-MiosTomlLayer -Dst $r -Src (ConvertFrom-MiosTomlFile -Path $layer -ProjectedCredentials:([bool]$ResolvedJson)) }
     if (-not $ResolvedJson) { $ResolvedJson = $env:MIOS_RESOLVED_JSON }
     if ($ResolvedJson) { Import-MiOSResolvedCredentials -Toml $r -Path $ResolvedJson }
     return $r

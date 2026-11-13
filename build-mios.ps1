@@ -4625,55 +4625,19 @@ function Install-MiOSTmuxProfile {
     return $null
 }
 
-function Update-MiosWindowsBuildCheckout {
-    param([Parameter(Mandatory = $true)][string]$Path,
-          [Parameter(Mandatory = $true)][string]$Ref)
-    # Keep local operator work and commits. Only a clean checkout can advance.
-    # Native stderr is not a terminating PowerShell error on Windows PowerShell 5.1.
-    $ErrorActionPreference = 'Continue'
-    $changes = @(& git -C $Path status --porcelain=v1 --untracked-files=normal 2>$null)
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the Windows MiOS checkout; no source was changed.' }
-    if (@($changes | Where-Object { $_ }).Count) {
-        Write-Host '  [pull] Windows checkout has local changes; preserving them and building the current tree.' -ForegroundColor Yellow
-        return
-    }
-    & git check-ref-format --branch $Ref *> $null
-    if ($LASTEXITCODE -ne 0) { throw 'The configured MiOS source ref is invalid; no source was changed.' }
-    & git -C $Path fetch origin $Ref *> $null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host '  [pull] Windows source fetch failed; preserving and building the current tree. Retry when the remote is available.' -ForegroundColor Yellow
-        return
-    }
-    # A local editor may have saved while fetch was running.
-    $changes = @(& git -C $Path status --porcelain=v1 --untracked-files=normal 2>$null)
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the Windows MiOS checkout after fetch; no local source was changed.' }
-    if (@($changes | Where-Object { $_ }).Count) {
-        Write-Host '  [pull] Windows checkout changed during fetch; preserving it and building the current tree.' -ForegroundColor Yellow
-        return
-    }
-    & git -C $Path merge-base --is-ancestor HEAD FETCH_HEAD *> $null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host '  [pull] Windows checkout has local commits that differ from the remote; preserving and building the current tree. Reconcile the branches before updating.' -ForegroundColor Yellow
-        return
-    }
-    & git -C $Path merge --ff-only --no-edit --no-autostash FETCH_HEAD *> $null
-    if ($LASTEXITCODE -ne 0) { throw 'The Windows MiOS checkout could not fast-forward safely; local work was preserved. Reconcile it before retrying.' }
-    Write-Host '  [pull] Windows checkout is current after a clean fast-forward.' -ForegroundColor Green
-}
-
 function Get-MiosUserTomlHelperSource {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    # The Windows entrypoint owns private user-tier publication and transfer.
+    param([Parameter(Mandatory = $true)][string]$Path,
+          [string[]]$Names = @('Assert-MiosNoReparsePath', 'Set-MiosPrivateUserTomlAcl', 'Import-MiosUserToml',
+                              'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder'))
+    # The Windows entrypoint owns private publication and lossless checkout refresh.
     # Embed its definitions without executing installation or maintaining a second policy.
     $tokens = $null; $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$parseErrors)
     if ($parseErrors.Count) { throw 'The canonical MiOS user configuration helpers do not parse.' }
-    $required = @('Assert-MiosNoReparsePath', 'Set-MiosPrivateUserTomlAcl', 'Import-MiosUserToml',
-                  'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder')
     $definitions = @($ast.FindAll({ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
     }, $true))
-    $source = foreach ($name in $required) {
+    $source = foreach ($name in $Names) {
         $definition = @($definitions | Where-Object { $_.Name -eq $name })
         if ($definition.Count -ne 1) { throw "The canonical MiOS user configuration helper is missing or ambiguous: $name" }
         $definition[0].Extent.Text
@@ -5174,99 +5138,64 @@ if (`$args.Count -eq 0) {
 }
 "@ -Encoding UTF8
 
+    $userTomlHelperPath = @(
+        (Join-Path $PSScriptRoot 'Get-MiOS.ps1')
+        (Join-Path $MiosBootstrapShadow 'Get-MiOS.ps1')
+        (Join-Path $MiosRepoDir 'Get-MiOS.ps1')
+    ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $userTomlHelperPath) { throw 'The canonical MiOS private user configuration helpers are unavailable.' }
+    $userTomlHelperBlock = Get-MiosUserTomlHelperSource -Path $userTomlHelperPath
+    $windowsRefreshBlock = Get-MiosUserTomlHelperSource -Path $userTomlHelperPath -Names @('Update-MiosWindowsBuildCheckout')
+    $losslessPullShellHelper = Get-MiosUserTomlHelperSource -Path $userTomlHelperPath -Names @('Get-MiosLosslessPullShell')
+    $losslessPullShell = & ([scriptblock]::Create($losslessPullShellHelper + "`nGet-MiosLosslessPullShell"))
+    $miosBuildRefLiteral = "'" + ([string]$MiosRef).Replace("'", "''") + "'"
+    $miosBootstrapRefLiteral = "'" + ([string]$MiosBootstrapRef).Replace("'", "''") + "'"
+
     $pullPath = Join-Path $MiosBinDir 'mios-pull.ps1'
-    Set-Content -Path $pullPath -Value @"
+    $pullScript = @"
 $devResolveBlock
+$windowsRefreshBlock
 `$ErrorActionPreference = 'Continue'
-
-# Step 1: Windows-side M:\ refresh.
-`$miosRoot = 'M:\'
+`$sysLetter = if (`$env:SystemDrive) { `$env:SystemDrive } else { 'C:' }
+`$miosRoot = if (Test-Path "`$sysLetter\.git") { "`$sysLetter\" } elseif (Test-Path "`$sysLetter\MiOS\.git") { "`$sysLetter\MiOS" } elseif (Test-Path 'M:\.git') { 'M:\' } else { "`$sysLetter\" }
 if ((Test-Path (Join-Path `$miosRoot '.git')) -and (Get-Command git -ErrorAction SilentlyContinue)) {
-    Write-Host '  [mios-pull] Windows-side: git fetch + reset --hard origin/main on M:\...' -ForegroundColor Cyan
-    try {
-        & git -C `$miosRoot fetch --depth=1 origin main 2>&1 | ForEach-Object { Write-Host ('    ' + `$_) -ForegroundColor DarkGray }
-        if (`$LASTEXITCODE -eq 0) {
-            & git -C `$miosRoot reset --hard origin/main 2>&1 | ForEach-Object { Write-Host ('    ' + `$_) -ForegroundColor DarkGray }
-            if (`$LASTEXITCODE -eq 0) {
-                `$_head = (& git -C `$miosRoot rev-parse --short HEAD 2>`$null)
-                Write-Host ('  [mios-pull] M:\ now at origin/main HEAD = ' + `$_head) -ForegroundColor Green
-            } else {
-                Write-Host '  [mios-pull] M:\ git reset --hard failed' -ForegroundColor Yellow
-            }
-        } else {
-            Write-Host '  [mios-pull] M:\ git fetch failed (offline?)' -ForegroundColor Yellow
-        }
-    } catch {
-        Write-Host ('  [mios-pull] M:\ git refresh threw: ' + `$_.Exception.Message) -ForegroundColor Yellow
-    }
+    Update-MiosWindowsBuildCheckout -Path `$miosRoot -Ref $miosBuildRefLiteral
 } else {
-    Write-Host '  [mios-pull] M:\ is not a git working tree -- skipping Windows-side refresh' -ForegroundColor Yellow
+    Write-Host '  [mios-pull] Windows checkout is unavailable -- preserving the staged tree.' -ForegroundColor Yellow
 }
+# END WINDOWS CHECKOUT REFRESH
 
-Write-Host '  [mios-pull] dev VM: syncing / overlay to origin/main...' -ForegroundColor Cyan
+# The contained native companion follows the same preservation contract.
+# External native pull implementations are not part of this generated entrypoint.
 `$inlinePull = @'
-set -uo pipefail
-if [ -x /usr/bin/mios-pull ]; then
-    # post-bootc-switch path: canonical script is present, defer to it
-    sudo /usr/bin/mios-pull "`$@"
-    exit `$?
-fi
-# pre-bootc-switch path: do the same work inline
-if [ ! -d /.git ]; then
-    echo "[mios-pull-inline] /.git missing -- dev VM root is not yet a mios.git working tree"
-    echo "[mios-pull-inline]   (this is normal pre-build; bootstrap's mios-build-driver"
-    echo "[mios-pull-inline]    will git-init / and overlay mios.git on the next build)"
-    exit 0
-fi
-echo "[mios-pull-inline] git -C / fetch --depth=1 origin main ..."
-sudo git -C / fetch --depth=1 origin main 2>&1 | sed 's/^/    /'
-echo "[mios-pull-inline] git -C / reset --hard FETCH_HEAD ..."
-sudo git -C / reset --hard FETCH_HEAD 2>&1 | sed 's/^/    /'
-_head=`$(sudo git -C / rev-parse --short HEAD 2>/dev/null || true)
-echo "[mios-pull-inline] / now at origin/main HEAD = `${_head}"
+$losslessPullShell
 '@
 `$inlinePullLf = `$inlinePull.Replace("``r``n", "``n")
-`$inlinePullLf | wsl.exe -d (Resolve-MiosDevDistro) --user mios -- bash -s -- @args
-"@ -Encoding UTF8
+`$inlinePullLf | wsl.exe -d (Resolve-MiosDevDistro) --user mios -- sh -s -- / $miosBuildRefLiteral --sudo
+if (`$LASTEXITCODE -ne 0) { throw 'The native checkout refused a safe refresh; local work was preserved.' }
+"@
+    Set-Content -Path $pullPath -Value $pullScript -Encoding UTF8
 
-    $bootstrapBuild = Join-Path $MiosRepoDir 'mios-bootstrap\build-mios.ps1'
+    $bootstrapBuild = Join-Path $MiosBootstrapShadow 'build-mios.ps1'
+    $bootstrapFallback = Join-Path $MiosRepoDir 'build-mios.ps1'
     $updatePath = Join-Path $MiosBinDir 'mios-update.ps1'
     $updateScript = @"
 # <MiOSRoot>\bin\mios-update.ps1 -- self-updating bootstrap re-runner.
-# Fetches latest mios-bootstrap from origin/main, re-overlays it onto
-# M:\, then re-runs build-mios.ps1 with whatever args were passed.
-`$ErrorActionPreference = 'SilentlyContinue'
+# Advances a clean bootstrap checkout safely, then runs its current build script.
+$windowsRefreshBlock
+`$ErrorActionPreference = 'Continue'
 `$shadow      = "$MiosBootstrapShadow"
-`$repoDir     = "$MiosRepoDir"
 `$bootstrapBs = "$bootstrapBuild"
 
 if (Test-Path (Join-Path `$shadow '.git')) {
-    Write-Host '  [mios update] Fetching latest mios-bootstrap from origin/main...' -ForegroundColor Cyan
-    Push-Location `$shadow
-    try {
-        & git remote set-url origin '$MiosBootstrapUrl' 2>&1 | Out-Null
-        & git fetch --depth=1 origin main 2>&1 | Out-Null
-        if (`$LASTEXITCODE -eq 0) {
-            & git reset --hard FETCH_HEAD 2>&1 | Out-Null
-            if (`$LASTEXITCODE -eq 0) {
-                Write-Host '  [mios update] mios-bootstrap shadow updated to origin/main HEAD.' -ForegroundColor Green
-            } else {
-                Write-Host '  [mios update] git reset failed; running with possibly-stale shadow.' -ForegroundColor Yellow
-            }
-        } else {
-            Write-Host '  [mios update] git fetch failed (offline?); running with possibly-stale shadow.' -ForegroundColor Yellow
-        }
-    } finally { Pop-Location }
-
-    # 2. Re-overlay shadow onto M:\ so the build-mios.ps1 we run is
-    #    the fresh one. /XD .git keeps mios.git's .git intact.
-    Write-Host '  [mios update] Re-overlaying mios-bootstrap files onto M:\...' -ForegroundColor Cyan
-    & robocopy `$shadow `$repoDir /E /XD .git /XF mios.toml /NJH /NJS /NFL /NDL /NP 2>&1 | Out-Null
+    Update-MiosWindowsBuildCheckout -Path `$shadow -Ref $miosBootstrapRefLiteral
 } else {
-    Write-Host "  [mios update] No mios-bootstrap shadow at `$shadow -- running local build-mios.ps1 as-is." -ForegroundColor Yellow
+    Write-Host '  [mios update] Bootstrap checkout is unavailable -- running the current staged build script.' -ForegroundColor Yellow
 }
+# END BOOTSTRAP CHECKOUT REFRESH
 
-# 3. Re-run build-mios.ps1 (now refreshed) with all forwarded args.
+# Re-run the preserved bootstrap checkout with all forwarded args.
+if (-not (Test-Path -LiteralPath `$bootstrapBs -PathType Leaf)) { `$bootstrapBs = "$bootstrapFallback" }
 if (Test-Path `$bootstrapBs) {
     & pwsh.exe -NoProfile -File `$bootstrapBs @args
 } else {
@@ -5443,15 +5372,6 @@ Note '   Press any key to close...'
     Log-Ok "mios-help.ps1 (full verb + functionality reference) staged at $helpPath"
 
     $buildPath = Join-Path $MiosBinDir 'mios-build.ps1'
-    $userTomlHelperPath = @(
-        (Join-Path $PSScriptRoot 'Get-MiOS.ps1')
-        (Join-Path $MiosBootstrapShadow 'Get-MiOS.ps1')
-        (Join-Path $MiosRepoDir 'Get-MiOS.ps1')
-    ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-    if (-not $userTomlHelperPath) { throw 'The canonical MiOS private user configuration helpers are unavailable.' }
-    $userTomlHelperBlock = Get-MiosUserTomlHelperSource -Path $userTomlHelperPath
-    $windowsRefreshBlock = 'function Update-MiosWindowsBuildCheckout {' + (Get-Command Update-MiosWindowsBuildCheckout).Definition + "`r`n}"
-    $miosBuildRefLiteral = "'" + ([string]$MiosRef).Replace("'", "''") + "'"
     $buildScript = @"
 $devResolveBlock
 $userTomlHelperBlock

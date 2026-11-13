@@ -765,7 +765,7 @@ function Write-MiosHostToml {
 function Repair-MiosHostTierCredentials {
     param([string[]]$Paths = @())
     foreach ($p in $Paths) {
-        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf -ErrorAction SilentlyContinue)) { continue }
         Set-MiosHostTierAcl -Path $p -Private
         Initialize-MiosHostTierDirectory $p
         Set-MiosHostTierAcl -Path $p -Private
@@ -853,6 +853,89 @@ function Sync-MiosUserTomlToBuilder {
         try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
         $proc.Dispose()
     }
+}
+
+function Update-MiosWindowsBuildCheckout {
+    param([Parameter(Mandatory = $true)][string]$Path,
+          [Parameter(Mandatory = $true)][string]$Ref)
+    # Keep local operator work and commits. Only a clean checkout can advance.
+    # Native stderr is not a terminating PowerShell error on Windows PowerShell 5.1.
+    $ErrorActionPreference = 'Continue'
+    $changes = @(& git -C $Path status --porcelain=v1 --untracked-files=normal 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the Windows MiOS checkout; no source was changed.' }
+    if (@($changes | Where-Object { $_ }).Count) {
+        Write-Host '  [pull] Windows checkout has local changes; preserving them and building the current tree.' -ForegroundColor Yellow
+        return
+    }
+    & git check-ref-format --branch $Ref *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'The configured MiOS source ref is invalid; no source was changed.' }
+    & git -C $Path fetch origin $Ref *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host '  [pull] Windows source fetch failed; preserving and building the current tree. Retry when the remote is available.' -ForegroundColor Yellow
+        return
+    }
+    # A local editor may have saved while fetch was running.
+    $changes = @(& git -C $Path status --porcelain=v1 --untracked-files=normal 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the Windows MiOS checkout after fetch; no local source was changed.' }
+    if (@($changes | Where-Object { $_ }).Count) {
+        Write-Host '  [pull] Windows checkout changed during fetch; preserving it and building the current tree.' -ForegroundColor Yellow
+        return
+    }
+    & git -C $Path merge-base --is-ancestor HEAD FETCH_HEAD *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host '  [pull] Windows checkout has local commits that differ from the remote; preserving and building the current tree. Reconcile the branches before updating.' -ForegroundColor Yellow
+        return
+    }
+    & git -C $Path merge --ff-only --no-edit --no-autostash --no-overwrite-ignore FETCH_HEAD *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'The Windows MiOS checkout could not fast-forward safely; local work was preserved. Reconcile it before retrying.' }
+    Write-Host '  [pull] Windows checkout is current after a clean fast-forward.' -ForegroundColor Green
+}
+
+function Get-MiosLosslessPullShell {
+    # One shell implementation for generated native pull companions; no installer side effects.
+    return @'
+set -eu
+checkout=${1:?A checkout path is required}
+source_ref=${2:?A source ref is required}
+case "${3:-}" in
+    '') git_command() { git "$@"; } ;;
+    --sudo) git_command() { sudo -n git "$@"; } ;;
+    *) echo '[mios-pull] Invalid checkout execution mode; no source was changed.' >&2; exit 1 ;;
+esac
+if ! changes=$(git_command -C "$checkout" status --porcelain=v1 --untracked-files=normal 2>/dev/null); then
+    echo '[mios-pull] Cannot inspect the checkout; no source was changed.' >&2
+    exit 1
+fi
+if [ -n "$changes" ]; then
+    echo '[mios-pull] Local changes preserved; using the current tree. Commit or reconcile them before updating.'
+    exit 0
+fi
+if ! git_command check-ref-format --branch "$source_ref" >/dev/null 2>&1; then
+    echo '[mios-pull] The configured source ref is invalid; no source was changed.' >&2
+    exit 1
+fi
+if ! git_command -C "$checkout" fetch origin "$source_ref" >/dev/null 2>&1; then
+    echo '[mios-pull] Fetch failed; the current tree was preserved. Retry when the remote is available.'
+    exit 0
+fi
+if ! changes=$(git_command -C "$checkout" status --porcelain=v1 --untracked-files=normal 2>/dev/null); then
+    echo '[mios-pull] Cannot inspect the checkout after fetch; local source was preserved.' >&2
+    exit 1
+fi
+if [ -n "$changes" ]; then
+    echo '[mios-pull] The checkout changed during fetch; preserving the current tree.'
+    exit 0
+fi
+if ! git_command -C "$checkout" merge-base --is-ancestor HEAD FETCH_HEAD >/dev/null 2>&1; then
+    echo '[mios-pull] Local commits differ from the remote; preserving the current tree. Reconcile the branches before updating.'
+    exit 0
+fi
+if ! git_command -C "$checkout" merge --ff-only --no-edit --no-autostash --no-overwrite-ignore FETCH_HEAD >/dev/null 2>&1; then
+    echo '[mios-pull] A safe fast-forward was refused; local work was preserved. Reconcile it before retrying.' >&2
+    exit 1
+fi
+echo '[mios-pull] Checkout is current after a clean fast-forward.'
+'@
 }
 
 function Get-MiosTomlTableArray {
@@ -3330,6 +3413,10 @@ function Install-MiOSPowerShellProfile {
         'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder') | ForEach-Object {
             'function ' + $_ + " {`r`n" + (Get-Command $_ -CommandType Function -ErrorAction Stop).Definition + "`r`n}"
         }) -join "`r`n"
+    $windowsRefreshBlock = 'function Update-MiosWindowsBuildCheckout {' +
+        (Get-Command Update-MiosWindowsBuildCheckout -CommandType Function -ErrorAction Stop).Definition + "`r`n}"
+    $miosBuildRef = [string](Get-MiosTomlValue -Section 'bootstrap' -Key 'mios_ref' -Default 'main')
+    $miosBuildRefLiteral = "'" + $miosBuildRef.Replace("'", "''") + "'"
     $_devName = [string](Get-MiosTomlValue -Section 'bootstrap' -Key 'dev_distro' -Default 'MiOS-DEV')
     if ($_devName -notmatch '^[A-Za-z0-9_.-]+$') { throw 'bootstrap.dev_distro is not a valid WSL distribution name.' }
     $miosDevDistroLiteral = "'" + $_devName + "'"
@@ -3452,6 +3539,7 @@ if (`$true) {
 
 `$Script:MiosBootstrapRaw = '$($Script:MiosBootstrapRaw)'
 $userTomlHelperBlock
+$windowsRefreshBlock
 function Resolve-MiosDevDistro {
     `$name = $miosDevDistroLiteral
     `$registered = @((& wsl.exe -l -q 2>`$null) -split "`r?`n" | ForEach-Object { (`$_ -replace [char]0, '').Trim() } | Where-Object { `$_ })
@@ -3580,16 +3668,8 @@ function mios-pull {
         Write-Host "  [!] `$_targetRoot is not a git working tree -- run mios-build first." -ForegroundColor Yellow
         return
     }
-    Push-Location `$_targetRoot
-    try {
-        git fetch --depth=1 origin main
-        if (`$LASTEXITCODE -eq 0) {
-            git reset --hard FETCH_HEAD
-            Write-Host "  [+] `$_targetRoot overlay synced to origin/main." -ForegroundColor Green
-        } else {
-            Write-Host '  [!] git fetch failed -- check network.' -ForegroundColor Yellow
-        }
-    } finally { Pop-Location }
+    Update-MiosWindowsBuildCheckout -Path `$_targetRoot -Ref $miosBuildRefLiteral
+
 }
 
 function mios-config {

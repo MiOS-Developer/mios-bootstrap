@@ -239,7 +239,7 @@ groups    = ["wheel", "libvirt", "kvm", "video", "render", "input", "dialout", "
 # service account resolve to this (rotate on first run -- an answer-file/task cred
 # is temporary). Referenced by [autounattend.service].svc_password and the account
 # defaults; defining it here makes that SSOT chain resolve (was a dangling ref).
-default_password = "user"
+default_password = ""
 
 # ----------------------------------------------------------------------------
 # [accounts] -- DB-backed account control plane (task_152/task_153)

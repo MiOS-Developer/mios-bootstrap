@@ -1,6 +1,10 @@
 # AI-hint: Shared MiOS install-time provisioning library (SSOT reader + hostname/account/branding/theme/layout/preferences emitters) dot-sourced by BOTH the MiOS-XBOX.iso path (ConvertTo-MiOSPreset.ps1 -> autounattend reg) AND the irm|iex / existing-Windows path (Invoke-MiOSProvision.ps1 -> live apply). One source => the two install paths stay in feature parity.
 # AI-related: mios-bootstrap, Get-MiOS.ps1, ConvertTo-MiOSPreset.ps1, Invoke-MiOSProvision.ps1, New-MiOSAutounattend.ps1
+<<<<<<< HEAD
 # AI-functions: Read-MiosToml, ConvertFrom-MiosTomlFile, Merge-MiosTomlLayer, Resolve-MiOSCredentials, Write-MiOSPrivateText, Install-MiOSLivingWallpaperAssets, Resolve-MiOSVendorCommit, Install-MiOSOemLogo, New-MiOSOemLogoCommands, Get-Toml, Get-MiOSHostname, Get-MiOSAccounts, ConvertTo-PwPair, ConvertTo-AccentDword, New-MiOSGlobalPrefCommands, New-MiOSBrandingCommands, New-MiOSLinuxLayoutCommands, New-MiOSProvisionCommands, Invoke-MiOSHostCommands
+=======
+# AI-functions: Read-MiosToml, ConvertFrom-MiosTomlFile, Merge-MiosTomlLayer, Resolve-MiOSCredentials, Write-MiOSPrivateText, Install-MiOSLivingWallpaperAssets, Get-Toml, Get-MiOSHostname, Get-MiOSAccounts, ConvertTo-PwPair, ConvertTo-AccentDword, New-MiOSGlobalPrefCommands, New-MiOSBrandingCommands, New-MiOSLinuxLayoutCommands, New-MiOSProvisionCommands, New-MiOSUnattendPayload, Invoke-MiOSHostCommands
+>>>>>>> 5ecf6dc6a43761688919ccc4d6b4b61c482221a6
 #Requires -Version 5.1
 # =============================================================================
 # MiOS-Provision.lib.ps1 -- UNIFIED provisioning core.
@@ -250,6 +254,44 @@ function Write-MiOSPrivateText {
         if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
     }
 }
+# Keep the complete ordered payload in the existing answer-file extension. Only
+# the bounded, payload-bound launcher is passed to Windows CreateProcess.
+# Windows Setup must retain custom extensions in its Panther cache through both
+# passes; verify that lifecycle on the supported Windows installation path.
+function New-MiOSUnattendPayload {
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet('FirstLogonScript','SpecializeScript')][string]$Name,
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Script
+    )
+    $encoding = [Text.UnicodeEncoding]::new($false, $false, $true)
+    $bytes = $encoding.GetBytes($Script)
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try { $digest = [Convert]::ToBase64String($hash.ComputeHash($bytes)) }
+    finally { $hash.Dispose() }
+    # No script, credential, XML body, or caught exception is printed on failure.
+    # Decode and invoke once in this process: variables, functions and command
+    # ordering survive intact, without credential-bearing extracted sidecars.
+    # Security boundary: never use mutable WINDIR or search removable/network
+    # media. Windows SpecialFolder.Windows (36) must be drive-rooted; inspect
+    # root and every ancestor before opening a later component. ReparsePoint is
+    # FileAttributes 1024. ActionPreference Stop is 1; DtdProcessing Prohibit is 0.
+    # The reader itself disables DTDs/resolution; Load(reader) cannot resolve any.
+    # The full SHA-256 is encoded as 44 Base64 characters, compared case-sensitively.
+    # Windows owns/protects the Windows/Panther ancestors. The pinned digest also
+    # refuses substituted cache payloads; real Setup retention, owner/DACL and
+    # credential privacy remain Windows installation acceptance (not verified here).
+    $launcher = @'
+$ErrorActionPreference=1;try{$d=[Environment]::GetFolderPath(36);if($d -notmatch '^[A-Za-z]:\\'){throw};$p=$d.Remove(2);foreach($c in ('\'+$d.Substring(3)+'\Panther\unattend.xml').Split('\')){$p+='\'+$c;if([IO.File]::GetAttributes($p) -band 1024){throw}};$r=[Xml.XmlReader]::Create($p,([Xml.XmlReaderSettings]@{DtdProcessing=0;XmlResolver=$null}));$x=[xml]::new();$x.Load($r);$r.Dispose();$n=[Xml.XmlNamespaceManager]::new($x.NameTable);$n.AddNamespace('u','urn:schemas-microsoft-com:unattend');$n.AddNamespace('m','urn:mios:unattend');$p=$x.SelectNodes('/u:unattend/m:Extensions/m:__PAYLOAD_NAME__',$n);if($p.Count -ne 1){throw};$b=[Convert]::FromBase64String($p[0].InnerText);$h=[Security.Cryptography.SHA256]::Create();$s=[Convert]::ToBase64String($h.ComputeHash($b));$h.Dispose();if($s -cne '__PAYLOAD_SHA256__'){throw};& ([ScriptBlock]::Create(([Text.UnicodeEncoding]::new(0,0,1)).GetString($b)))}catch{[Console]::Error.WriteLine('MiOS payload failed.');exit 1}
+'@
+    $launcher = $launcher.Replace('__PAYLOAD_NAME__', $Name).Replace('__PAYLOAD_SHA256__', $digest)
+    # This template is ASCII and uses no double quote; pass it as one -Command
+    # argument. Encoding the launcher would itself exceed Setup's 1,024-unit
+    # FirstLogon CommandLine cap, even below CreateProcessW's 32,767-unit limit.
+    $command = 'powershell.exe -nop -c "' + $launcher + '"'
+    if ($command.Length -ge 1024) { throw 'MiOS unattended launcher exceeds the Windows Setup command-line limit' }
+    return @{ Base64 = [Convert]::ToBase64String($bytes); CommandLine = $command }
+}
+
 function Import-MiOSResolvedCredentials {
     param($Toml, [string]$Path)
     Assert-MiOSPrivateFile -Path $Path

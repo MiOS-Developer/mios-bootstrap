@@ -95,6 +95,17 @@ if (-not $TomlPath) {
         if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) { $TomlPath = $candidate; break }
     }
 }
+$ventoy = Get-Item -LiteralPath (Join-Path $target.FullName 'ventoy') -Force
+if (-not $ventoy.PSIsContainer -or ($ventoy.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw 'The rescue output directory must exist without a link; no files were changed.'
+}
+$environmentPath = Join-Path $target.FullName 'mios-sysrescue.env'
+if (Test-Path -LiteralPath $environmentPath) {
+    $existingEnvironment = Get-Item -LiteralPath $environmentPath -Force
+    if ($existingEnvironment.PSIsContainer -or ($existingEnvironment.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'Refusing a rescue environment output that is not a regular file; no files were changed.'
+    }
+}
 $toml = Read-MiosToml -Path $TomlPath -ResolvedJson $ResolvedJson
 if ((Get-Toml $toml 'field.sysrescue.enable' 'true') -notmatch '^(?i:true|1|yes)$') { return }
 $credentials = Resolve-MiOSCredentials -Toml $toml
@@ -120,7 +131,7 @@ $hash = Get-MiOSKickstartPasswordHash -Toml $toml -Credentials $credentials
 $prepared = @()
 foreach ($name in @('sysrescue_grub.cfg', 'sysrescue_syslinux.cfg', 'mios-kickstart.cfg')) {
     $source = Join-Path $PSScriptRoot $name
-    $path = Join-Path (Join-Path $target.FullName 'ventoy') $name
+    $path = Join-Path $ventoy.FullName $name
     $existing = Get-Item -LiteralPath $path -Force
     if ($existing.PSIsContainer -or ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
         throw 'Refusing a rescue output that is not a regular file; no files were changed.'
@@ -153,5 +164,5 @@ $environment = "# Rendered from layered MiOS field.sysrescue credentials; privat
 foreach ($output in $prepared) {
     Write-MiOSPrivateText -Path $output.Path -Text $output.Text -Encoding UTF8 -PublicTemplateSha256 $output.PublicTemplateSha256
 }
-Write-MiOSPrivateText -Path (Join-Path $target.FullName 'mios-sysrescue.env') -Text $environment -Encoding UTF8
+Write-MiOSPrivateText -Path $environmentPath -Text $environment -Encoding UTF8
 Write-Host '[render-sysrescue] Rendered the requested rescue credential surfaces from the layered MiOS SSOT; credential values are not displayed.'

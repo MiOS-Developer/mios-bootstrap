@@ -117,7 +117,7 @@ function Install-ApiMocks {
         $script:aclCalls.Add("$Path|$Private")
         if ($script:failAcl) { throw 'Fixture ACL failure' }
         if ($Path -like '*.tmp' -and $Private -and (Test-Path -LiteralPath $Path)) {
-            if ((Get-Item -LiteralPath $Path).Length -ne 0) { throw 'Fixture: private ACL was set after bytes were written' }
+            if ((Get-Item -LiteralPath $Path -Force).Length -ne 0) { throw 'Fixture: private ACL was set after bytes were written' }
         }
     }
     function global:Resolve-MiosTomlText { return $script:fixtureUser }

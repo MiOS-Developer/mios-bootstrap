@@ -1,10 +1,6 @@
 # AI-hint: Shared MiOS install-time provisioning library (SSOT reader + hostname/account/branding/theme/layout/preferences emitters) dot-sourced by BOTH the MiOS-XBOX.iso path (ConvertTo-MiOSPreset.ps1 -> autounattend reg) AND the irm|iex / existing-Windows path (Invoke-MiOSProvision.ps1 -> live apply). One source => the two install paths stay in feature parity.
 # AI-related: mios-bootstrap, Get-MiOS.ps1, ConvertTo-MiOSPreset.ps1, Invoke-MiOSProvision.ps1, New-MiOSAutounattend.ps1
-<<<<<<< HEAD
-# AI-functions: Read-MiosToml, ConvertFrom-MiosTomlFile, Merge-MiosTomlLayer, Resolve-MiOSCredentials, Write-MiOSPrivateText, Install-MiOSLivingWallpaperAssets, Resolve-MiOSVendorCommit, Install-MiOSOemLogo, New-MiOSOemLogoCommands, Get-Toml, Get-MiOSHostname, Get-MiOSAccounts, ConvertTo-PwPair, ConvertTo-AccentDword, New-MiOSGlobalPrefCommands, New-MiOSBrandingCommands, New-MiOSLinuxLayoutCommands, New-MiOSProvisionCommands, Invoke-MiOSHostCommands
-=======
-# AI-functions: Read-MiosToml, ConvertFrom-MiosTomlFile, Merge-MiosTomlLayer, Resolve-MiOSCredentials, Write-MiOSPrivateText, Install-MiOSLivingWallpaperAssets, Get-Toml, Get-MiOSHostname, Get-MiOSAccounts, ConvertTo-PwPair, ConvertTo-AccentDword, New-MiOSGlobalPrefCommands, New-MiOSBrandingCommands, New-MiOSLinuxLayoutCommands, New-MiOSProvisionCommands, New-MiOSUnattendPayload, Invoke-MiOSHostCommands
->>>>>>> 5ecf6dc6a43761688919ccc4d6b4b61c482221a6
+# AI-functions: Read-MiosToml, ConvertFrom-MiosTomlFile, Merge-MiosTomlLayer, Resolve-MiOSCredentials, Write-MiOSPrivateText, Install-MiOSLivingWallpaperAssets, Resolve-MiOSVendorCommit, Install-MiOSOemLogo, New-MiOSOemLogoCommands, Get-Toml, Get-MiOSHostname, Get-MiOSAccounts, ConvertTo-PwPair, ConvertTo-AccentDword, New-MiOSGlobalPrefCommands, New-MiOSBrandingCommands, New-MiOSLinuxLayoutCommands, New-MiOSProvisionCommands, New-MiOSUnattendPayload, Invoke-MiOSHostCommands
 #Requires -Version 5.1
 # =============================================================================
 # MiOS-Provision.lib.ps1 -- UNIFIED provisioning core.

@@ -556,11 +556,11 @@
         <UserAccounts>
           <LocalAccounts>
             <LocalAccount>
-              <Name>mios</Name>
+              <Name>__MIOS_IDENTITY_USERNAME__</Name>
               <DisplayName>MiOS' User</DisplayName>
               <Group>Administrators</Group>
               <Password>
-                <Value>mios</Value>
+                <Value></Value>
                 <PlainText>true</PlainText>
               </Password>
             </LocalAccount>
@@ -568,10 +568,10 @@
         </UserAccounts>
         <AutoLogon>
           <Enabled>true</Enabled>
-          <Username>mios</Username>
+          <Username>__MIOS_IDENTITY_USERNAME__</Username>
           <LogonCount>1</LogonCount>
           <Password>
-            <Value>mios</Value>
+            <Value></Value>
             <PlainText>true</PlainText>
           </Password>
         </AutoLogon>
@@ -1466,21 +1466,21 @@
         </FirstLogonCommands>
         <AutoLogon>
           <Password>
-            <Value>mios</Value>
+            <Value></Value>
             <PlainText>true</PlainText>
           </Password>
           <Enabled>true</Enabled>
           <LogonCount>999</LogonCount>
-          <Username>mios</Username>
+          <Username>__MIOS_IDENTITY_USERNAME__</Username>
         </AutoLogon>
         <UserAccounts>
           <LocalAccounts>
             <LocalAccount wcm:action="add">
-              <Name>mios</Name>
+              <Name>__MIOS_IDENTITY_USERNAME__</Name>
               <DisplayName>MiOS</DisplayName>
               <Group>Administrators</Group>
               <Password>
-                <Value>mios</Value>
+                <Value></Value>
                 <PlainText>true</PlainText>
               </Password>
             </LocalAccount>

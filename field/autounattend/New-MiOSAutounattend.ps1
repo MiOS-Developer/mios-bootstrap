@@ -1,74 +1,24 @@
-# AI-hint: SSOT-driven generator that renders a MiOS autounattend.xml (with a nested MiOS irm|iex bootstrap + all local offline accounts from mios.toml) and optionally injects it into a UUP-Dump / winutil source ISO via oscdimg to produce a custom "MiOS Windows 11" install image.
-# AI-related: mios-bootstrap, Get-MiOS.ps1, field/autounattend/autounattend.xml, Invoke-MiOSProvision.ps1
-# AI-functions: Read-MiosToml, ConvertTo-UnattendPassword, New-MiOSAutounattendXml, Build-MiOSIso
+# AI-hint: Pure XML compatibility renderer over the layered MiOS credential SSOT; no host mutation or image build.
+# AI-related: MiOS-Provision.lib.ps1, usr/lib/mios/mios_credentials.py, usr/libexec/mios/win/xbox/build.py
+# AI-functions: ConvertTo-UnattendPassword, New-MiOSAutounattendXml
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Generate a MiOS autounattend.xml from mios.toml SSOT, and (optionally) inject
-    it into a Windows 11 ISO to produce a custom MiOS install image.
-
+    Render a private autounattend.xml from layered MiOS configuration.
 .DESCRIPTION
-    Part of the MiOS custom-Windows pipeline:
-
-        UUP Dump            -> latest, slipstreamed Windows 11 source ISO
-        winutil / MicroWin  -> debloat + hardware-check bypass (optional)
-        THIS SCRIPT         -> Schneegans-style autounattend.xml with:
-                                 * ALL local ("offline") accounts from SSOT
-                                   (mios.toml [[autounattend.accounts]]),
-                                   NO Microsoft account, fully offline
-                                 * OOBE skip + long-path enable + optional
-                                   Win11 TPM/SecureBoot/RAM bypass
-                                 * a NESTED MiOS irm|iex in FirstLogonCommands
-                                   that runs Get-MiOS.ps1 at first boot
-        oscdimg (ADK)       -> rebuilt dual BIOS/UEFI bootable MiOS ISO
-
-    "During install" (fresh media) and "post install" (existing Windows users,
-    via Invoke-MiOSProvision.ps1) both converge on the SAME irm|iex bootstrap.
-
-    SSOT: accounts, computer name, timezone, and the bootstrap URL all resolve
-    from mios.toml. Missing keys degrade-open to safe defaults derived from
-    [identity]. No value is hardcoded that belongs in the TOML.
-
-.PARAMETER TomlPath
-    mios.toml to read. Default: first of M:\etc\mios\mios.toml,
-    M:\usr\share\mios\mios.toml, <repo>\mios.toml.
-
+    XML-only compatibility entry. MiOS-Xbox images use the canonical build.py
+    pipeline. A validated private -ResolvedJson projection wins over credential
+    fields in a Bootstrap vendor fork. Missing credentials refuse before output.
+    FirstLogon and specialize payloads are UTF-16LE encoded commands, also kept
+    in urn:mios:unattend extensions for inspection. Rendering never runs them.
 .PARAMETER OutXml
-    Output autounattend.xml path. Default: .\autounattend.xml (cwd).
-
-.PARAMETER SourceIso
-    A Windows 11 ISO (from UUP Dump, or a winutil/MicroWin output) to inject the
-    autounattend into. When set with -OutIso, rebuilds a bootable ISO via oscdimg.
-
-.PARAMETER OutIso
-    Output ISO path for the injected MiOS image.
-
-.PARAMETER WinutilToolsDir
-    If given, also copies the generated autounattend.xml to
-    <WinutilToolsDir>\autounattend.xml so a winutil/MicroWin build picks up the
-    MiOS answer file (MicroWin ships its own tools\autounattend.xml at ISO root).
-
-.PARAMETER FullDiskWindows
-    Give Windows the whole disk (C: = all), provisioning M:\ later via Get-MiOS.ps1.
-    DEFAULT (off) is the MiOS carve: C: = [autounattend].c_partition_gb (128 GB) and
-    the REST of the disk allocated to MiOS as M:\ (MIOS-DEV).
-
+    Credential-bearing output, restricted to the current user/system administrators.
 .PARAMETER ObfuscatePasswords
-    Base64-obscure account passwords in the XML (Schneegans "Base64 obscuration").
-    NOT encryption -- an answer file on media is always readable. Treat passwords
-    as first-boot temporary credentials and rotate on first logon.
-
-.PARAMETER BootstrapUrl
-    Override the nested-bootstrap URL. Default: mios.toml [autounattend].bootstrap_url
-    or the canonical raw Get-MiOS.ps1.
-
-.EXAMPLE
-    # SSOT -> autounattend.xml only
-    .\New-MiOSAutounattend.ps1 -OutXml .\autounattend.xml
-
-.EXAMPLE
-    # Full custom MiOS ISO from a UUP-Dump source ISO
-    .\New-MiOSAutounattend.ps1 -SourceIso .\Win11_UUP.iso -OutIso .\MiOS-Win11.iso -CarveDataPartition
+    Windows Setup Base64 obscuration; this is not encryption. Keep media private.
+.PARAMETER SourceIso
+    Retired; any ISO or legacy injection parameter refuses before SSOT reads.
+.PARAMETER ResolvedJson
+    Private mios-resolved-credentials/1 file produced by the canonical resolver.
 #>
 [CmdletBinding()]
 param(
@@ -80,15 +30,16 @@ param(
     [switch]$FullDiskWindows,
     [switch]$ObfuscatePasswords,
     [string]$BootstrapUrl,
-    [string]$Edition
+    [string]$Edition,
+    [string]$ResolvedJson
 )
+if ($SourceIso -or $OutIso) { throw 'MiOS-Xbox: ISO generation through this legacy entry is retired; use usr/libexec/mios/win/xbox/build.py.' }
+if ($WinutilToolsDir) { throw 'MiOS-Xbox: legacy image injection is retired; this entry renders XML only.' }
 $ErrorActionPreference = 'Stop'
 
 $CANONICAL_BOOTSTRAP = 'https://raw.githubusercontent.com/mios-dev/mios-bootstrap/main/Get-MiOS.ps1'
 
-# Shared MiOS provisioning core -- same strip-and-rebuild layout + branding the
-# NTLite preset (ConvertTo-MiOSPreset) and existing-Windows path (Invoke-MiOSProvision)
-# use, so all three stay in parity. (Provides New-MiOSLinuxLayoutCommands, etc.)
+# Shared pure render functions; actual host changes belong to the explicit live provision entry.
 . (Join-Path $PSScriptRoot 'MiOS-Provision.lib.ps1')
 
 
@@ -107,6 +58,8 @@ function ConvertTo-UnattendPassword {
 function New-MiOSAutounattendXml {
     param($Toml)
 
+    # Credentials are validated before any output or host-side work.
+    $credentials = Resolve-MiOSCredentials -Toml $Toml
     # --- Resolve SSOT ------------------------------------------------------
     $computerName = Get-Toml $Toml 'autounattend.computer_name' (Get-Toml $Toml 'identity.hostname' 'MIOS')
     $timezone     = Get-Toml $Toml 'autounattend.timezone'      (Get-Toml $Toml 'locale.timezone' 'UTC')
@@ -134,17 +87,9 @@ function New-MiOSAutounattendXml {
     $edition      = [Security.SecurityElement]::Escape($edition)
     $productKey   = [Security.SecurityElement]::Escape($productKey)
 
-    # --- Accounts (SSOT; fallback to [identity].username as sole admin) -----
-    $accounts = @($Toml.accounts)
-    if ($accounts.Count -eq 0) {
-        $u = Get-Toml $Toml 'identity.username' 'mios'
-        $accounts = @(@{ name = $u; display_name = (Get-Toml $Toml 'identity.fullname' 'MiOS User'); group = 'Administrators'; password = $u })
-    }
-
-    # svc_user (default mios-sudo) IS the renamed built-in Administrator (RID-500), created by the
-    # specialize rename -- NOT as a LocalAccount here, or the duplicate collides. It is the AutoLogon
-    # + provisioning identity (SSOT, no hardcode).
-    $svcUser = Get-Toml $Toml 'autounattend.service.svc_user' 'mios-sudo'
+    # Account names/passwords and console sign-in come from the one layered resolver.
+    $accounts = @($credentials.accounts)
+    $svcUser = [string]$credentials.service.user
 
     $localAccountsXml = New-Object System.Text.StringBuilder
     foreach ($a in $accounts) {
@@ -172,17 +117,14 @@ function New-MiOSAutounattendXml {
 "@)
     }
 
-    # AutoLogon runs FirstLogon + provisioning as SSOT autounattend.autologon_user (default = svc_user
-    # 'mios-sudo', the renamed built-in Administrator) -- NEVER a stray 'user'/accounts[0]. RID-500 is
-    # renamed + passworded in specialize (before oobeSystem), so AutoLogon into it resolves. The
-    # password is the ONE SSOT chain used everywhere (specialize / SetupComplete __SVCPW__ / schtasks /rp
-    # / AutoLogon): autounattend.service.svc_password else identity.default_password. No hardcode.
-    $alUser  = Get-Toml $Toml 'autounattend.autologon_user' ''
-    if (-not $alUser) { $alUser = $svcUser }
-    $alPwRaw = Get-Toml $Toml 'autounattend.service.svc_password' ''
-    if (-not $alPwRaw) { $alPwRaw = Get-Toml $Toml 'identity.default_password' 'user' }
-    $firstPw   = ConvertTo-UnattendPassword -Pw ([string]$alPwRaw) -Obfuscate:$ObfuscatePasswords
-    $firstName = [Security.SecurityElement]::Escape([string]$alUser)
+    # The console account is independent of the service account and keeps the
+    # resolved persistent policy. A missing or conflicting credential already refused.
+    $alUser = [string]$credentials.autologon.user
+    $alPwRaw = [string]$credentials.autologon.password
+    $firstPw = ConvertTo-UnattendPassword -Pw $alPwRaw -Obfuscate:$ObfuscatePasswords
+    $firstName = [Security.SecurityElement]::Escape($alUser)
+    $firstEnabled = if ($credentials.autologon.enable) { 'true' } else { 'false' }
+    $firstCount = [string]$credentials.autologon.count
 
     # --- FirstLogonCommands (USER context): full layout creation, offline branding,
     #     user preferences, Xbox mode, custom scripts, and the nested bootstrap.
@@ -201,11 +143,11 @@ function New-MiOSAutounattendXml {
     $_flOrd++
 
     # Expire passwords of all local interactive/non-service accounts to force rotation on next logon
-    $svcUser = Get-Toml $Toml 'autounattend.service.svc_user' 'mios-sudo'
+    $svcUser = [string]$credentials.service.user
     # svc_user IS the renamed built-in Administrator (RID 500) = the MiOS AI admin; its
     # account description is SSOT-driven too and stamped onto RID-500 in the specialize pass.
     $svcDesc = Get-Toml $Toml 'autounattend.service.svc_description' 'MiOS AI -- autonomous system administrator (the renamed built-in Administrator, RID 500)'
-    $expireCmd = 'powershell.exe -NoProfile -Command "Get-LocalUser | Where-Object { $_.Name -ne ''Administrator'' -and $_.Name -ne ''' + $svcUser + ''' -and $_.Name -ne ''Guest'' -and $_.Name -ne ''DefaultAccount'' -and $_.Name -ne ''WDAGUtilityAccount'' } | Set-LocalUser -PasswordExpired $true"'
+    $expireCmd = 'powershell.exe -NoProfile -Command "Get-LocalUser | Where-Object { $_.Name -ne ''Administrator'' -and $_.Name -ne ''' + $svcUser + ''' -and $_.Name -ne ''' + $alUser.Replace("'", "''") + ''' -and $_.Name -ne ''Guest'' -and $_.Name -ne ''DefaultAccount'' -and $_.Name -ne ''WDAGUtilityAccount'' } | Set-LocalUser -PasswordExpired $true"'
     [void]$_flc.AppendLine(('        <SynchronousCommand wcm:action="add"><Order>{0}</Order><CommandLine>{1}</CommandLine><Description>Expire first-boot temporary passwords</Description></SynchronousCommand>' -f $_flOrd, [Security.SecurityElement]::Escape($expireCmd)))
     $_flOrd++
 
@@ -217,9 +159,19 @@ function New-MiOSAutounattendXml {
         [void]$_flc.AppendLine(('        <SynchronousCommand wcm:action="add"><Order>{0}</Order><CommandLine>{1}</CommandLine><Description>MiOS bootstrap (nested offline USB / irm|iex)</Description><RequiresUserInput>false</RequiresUserInput></SynchronousCommand>' -f $_flOrd, $cmd))
         $_flOrd++
     }
-    if ($_flc.Length -gt 0) {
-        $firstLogonXml = "      <FirstLogonCommands>`n" + $_flc.ToString().TrimEnd() + "`n      </FirstLogonCommands>"
+    # Windows command payloads are encoded once, and the same bytes remain
+    # inspectable in the namespaced extension. Rendering never executes them.
+    [xml]$firstCommands = ('<Commands xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">' + $_flc.ToString() + '</Commands>')
+    $firstScriptLines = @('$ErrorActionPreference = ''Stop''')
+    foreach ($entry in @($firstCommands.Commands.SynchronousCommand)) {
+        $firstScriptLines += ('& $env:ComSpec /d /s /c ''' + ([string]$entry.CommandLine).Replace("'", "''") + '''')
     }
+    if ($credentials.autologon.persistent) {
+        $firstScriptLines += '& $env:ComSpec /d /s /c ''reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoLogonCount /f'''
+    }
+    $firstScript = ($firstScriptLines -join "`r`n") + "`r`n"
+    $firstScriptB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($firstScript))
+    $firstLogonXml = ('      <FirstLogonCommands><SynchronousCommand wcm:action="add"><Order>1</Order><CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand {0}</CommandLine><Description>MiOS first logon from the layered SSOT</Description></SynchronousCommand></FirstLogonCommands>' -f $firstScriptB64)
 
     # --- Optional Win11 hardware-check bypass (windowsPE) -------------------
     $bypassXml = ''
@@ -305,7 +257,15 @@ function New-MiOSAutounattendXml {
     # description POST-OOBE, where Windows Setup ignores exit codes and a failure cannot
     # abort the install (SetupComplete.cmd L66-84; New-MiOSISO substitutes __SVCUSER__ /
     # __SVCPW__ / __SVCDESC__ from mios.toml). `specialize` stays identity-mutation-free.
-    $preOobeXml = $_preOobe.ToString().TrimEnd()
+    [xml]$specialCommands = ('<Commands xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">' + $_preOobe.ToString() + '</Commands>')
+    $specialScriptLines = @('$ErrorActionPreference = ''Stop''')
+    foreach ($entry in @($specialCommands.Commands.RunSynchronousCommand)) {
+        $command = ([string]$entry.Path) -replace '^cmd /c ', ''
+        $specialScriptLines += ('& $env:ComSpec /d /s /c ''' + $command.Replace("'", "''") + '''')
+    }
+    $specialScript = ($specialScriptLines -join "`r`n") + "`r`n"
+    $specialScriptB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($specialScript))
+    $preOobeXml = ('        <RunSynchronousCommand wcm:action="add"><Order>5</Order><Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand {0}</Path><Description>MiOS service commands from the layered SSOT</Description></RunSynchronousCommand>' -f $specialScriptB64)
 
     # Boot-into-Xbox FSE: the Microsoft-Windows-Gaming-Configuration component
     # (StartupToGamingHome + GamingHomeApp) launches the full-screen Xbox home on
@@ -408,45 +368,20 @@ $gamingXml  </settings>
 $($localAccountsXml.ToString())        </LocalAccounts>
       </UserAccounts>
       <AutoLogon>
-        <Enabled>true</Enabled>
+        <Enabled>$firstEnabled</Enabled>
         <Username>$firstName</Username>
-        <LogonCount>1</LogonCount>
+        <LogonCount>$firstCount</LogonCount>
         <Password><Value>$($firstPw.Value)</Value><PlainText>$($firstPw.PlainText)</PlainText></Password>
       </AutoLogon>
 $firstLogonXml
     </component>
   </settings>
+  <Extensions xmlns="urn:mios:unattend">
+    <FirstLogonScript>$firstScriptB64</FirstLogonScript>
+    <SpecializeScript>$specialScriptB64</SpecializeScript>
+  </Extensions>
 </unattend>
 "@
-}
-
-function Build-MiOSIso {
-    param([string]$SourceIso,[string]$XmlPath,[string]$OutIso)
-    # Locate oscdimg (Windows ADK Deployment Tools).
-    $oscdimg = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools" -Recurse -Filter oscdimg.exe -ErrorAction SilentlyContinue |
-               Select-Object -First 1 -ExpandProperty FullName
-    if (-not $oscdimg) { $oscdimg = (Get-Command oscdimg.exe -ErrorAction SilentlyContinue).Source }
-    if (-not $oscdimg) {
-        throw "oscdimg.exe not found. Install the Windows ADK 'Deployment Tools', or run winutil/MicroWin which bundles the ISO build. autounattend.xml written to '$XmlPath' -- copy it to the ISO root manually."
-    }
-    Write-Host "[*] Mounting $SourceIso ..." -ForegroundColor Cyan
-    $mount = Mount-DiskImage -ImagePath (Resolve-Path $SourceIso) -PassThru
-    try {
-        $drive = ($mount | Get-Volume).DriveLetter + ':'
-        $scratch = Join-Path $env:TEMP ("mios-iso-" + [guid]::NewGuid().ToString('N').Substring(0,8))
-        Write-Host "[*] Copying ISO contents to $scratch ..." -ForegroundColor Cyan
-        New-Item -ItemType Directory -Path $scratch -Force | Out-Null
-        Copy-Item -Path "$drive\*" -Destination $scratch -Recurse -Force
-        Copy-Item -LiteralPath $XmlPath -Destination (Join-Path $scratch 'autounattend.xml') -Force
-        $boot = "-bootdata:2#p0,e,b$scratch\boot\etfsboot.com#pEF,e,b$scratch\efi\microsoft\boot\efisys.bin"
-        Write-Host "[*] Building $OutIso via oscdimg ..." -ForegroundColor Cyan
-        & $oscdimg -m -o -u2 -udfver102 $boot $scratch $OutIso
-        if ($LASTEXITCODE -ne 0) { throw "oscdimg failed (exit $LASTEXITCODE)" }
-        Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Host "[+] MiOS ISO built: $OutIso" -ForegroundColor Green
-    } finally {
-        Dismount-DiskImage -ImagePath (Resolve-Path $SourceIso) | Out-Null
-    }
 }
 
 # ---------------------------------------------------------------------------
@@ -475,27 +410,11 @@ if ($TomlPath -and -not [System.IO.Path]::IsPathRooted($TomlPath)) {
 if (-not [System.IO.Path]::IsPathRooted($OutXml)) {
     $OutXml = [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $OutXml))
 }
-Write-Host "[*] Reading SSOT: $(if ($TomlPath) { $TomlPath } else { '(none found -- using identity defaults)' })" -ForegroundColor DarkGray
-$toml = if ($TomlPath) { Read-MiosToml -Path $TomlPath } else { @{ scalars=@{}; accounts=@() } }
+Write-Host "[*] Reading SSOT: $(if ($TomlPath) { $TomlPath } else { '(layered resolver inputs)' })" -ForegroundColor DarkGray
+$toml = Read-MiosToml -Path $TomlPath -ResolvedJson $ResolvedJson
 $toml = Apply-MiosEdition -T $toml -Edition $Edition
 
 $xml = New-MiOSAutounattendXml -Toml $toml
-[IO.File]::WriteAllText($OutXml, $xml, (New-Object System.Text.UTF8Encoding($false)))
+Write-MiOSPrivateText -Path $OutXml -Text $xml
 Write-Host "[+] autounattend.xml written: $OutXml" -ForegroundColor Green
 
-if ($WinutilToolsDir) {
-    if (-not (Test-Path -LiteralPath $WinutilToolsDir)) { New-Item -ItemType Directory -Path $WinutilToolsDir -Force | Out-Null }
-    Copy-Item -LiteralPath $OutXml -Destination (Join-Path $WinutilToolsDir 'autounattend.xml') -Force
-    Write-Host "[+] Copied to winutil tools dir: $WinutilToolsDir\autounattend.xml (MicroWin will use the MiOS answer file)" -ForegroundColor Green
-}
-
-if ($SourceIso -and $OutIso) {
-    Build-MiOSIso -SourceIso $SourceIso -XmlPath $OutXml -OutIso $OutIso
-} elseif ($SourceIso -or $OutIso) {
-    Write-Warning "Both -SourceIso and -OutIso are required to build an ISO. Skipped ISO build; XML is ready at $OutXml."
-}
-
-Write-Host ''
-Write-Host "Post-install path for EXISTING Windows users (same bootstrap):" -ForegroundColor Cyan
-Write-Host '  powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/mios-dev/mios-bootstrap/main/Get-MiOS.ps1 | iex"' -ForegroundColor DarkGray
-Write-Host "  (or field\autounattend\Invoke-MiOSProvision.ps1 to also create the SSOT local accounts first)" -ForegroundColor DarkGray

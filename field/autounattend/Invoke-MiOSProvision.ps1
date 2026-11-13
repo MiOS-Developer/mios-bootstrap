@@ -28,7 +28,8 @@
 param(
     [string]$TomlPath,
     [string]$BootstrapUrl = 'https://raw.githubusercontent.com/mios-dev/mios-bootstrap/main/Get-MiOS.ps1',
-    [switch]$SkipBootstrap
+    [switch]$SkipBootstrap,
+    [string]$ResolvedJson
 )
 $ErrorActionPreference = 'Stop'
 
@@ -44,6 +45,7 @@ if (-not (Test-Admin)) {
     $psi = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"")
     if ($TomlPath)      { $psi += @('-TomlPath',"`"$TomlPath`"") }
     if ($SkipBootstrap) { $psi += '-SkipBootstrap' }
+    if ($ResolvedJson) { $psi += @('-ResolvedJson', '"' + $ResolvedJson + '"') }
     Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $psi -Verb RunAs
     return
 }
@@ -54,8 +56,9 @@ if (-not $TomlPath) {
         if (Test-Path -LiteralPath $c) { $TomlPath = (Resolve-Path $c).Path; break }
     }
 }
-$toml     = if ($TomlPath) { Read-MiosToml -Path $TomlPath } else { @{ scalars=@{}; accounts=@(); prefs=@{} } }
-$accounts = Get-MiOSAccounts -Toml $toml
+$toml = Read-MiosToml -Path $TomlPath -ResolvedJson $ResolvedJson
+$credentials = Resolve-MiOSCredentials -Toml $toml
+$accounts = @($credentials.accounts)
 
 # 1) SSOT local accounts (multi-user) --------------------------------------
 Write-Host "[*] Provisioning $($accounts.Count) SSOT local account(s) from $(if($TomlPath){$TomlPath}else{'identity defaults'})" -ForegroundColor Cyan
@@ -65,12 +68,12 @@ foreach ($a in $accounts) {
     $pw    = [string]$a.password
     $disp  = if ($a.display_name) { [string]$a.display_name } else { $name }
     try {
-        $sec = if ($pw) { ConvertTo-SecureString $pw -AsPlainText -Force } else { $null }
+        if (-not $pw) { throw 'MiOS SSOT: autounattend.accounts password is missing.' }
+        $sec = ConvertTo-SecureString $pw -AsPlainText -Force
         if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) {
             Write-Host "  [.] $name already exists -- skipping create" -ForegroundColor DarkGray
         } else {
-            if ($sec) { New-LocalUser -Name $name -Password $sec -FullName $disp -PasswordNeverExpires -AccountNeverExpires -ErrorAction Stop | Out-Null }
-            else      { New-LocalUser -Name $name -NoPassword -FullName $disp -ErrorAction Stop | Out-Null }
+            New-LocalUser -Name $name -Password $sec -FullName $disp -PasswordNeverExpires -AccountNeverExpires -ErrorAction Stop | Out-Null
             Write-Host "  [+] Created local account: $name ($disp)" -ForegroundColor Green
         }
         $grpName = if ($group -match '^(?i)admin') { 'Administrators' } else { 'Users' }
@@ -80,6 +83,8 @@ foreach ($a in $accounts) {
         }
     } catch { Write-Warning "  account '$name' provisioning failed: $($_.Exception.Message)" }
 }
+
+Install-MiOSLivingWallpaperAssets -Toml $toml
 
 # 2) LIVE-apply the SAME global branding/layout/prefs the ISO bakes ---------
 foreach ($grp in (New-MiOSProvisionCommands -Toml $toml)) {

@@ -1461,6 +1461,10 @@ function Invoke-MiOSAgreementGate {
 }
 $_isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
             ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $_isAdmin -and $env:MIOS_GETMIOS_RELAUNCHED) {
+    # The marker belongs to the elevated child; unelevated, it would skip elevation and reach the admin steps.
+    throw 'MIOS_GETMIOS_RELAUNCHED is set in a non-elevated session; refusing to continue. Open a new PowerShell window and re-run the one-liner.'
+}
 if (-not $_isAdmin -and -not $env:MIOS_GETMIOS_RELAUNCHED) {
     Write-Host ''
     $_eAdmin = Get-MiosTomlValue -Section 'messages.elevation' -Key 'admin_required'   -Default '  [*] MiOS bootstrap requires admin (M:\ partition + Podman + dev VM).'
@@ -4203,21 +4207,29 @@ function Get-MiosDismEnableOutcome([int]$ExitCode) {
     switch ($ExitCode) { 0 { return 'enabled' } 3010 { return 'restart' } default { return 'unavailable' } }
 }
 
+function Test-MiosElevated {
+    return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Enable-MiOSWindowsFeatures {
-    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $isAdmin) {
-        Write-Host "  [!] Enable-MiOSWindowsFeatures needs admin -- deferring (auto-elevation will rerun this)." -ForegroundColor Yellow
-        return $false
+    # Status: ready | pending (restart first) | error | deferred. Only 'ready' may reach the WSL firewall policy and MiOS-DEV.
+    if (-not (Test-MiosElevated)) {
+        Write-Host '  [!] Windows features need an elevated run; nothing was checked or enabled.' -ForegroundColor Red
+        return [pscustomobject]@{ Status = 'deferred'; Detail = 'not elevated'; RebootRequired = $false }
     }
 
-    $features = [ordered]@{}
-    $features.Add([string](Get-MiosTomlValue -Section 'bootstrap.prereqs.features' -Key 'wsl'    -Default 'Microsoft-Windows-Subsystem-Linux'), 'Windows Subsystem for Linux')
-    $features.Add([string](Get-MiosTomlValue -Section 'bootstrap.prereqs.features' -Key 'vmp'    -Default 'VirtualMachinePlatform'),            'Virtual Machine Platform (WSL2 + Hyper-V hypervisor)')
-    $features.Add([string](Get-MiosTomlValue -Section 'bootstrap.prereqs.features' -Key 'hyperv' -Default 'Microsoft-Hyper-V'),                 'Hyper-V (manager + VMs)')
+    $features = @(
+        @{ Name = [string](Get-MiosTomlValue -Section 'bootstrap.prereqs.features' -Key 'wsl'    -Default 'Microsoft-Windows-Subsystem-Linux')
+           Label = 'Windows Subsystem for Linux'; Required = $true; StoreWsl = $true },
+        @{ Name = [string](Get-MiosTomlValue -Section 'bootstrap.prereqs.features' -Key 'vmp'    -Default 'VirtualMachinePlatform')
+           Label = 'Virtual Machine Platform (WSL2 + Hyper-V hypervisor)'; Required = $true; StoreWsl = $false },
+        @{ Name = [string](Get-MiosTomlValue -Section 'bootstrap.prereqs.features' -Key 'hyperv' -Default 'Microsoft-Hyper-V')
+           Label = 'Hyper-V (manager + VMs)'; Required = $false; StoreWsl = $false })
 
     $rebootPending = $false
-    foreach ($name in $features.Keys) {
-        $label = $features[$name]
+    $failed = New-Object System.Collections.Generic.List[string]
+    foreach ($feature in $features) {
+        $name = $feature.Name; $label = $feature.Label
         $state = 'unknown'
         try {
             $info = & dism.exe /online /get-featureinfo /featurename:$name 2>$null
@@ -4234,7 +4246,7 @@ function Enable-MiOSWindowsFeatures {
             continue
         }
 
-        if ($name -like '*Subsystem-Linux*') {
+        if ($feature.StoreWsl) {
             $_wslOk = $false
             try { & wsl.exe --version *> $null; if ($LASTEXITCODE -eq 0) { $_wslOk = $true } } catch {}
             if ($_wslOk) {
@@ -4244,19 +4256,23 @@ function Enable-MiOSWindowsFeatures {
         }
 
         Write-Host "  [*] Enabling $label..." -ForegroundColor Cyan
+        $outcome = 'unavailable'
         try {
-            $r = & dism.exe /online /enable-feature /featurename:$name /all /norestart
+            $null = & dism.exe /online /enable-feature /featurename:$name /all /norestart
             $outcome = Get-MiosDismEnableOutcome $LASTEXITCODE
-            if ($outcome -eq 'enabled') {
-                Write-Host "  [+] $label enabled." -ForegroundColor Green
-            } elseif ($outcome -eq 'restart') {
-                Write-Host "  [+] $label enabled; Windows needs a restart to activate it." -ForegroundColor Green
-                $rebootPending = $true
-            } else {
-                Write-Host "  [-] $label not available on this Windows edition -- skipping." -ForegroundColor DarkGray
-            }
         } catch {
             Write-Host "  [!] dism /enable-feature $name failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+        if ($outcome -eq 'enabled') {
+            Write-Host "  [+] $label enabled." -ForegroundColor Green
+        } elseif ($outcome -eq 'restart') {
+            Write-Host "  [+] $label enabled; Windows needs a restart to activate it." -ForegroundColor Green
+            $rebootPending = $true
+        } elseif ($feature.Required) {
+            Write-Host "  [!] $label could not be enabled; MiOS-DEV requires it." -ForegroundColor Red
+            $failed.Add($label)
+        } else {
+            Write-Host "  [-] $label not available on this Windows edition -- skipping." -ForegroundColor DarkGray
         }
     }
 
@@ -4312,28 +4328,27 @@ function Enable-MiOSWindowsFeatures {
         $rebootPending = $true
     }
 
+    if ($failed.Count) {
+        return [pscustomobject]@{ Status = 'error'; Detail = ($failed -join ', '); RebootRequired = $rebootPending }
+    }
     if ($rebootPending) {
-        $_haltOnReboot = ([string](Get-MiosTomlValue -Section 'bootstrap.prereqs.features' -Key 'require_reboot_to_continue' -Default 'true')) -ieq 'true'
         Write-Host ''
         Write-Host '  +==============================================================+' -ForegroundColor Yellow
         Write-Host '  | REBOOT PENDING -- Windows features enabled this session need |' -ForegroundColor Yellow
         Write-Host '  | a reboot to take full effect. WSL2, the dev VM, podman       |' -ForegroundColor Yellow
         Write-Host '  | machine init, and the OCI build will fail until you reboot.  |' -ForegroundColor Yellow
         Write-Host '  +==============================================================+' -ForegroundColor Yellow
-        if ($_haltOnReboot) {
-            Write-Host ''
-            Write-Host '  REBOOT NOW, then re-run the irm|iex one-liner. Pass-0 reaps' -ForegroundColor Cyan
-            Write-Host '  prior state automatically; the next run starts clean and'  -ForegroundColor Cyan
-            Write-Host '  proceeds straight through.' -ForegroundColor Cyan
-            Write-Host ''
-            return [pscustomobject]@{ Status = 'ok';  RebootRequired = $true; HaltRequested = $true }
+        if (([string](Get-MiosTomlValue -Section 'bootstrap.prereqs.features' -Key 'require_reboot_to_continue' -Default 'true')) -ine 'true') {
+            Write-Host '  [!] require_reboot_to_continue=false is refused: the WSL firewall policy and MiOS-DEV need active features.' -ForegroundColor Yellow
         }
-        Write-Host '  [bootstrap.prereqs.features].require_reboot_to_continue=false ' -ForegroundColor DarkGray
-        Write-Host '  -- continuing despite reboot-pending; expect cascade failures.' -ForegroundColor DarkGray
         Write-Host ''
-        return [pscustomobject]@{ Status = 'ok'; RebootRequired = $true; HaltRequested = $false }
+        Write-Host '  REBOOT NOW, then re-run the irm|iex one-liner. Pass-0 reaps' -ForegroundColor Cyan
+        Write-Host '  prior state automatically; the next run starts clean and'  -ForegroundColor Cyan
+        Write-Host '  proceeds straight through.' -ForegroundColor Cyan
+        Write-Host ''
+        return [pscustomobject]@{ Status = 'pending'; Detail = 'restart required'; RebootRequired = $true }
     }
-    return [pscustomobject]@{ Status = 'ok'; RebootRequired = $false; HaltRequested = $false }
+    return [pscustomobject]@{ Status = 'ready'; Detail = ''; RebootRequired = $false }
 }
 
 function Ensure-Git {
@@ -4811,15 +4826,47 @@ function Add-MiosDefenderExclusions {
     foreach ($p in $plan.processes) { Add-MpPreference -ExclusionProcess $p -ErrorAction Stop }
 }
 
+function Test-MiosWslVmCreator([string]$Creator) {
+    foreach ($c in @(Get-NetFirewallHyperVVMCreator -ErrorAction Stop)) {
+        $id = [guid]::Empty
+        if ([guid]::TryParse([string]$c.VMCreatorId, [ref]$id) -and $id -eq [guid]$Creator) { return $true }
+    }
+    return $false
+}
+
+function Register-MiosWslVmCreator([string]$Creator) {
+    # The call WSL itself makes (microsoft/WSL WslCoreFirewallSupport.cpp, FriendlyName "WSL"); no VM is created.
+    $alreadyExists = [uint32]2147749913   # 0x80041019 WBEM_E_ALREADY_EXISTS
+    try {
+        $rv = [uint32](Invoke-CimMethod -Namespace 'root/standardcimv2' -ClassName 'MSFT_NetFirewallHyperVVMCreator' -MethodName 'RegisterHyperVVMCreator' `
+            -Arguments @{ VMCreatorId = $Creator; FriendlyName = 'WSL' } -ErrorAction Stop).ReturnValue
+    } catch {
+        $native = if ($_.Exception.PSObject.Properties['NativeErrorCode']) { [string]$_.Exception.NativeErrorCode } else { '' }
+        if ($native -ne 'AlreadyExists') { throw "Registering the WSL firewall creator failed: $($_.Exception.Message)" }
+        $rv = $alreadyExists
+    }
+    if ($rv -ne 0 -and $rv -ne $alreadyExists) { throw "Registering the WSL firewall creator returned $rv; provisioning stopped before MiOS-DEV." }
+    # Success, or a concurrent registration, counts only once the creator record is visible.
+    foreach ($attempt in 1..5) {
+        if (Test-MiosWslVmCreator $Creator) { return }
+        Start-Sleep -Seconds 1
+    }
+    throw 'The WSL firewall creator did not appear after registration; provisioning stopped before MiOS-DEV.'
+}
+
 function Set-MiosWslFirewallPolicy {
     $creator = '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}'
+    $provider = @('Get-NetFirewallHyperVVMCreator', 'Get-NetFirewallHyperVVMSetting', 'Set-NetFirewallHyperVVMSetting', 'Get-NetFirewallHyperVRule',
+        'New-NetFirewallHyperVRule', 'Remove-NetFirewallHyperVRule', 'Invoke-CimMethod')
+    $missing = @($provider | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
+    if ($missing.Count) { throw "The Hyper-V firewall provider is unavailable ($($missing -join ', ')); provisioning stopped before MiOS-DEV." }
+    if (-not (Test-MiosWslVmCreator $creator)) { Register-MiosWslVmCreator $creator }
     $policy = @{ Enabled = 'True'; DefaultInboundAction = 'Block'; DefaultOutboundAction = 'Allow'; LoopbackEnabled = 'True'; AllowHostPolicyMerge = 'True' }
-    try {
-        Set-NetFirewallHyperVVMSetting -Name $creator @policy -ErrorAction Stop
-    } catch {
-        # Set needs a registered WSL creator; before the VM platform is active, New creates the policy ahead of any WSL VM.
-        if ($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound) { throw }
-        New-NetFirewallHyperVVMSetting -Name $creator @policy -ErrorAction Stop | Out-Null
+    Set-NetFirewallHyperVVMSetting -Name $creator @policy -ErrorAction Stop
+    # ActiveStore is the effective policy (Group Policy merged in): it must read back enabled with inbound Block.
+    $active = @(Get-NetFirewallHyperVVMSetting -PolicyStore ActiveStore -Name $creator -ErrorAction Stop)
+    if ($active.Count -ne 1 -or [string]$active[0].Enabled -ne 'True' -or [string]$active[0].DefaultInboundAction -ne 'Block') {
+        throw 'The WSL firewall policy did not read back enabled with inbound Block; provisioning stopped before MiOS-DEV.'
     }
     # Explicit allow rules survive default Block. Remove our previous rules first, including deleted/refused entries.
     foreach ($old in @(Get-NetFirewallHyperVRule -ErrorAction Stop)) {
@@ -4854,6 +4901,17 @@ function Set-MiosWslFirewallPolicy {
         $names[$name] = $true
         New-NetFirewallHyperVRule -Name $name -DisplayName $name -VMCreatorId $creator -Direction Inbound -Action Allow `
             -Protocol $protocol -LocalPorts ([string]$rule['local_port']) -RemoteAddresses $remote -ErrorAction Stop | Out-Null
+    }
+}
+
+function Invoke-MiosPlatformGate {
+    # Features first, then the WSL firewall policy; anything short of 'ready' stops before MiOS-DEV.
+    $result = @(Enable-MiOSWindowsFeatures) | Where-Object { $_ -is [pscustomobject] -and $_.PSObject.Properties['Status'] } | Select-Object -Last 1
+    if (-not $result) { throw 'Windows feature readiness returned no result; provisioning stopped before MiOS-DEV.' }
+    switch ([string]$result.Status) {
+        'ready'   { $null = Set-MiosWslFirewallPolicy; return $result }
+        'pending' { return $result }
+        default   { throw "Windows features are not ready ($($result.Status): $($result.Detail)); provisioning stopped before the WSL firewall policy and MiOS-DEV." }
     }
 }
 Add-MiosDefenderExclusions
@@ -5004,33 +5062,23 @@ Write-Host ''
 Write-Host "  $_msgStep06" -ForegroundColor Cyan
 try { Ensure-MiOSWinget | Out-Null } catch { Write-Host "  [!] Ensure-MiOSWinget failed: $($_.Exception.Message)" -ForegroundColor Yellow }
 
-if (Get-Command Set-NetFirewallHyperVVMSetting -ErrorAction SilentlyContinue) {
-    Set-MiosWslFirewallPolicy
-} else {
-    Write-Host '  [!] Hyper-V firewall cmdlets are unavailable on this Windows version.' -ForegroundColor Yellow
-}
-try {
-    # Capture into [pscustomobject] -- if the function leaks ANY pipeline
-    # output (shouldn't, post-.Add refactor), grab the LAST
-    # value (the explicit return) so the structured-result check can't be
-    # confused by stray strings/objects upstream of the return statement.
-    $_featOut = @(Enable-MiOSWindowsFeatures)
-    $_featResult = $_featOut | Where-Object { $_ -is [pscustomobject] -and $_.PSObject.Properties['HaltRequested'] } | Select-Object -Last 1
-    if ($_featResult -and $_featResult.HaltRequested) {
-        try {
-            $_resumeUrl = [string](Get-MiosTomlValue -Section 'bootstrap' -Key 'oneliner_url' -Default 'https://raw.githubusercontent.com/mios-dev/mios-bootstrap/main/Get-MiOS.ps1')
-            $_ps        = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            $_resumeArg = "-NoProfile -ExecutionPolicy Bypass -Command `"irm '$_resumeUrl' | iex`""
-            $_runHiddenVbs = Join-Path $env:ProgramData 'MiOS\bin\run-hidden.vbs'
-            if (-not (Test-Path -LiteralPath $_runHiddenVbs)) { $_runHiddenVbs = Join-Path $env:ProgramData 'MiOS\run-hidden.vbs' }
-            if (-not (Test-Path -LiteralPath $_runHiddenVbs) -and $miosRoot) {
-                $_vbsCandidate = Join-Path $miosRoot 'usr\share\mios\windows\run-hidden.vbs'
-                if (Test-Path -LiteralPath $_vbsCandidate) { $_runHiddenVbs = $_vbsCandidate }
-            }
-            if (-not (Test-Path -LiteralPath $_runHiddenVbs)) {
-                $_vbsDir = Split-Path $_runHiddenVbs -Parent
-                if (-not (Test-Path -LiteralPath $_vbsDir)) { New-Item -ItemType Directory -Path $_vbsDir -Force | Out-Null }
-                @'
+# Throws on error/deferred; a pending restart halts below. Either way nothing reaches the WSL firewall policy or MiOS-DEV.
+$_platform = Invoke-MiosPlatformGate
+if ($_platform.Status -eq 'pending') {
+    try {
+        $_resumeUrl = [string](Get-MiosTomlValue -Section 'bootstrap' -Key 'oneliner_url' -Default 'https://raw.githubusercontent.com/mios-dev/mios-bootstrap/main/Get-MiOS.ps1')
+        $_ps        = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $_resumeArg = "-NoProfile -ExecutionPolicy Bypass -Command `"irm '$_resumeUrl' | iex`""
+        $_runHiddenVbs = Join-Path $env:ProgramData 'MiOS\bin\run-hidden.vbs'
+        if (-not (Test-Path -LiteralPath $_runHiddenVbs)) { $_runHiddenVbs = Join-Path $env:ProgramData 'MiOS\run-hidden.vbs' }
+        if (-not (Test-Path -LiteralPath $_runHiddenVbs) -and $miosRoot) {
+            $_vbsCandidate = Join-Path $miosRoot 'usr\share\mios\windows\run-hidden.vbs'
+            if (Test-Path -LiteralPath $_vbsCandidate) { $_runHiddenVbs = $_vbsCandidate }
+        }
+        if (-not (Test-Path -LiteralPath $_runHiddenVbs)) {
+            $_vbsDir = Split-Path $_runHiddenVbs -Parent
+            if (-not (Test-Path -LiteralPath $_vbsDir)) { New-Item -ItemType Directory -Path $_vbsDir -Force | Out-Null }
+            @'
 ' MiOS Run-Hidden launcher: executes processes in hidden window mode without spawning console frames or Windows Terminal popups
 Option Explicit
 Dim WshShell, args, cmd, i, arg
@@ -5052,36 +5100,33 @@ If args.Count > 0 Then
     WshShell.Run cmd, 0, False
 End If
 '@ | Set-Content -Path $_runHiddenVbs -Encoding ASCII -Force
-            }
-            $_wscript     = Join-Path $env:SystemRoot 'System32\wscript.exe'
-            $_serviceTool = Join-Path $env:ProgramData 'MiOS\bin\MiosServiceTool.exe'
-            if (Test-Path -LiteralPath $_runHiddenVbs) {
-                $_act  = New-ScheduledTaskAction -Execute $_wscript -Argument "//B //Nologo `"$_runHiddenVbs`" `"$_ps`" $_resumeArg"
-            } elseif (Test-Path -LiteralPath $_serviceTool) {
-                $_act  = New-ScheduledTaskAction -Execute $_serviceTool -Argument "-Run `"$_ps`" $_resumeArg"
-            } else {
-                throw "Neither run-hidden.vbs (wscript.exe) nor MiosServiceTool.exe is available to prevent console window flashing on auto-resume."
-            }
-            $_trg  = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-            $_prin = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
-            $_set  = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-            Register-ScheduledTask -TaskName 'MiOS-Resume-Bootstrap' -Action $_act -Trigger $_trg -Principal $_prin -Settings $_set -Force | Out-Null
-            Write-Host '  [+] Auto-resume armed: MiOS continues automatically after you reboot and' -ForegroundColor Green
-            Write-Host '      sign back in -- no need to re-paste the one-liner.' -ForegroundColor Green
-        } catch {
-            Write-Host "  [!] Could not arm auto-resume ($($_.Exception.Message)); after reboot re-run" -ForegroundColor Yellow
-            Write-Host '      the irm|iex one-liner manually to continue.' -ForegroundColor Yellow
         }
-        Write-Host '  [*] Halting to await reboot (WSL/VirtualMachinePlatform just enabled).' -ForegroundColor Cyan
-        exit 0
-    } else {
-        # Features already present (first run had them, OR this IS the post-reboot
-        # resume) -- clear any leftover auto-resume task so it fires exactly once.
-        if (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue) {
-            Unregister-ScheduledTask -TaskName 'MiOS-Resume-Bootstrap' -Confirm:$false -ErrorAction SilentlyContinue
+        $_wscript     = Join-Path $env:SystemRoot 'System32\wscript.exe'
+        $_serviceTool = Join-Path $env:ProgramData 'MiOS\bin\MiosServiceTool.exe'
+        if (Test-Path -LiteralPath $_runHiddenVbs) {
+            $_act  = New-ScheduledTaskAction -Execute $_wscript -Argument "//B //Nologo `"$_runHiddenVbs`" `"$_ps`" $_resumeArg"
+        } elseif (Test-Path -LiteralPath $_serviceTool) {
+            $_act  = New-ScheduledTaskAction -Execute $_serviceTool -Argument "-Run `"$_ps`" $_resumeArg"
+        } else {
+            throw "Neither run-hidden.vbs (wscript.exe) nor MiosServiceTool.exe is available to prevent console window flashing on auto-resume."
         }
+        $_trg  = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+        $_prin = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
+        $_set  = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName 'MiOS-Resume-Bootstrap' -Action $_act -Trigger $_trg -Principal $_prin -Settings $_set -Force | Out-Null
+        Write-Host '  [+] Auto-resume armed: MiOS continues automatically after you reboot and' -ForegroundColor Green
+        Write-Host '      sign back in -- no need to re-paste the one-liner.' -ForegroundColor Green
+    } catch {
+        Write-Host "  [!] Could not arm auto-resume ($($_.Exception.Message)); after reboot re-run" -ForegroundColor Yellow
+        Write-Host '      the irm|iex one-liner manually to continue.' -ForegroundColor Yellow
     }
-} catch { Write-Host "  [!] Enable-MiOSWindowsFeatures failed: $($_.Exception.Message)" -ForegroundColor Yellow }
+    Write-Host '  [*] Halting to await reboot (WSL/VirtualMachinePlatform just enabled).' -ForegroundColor Cyan
+    exit 0
+}
+# Features are active (first run had them, or this is the post-reboot resume): the auto-resume task fires exactly once.
+if (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName 'MiOS-Resume-Bootstrap' -Confirm:$false -ErrorAction SilentlyContinue
+}
 
 if ($true) {
     $isAdmin = $_isAdmin
@@ -5194,11 +5239,9 @@ if ($true) {
         # Defensive fallback only -- if we got here, the auto-elevate
         # path didn't trigger for some reason (manual MIOS_GETMIOS_
         # RELAUNCHED=1 env override, etc.). Surface a clear error.
-        Write-Host '  [!] Reached admin-only code without admin token.' -ForegroundColor Red
-        Write-Host '      Re-run from a fresh pwsh window so the auto-elevation prompt fires.' -ForegroundColor DarkGray
-        return
+        throw 'Reached admin-only code without an admin token; re-run from a fresh PowerShell window so the elevation prompt fires.'
         # Dead code below (kept for fallback if auto-elevation is ever
-        # disabled). Reachable only if `return` above is removed.
+        # disabled). Reachable only if the `throw` above is removed.
         $rawUrl = "$($Script:MiosBootstrapRaw)/Get-MiOS.ps1?cb=$([int][double]::Parse((Get-Date -UFormat %s)))"
         $innerCmd = @"
 # Resize + center BEFORE anything else paints.

@@ -765,7 +765,7 @@ function Write-MiosHostToml {
 function Repair-MiosHostTierCredentials {
     param([string[]]$Paths = @())
     foreach ($p in $Paths) {
-        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf -ErrorAction SilentlyContinue)) { continue }
         Set-MiosHostTierAcl -Path $p -Private
         Initialize-MiosHostTierDirectory $p
         Set-MiosHostTierAcl -Path $p -Private
@@ -829,7 +829,15 @@ function Sync-MiosUserTomlToBuilder {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Distro, [string]$User = 'mios')
     if ($Distro -notmatch '^[A-Za-z0-9_.-]+$' -or $User -notmatch '^[A-Za-z_][A-Za-z0-9_-]*$') { throw 'Invalid builder distribution or user name.' }
     Set-MiosPrivateUserTomlAcl $Path
-    $put = 'set -eu; umask 077; test ! -L "$HOME/.config"; test ! -L "$HOME/.config/mios"; mkdir -p "$HOME/.config/mios"; chmod 700 "$HOME/.config/mios"; pending=$(mktemp "$HOME/.config/mios/.mios.XXXXXXXX"); trap ''rm -f -- "$pending"'' EXIT HUP INT TERM; cat > "$pending"; chmod 600 "$pending"; mv -f -- "$pending" "$HOME/.config/mios/mios.toml"'
+    function Get-MiosUserTomlReceiverScript {
+        param([Parameter(Mandatory)][long]$ExpectedBytes)
+        if ($ExpectedBytes -lt 0) { throw 'Invalid private TOML byte count.' }
+        # A closed client pipe can look like successful EOF. Verify the nonsecret byte count before publishing.
+        $program = 'set -eu; umask 077; test ! -L "$HOME/.config"; test ! -L "$HOME/.config/mios"; mkdir -p "$HOME/.config/mios"; chmod 700 "$HOME/.config/mios"; pending=$(mktemp "$HOME/.config/mios/.mios.XXXXXXXX"); trap ''rm -f -- "$pending"'' EXIT HUP INT TERM; cat > "$pending"; test "$(wc -c < "$pending")" -eq __MIOS_EXPECTED_BYTES__; chmod 600 "$pending"; mv -f -- "$pending" "$HOME/.config/mios/mios.toml"'
+        return $program.Replace('__MIOS_EXPECTED_BYTES__', $ExpectedBytes.ToString([Globalization.CultureInfo]::InvariantCulture))
+    }
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $put = Get-MiosUserTomlReceiverScript -ExpectedBytes $bytes.LongLength
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName = 'wsl.exe'
     $psi.Arguments = (@('-d', $Distro, '--user', $User, '--exec', 'sh', '-c', $put) | ForEach-Object { ConvertTo-MiosNativeArgument $_ }) -join ' '
@@ -840,13 +848,138 @@ function Sync-MiosUserTomlToBuilder {
     try {
         if (-not $proc.Start()) { throw 'Could not start the private builder handoff.' }
         $stdout = $proc.StandardOutput.ReadToEndAsync(); $stderr = $proc.StandardError.ReadToEndAsync()
-        $bytes = [IO.File]::ReadAllBytes($Path)
-        $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+        $write = $proc.StandardInput.BaseStream.WriteAsync($bytes, 0, $bytes.Length)
+        if (-not $write.Wait(60000)) { throw 'Private builder handoff stdin timed out; the saved file was retained.' }
+        $null = $write.GetAwaiter().GetResult()
         $proc.StandardInput.Close()
         if (-not $proc.WaitForExit(60000)) { $proc.Kill(); throw 'Private builder handoff timed out.' }
         if ($proc.ExitCode -ne 0) { throw "Private builder handoff failed (exit $($proc.ExitCode)); the saved file was not archived." }
         $null = $stdout.GetAwaiter().GetResult(); $null = $stderr.GetAwaiter().GetResult()
-    } finally { $proc.Dispose() }
+    } finally {
+        # An input error/timeout can happen before WaitForExit. Do not leave a blocked writer child behind.
+        try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+        $proc.Dispose()
+    }
+}
+
+function Update-MiosWindowsBuildCheckout {
+    param([Parameter(Mandatory = $true)][string]$Path,
+          [Parameter(Mandatory = $true)][string]$Ref)
+    # Keep local operator work and commits. Only a clean checkout can advance.
+    # Native stderr is not a terminating PowerShell error on Windows PowerShell 5.1.
+    $ErrorActionPreference = 'Continue'
+    $changes = @(& git -C $Path status --porcelain=v1 --untracked-files=normal 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the Windows MiOS checkout; no source was changed.' }
+    if (@($changes | Where-Object { $_ }).Count) {
+        Write-Host '  [pull] Windows checkout has local changes; preserving them and building the current tree.' -ForegroundColor Yellow
+        return
+    }
+    & git check-ref-format --branch $Ref *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'The configured MiOS source ref is invalid; no source was changed.' }
+    & git -C $Path fetch origin $Ref *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host '  [pull] Windows source fetch failed; preserving and building the current tree. Retry when the remote is available.' -ForegroundColor Yellow
+        return
+    }
+    # A local editor may have saved while fetch was running.
+    $changes = @(& git -C $Path status --porcelain=v1 --untracked-files=normal 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect the Windows MiOS checkout after fetch; no local source was changed.' }
+    if (@($changes | Where-Object { $_ }).Count) {
+        Write-Host '  [pull] Windows checkout changed during fetch; preserving it and building the current tree.' -ForegroundColor Yellow
+        return
+    }
+    & git -C $Path merge-base --is-ancestor HEAD FETCH_HEAD *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host '  [pull] Windows checkout has local commits that differ from the remote; preserving and building the current tree. Reconcile the branches before updating.' -ForegroundColor Yellow
+        return
+    }
+    & git -C $Path merge --ff-only --no-edit --no-autostash --no-overwrite-ignore FETCH_HEAD *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'The Windows MiOS checkout could not fast-forward safely; local work was preserved. Reconcile it before retrying.' }
+    Write-Host '  [pull] Windows checkout is current after a clean fast-forward.' -ForegroundColor Green
+}
+
+function Get-MiosLosslessPullShell {
+    # One shell implementation for generated native pull companions; no installer side effects.
+    return @'
+set -eu
+checkout=${1:?A checkout path is required}
+source_ref=${2:?A source ref is required}
+case "${3:-}" in
+    '') git_command() { git "$@"; } ;;
+    --sudo) git_command() { sudo -n git "$@"; } ;;
+    *) echo '[mios-pull] Invalid checkout execution mode; no source was changed.' >&2; exit 1 ;;
+esac
+if [ ! -d "$checkout/.git" ] && [ ! -f "$checkout/.git" ]; then
+    echo '[mios-pull] Checkout is not initialized; preserving the staged tree for the build.'
+    exit 0
+fi
+if ! changes=$(git_command -C "$checkout" status --porcelain=v1 --untracked-files=normal 2>/dev/null); then
+    echo '[mios-pull] Cannot inspect the checkout; no source was changed.' >&2
+    exit 1
+fi
+if [ -n "$changes" ]; then
+    echo '[mios-pull] Local changes preserved; using the current tree. Commit or reconcile them before updating.'
+    exit 0
+fi
+if ! git_command check-ref-format --branch "$source_ref" >/dev/null 2>&1; then
+    echo '[mios-pull] The configured source ref is invalid; no source was changed.' >&2
+    exit 1
+fi
+if ! git_command -C "$checkout" fetch origin "$source_ref" >/dev/null 2>&1; then
+    echo '[mios-pull] Fetch failed; the current tree was preserved. Retry when the remote is available.'
+    exit 0
+fi
+if ! changes=$(git_command -C "$checkout" status --porcelain=v1 --untracked-files=normal 2>/dev/null); then
+    echo '[mios-pull] Cannot inspect the checkout after fetch; local source was preserved.' >&2
+    exit 1
+fi
+if [ -n "$changes" ]; then
+    echo '[mios-pull] The checkout changed during fetch; preserving the current tree.'
+    exit 0
+fi
+if ! git_command -C "$checkout" merge-base --is-ancestor HEAD FETCH_HEAD >/dev/null 2>&1; then
+    echo '[mios-pull] Local commits differ from the remote; preserving the current tree. Reconcile the branches before updating.'
+    exit 0
+fi
+if ! git_command -C "$checkout" merge --ff-only --no-edit --no-autostash --no-overwrite-ignore FETCH_HEAD >/dev/null 2>&1; then
+    echo '[mios-pull] A safe fast-forward was refused; local work was preserved. Reconcile it before retrying.' >&2
+    exit 1
+fi
+echo '[mios-pull] Checkout is current after a clean fast-forward.'
+'@
+}
+
+function Get-MiosWslConfigText {
+    param([AllowEmptyString()][string]$Existing, [string[]]$ManagedLines, [Parameter(Mandatory)][bool]$Firewall)
+    if (-not $Firewall) { throw 'mios.toml [wsl2].firewall=false disables the required inbound security policy; enable it before continuing.' }
+    $managed = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $ManagedLines) {
+        if ($line -match '^firewall=') { continue }
+        if ($line -notmatch '^(memory|networkingMode|localhostForwarding|guiApplications)=[^\r\n\x00]+$') {
+            throw 'Invalid managed WSL configuration line.'
+        }
+        $managed.Add($line)
+    }
+    # Filtering is mandatory: firewall=false bypasses the Hyper-V default/rule policy altogether.
+    $managed.Add('firewall=' + $Firewall.ToString().ToLowerInvariant())
+    $out = New-Object System.Collections.Generic.List[string]
+    $inside = $false; $seen = $false
+    foreach ($line in ($Existing -split "`r?`n")) {
+        if ($line -match '^\s*\[\s*wsl2\s*\]\s*(?:[#;].*)?$') {
+            if ($seen) { throw 'Duplicate WSL2 configuration sections; refusing an ambiguous firewall policy.' }
+            $seen = $true; $inside = $true; $out.Add($line)
+            foreach ($entry in $managed) { $out.Add($entry) }
+            continue
+        }
+        if ($line -match '^\s*\[') { $inside = $false }
+        if ($inside -and $line -match '^\s*(memory|networkingMode|localhostForwarding|firewall|guiApplications)\s*=') { continue }
+        $out.Add($line)
+    }
+    if (-not $seen) {
+        $out.Add('[wsl2]')
+        foreach ($entry in $managed) { $out.Add($entry) }
+    }
+    return ($out -join "`r`n")
 }
 
 function Get-MiosTomlTableArray {
@@ -3324,6 +3457,10 @@ function Install-MiOSPowerShellProfile {
         'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder') | ForEach-Object {
             'function ' + $_ + " {`r`n" + (Get-Command $_ -CommandType Function -ErrorAction Stop).Definition + "`r`n}"
         }) -join "`r`n"
+    $windowsRefreshBlock = 'function Update-MiosWindowsBuildCheckout {' +
+        (Get-Command Update-MiosWindowsBuildCheckout -CommandType Function -ErrorAction Stop).Definition + "`r`n}"
+    $miosBuildRef = [string](Get-MiosTomlValue -Section 'bootstrap' -Key 'mios_ref' -Default 'main')
+    $miosBuildRefLiteral = "'" + $miosBuildRef.Replace("'", "''") + "'"
     $_devName = [string](Get-MiosTomlValue -Section 'bootstrap' -Key 'dev_distro' -Default 'MiOS-DEV')
     if ($_devName -notmatch '^[A-Za-z0-9_.-]+$') { throw 'bootstrap.dev_distro is not a valid WSL distribution name.' }
     $miosDevDistroLiteral = "'" + $_devName + "'"
@@ -3446,6 +3583,7 @@ if (`$true) {
 
 `$Script:MiosBootstrapRaw = '$($Script:MiosBootstrapRaw)'
 $userTomlHelperBlock
+$windowsRefreshBlock
 function Resolve-MiosDevDistro {
     `$name = $miosDevDistroLiteral
     `$registered = @((& wsl.exe -l -q 2>`$null) -split "`r?`n" | ForEach-Object { (`$_ -replace [char]0, '').Trim() } | Where-Object { `$_ })
@@ -3574,16 +3712,8 @@ function mios-pull {
         Write-Host "  [!] `$_targetRoot is not a git working tree -- run mios-build first." -ForegroundColor Yellow
         return
     }
-    Push-Location `$_targetRoot
-    try {
-        git fetch --depth=1 origin main
-        if (`$LASTEXITCODE -eq 0) {
-            git reset --hard FETCH_HEAD
-            Write-Host "  [+] `$_targetRoot overlay synced to origin/main." -ForegroundColor Green
-        } else {
-            Write-Host '  [!] git fetch failed -- check network.' -ForegroundColor Yellow
-        }
-    } finally { Pop-Location }
+    Update-MiosWindowsBuildCheckout -Path `$_targetRoot -Ref $miosBuildRefLiteral
+
 }
 
 function mios-config {
@@ -4670,7 +4800,7 @@ Add-MiosDefenderExclusions
 
 $_netMode  = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'networking_mode'      -Default 'NAT')
 $_lhfwd    = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'localhost_forwarding' -Default 'true')
-$_fwall    = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'firewall'             -Default 'false')
+$_fwall    = Get-MiosTomlValue -Section 'wsl2' -Key 'firewall' -Default $true
 $_gui      = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'gui_applications'     -Default 'true')
 $_isMirror = ($_netMode -ieq 'mirrored')
 $_wslHostRamGB = try { [math]::Floor((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1GB) } catch { 16 }
@@ -4679,57 +4809,20 @@ $_wslReserveGB  = [math]::Max(0, [int](Get-MiosTomlValue -Section 'bootstrap.dev
 $_wslRamGB = [math]::Max(4, $_wslHostRamGB - [math]::Max($_wslReserveGB, [math]::Floor($_wslHostRamGB * $_wslReservePct / 100)))
 
 $_wslCfg = Join-Path $env:USERPROFILE ".wslconfig"
-$_wslCfgRaw = if (Test-Path $_wslCfg) { Get-Content $_wslCfg -Raw } else { "" }
+$_wslCfgRaw = if (Test-Path -LiteralPath $_wslCfg) { [IO.File]::ReadAllText($_wslCfg) } else { '' }
 
 # Build the section body from TOML-resolved values.
 $_keyLines = New-Object System.Collections.Generic.List[string]
 $_keyLines.Add("memory=${_wslRamGB}GB")
 $_keyLines.Add("networkingMode=$_netMode")
-if ($_isMirror) {
-    if ($_fwall -ieq 'true') { $_keyLines.Add('firewall=true') }
-} else {
-    if ($_lhfwd -ieq 'true') { $_keyLines.Add('localhostForwarding=true') }
-}
+if (-not $_isMirror -and $_lhfwd -ieq 'true') { $_keyLines.Add('localhostForwarding=true') }
 if ($_gui -ieq 'true') { $_keyLines.Add('guiApplications=true') }
 
-# Detect divergence: any required key missing or value mismatched.
-$_needWrite = $false
-foreach ($_kv in $_keyLines) {
-    $_pat = '(?m)^' + [regex]::Escape($_kv) + '\s*$'
-    if ($_wslCfgRaw -notmatch $_pat) { $_needWrite = $true; break }
-}
-if ($_needWrite) {
-    if ($_wslCfgRaw -notmatch "\[wsl2\]") {
-        $_baseline = @"
-
-[wsl2]
-# MiOS pre-Phase-0 settings, generated from mios.toml [wsl2] and
-# [bootstrap.dev_vm.host_reserve] by
-# Get-MiOS.ps1 on every irm|iex. Edit values in mios.html, not here --
-# this block is regenerated.
-$($_keyLines -join "`r`n")
-"@
-        [System.IO.File]::WriteAllText($_wslCfg, $_baseline, (New-Object System.Text.UTF8Encoding($false)))
-    } else {
-        # [wsl2] section exists -- replace its keys with the TOML-resolved
-        # set. Strip ALL legacy networking keys (networkingMode,
-        # localhostForwarding, firewall) so a prior mode doesn't survive.
-        $_lines = Get-Content $_wslCfg
-        $_in    = $false
-        $_out   = [System.Collections.Generic.List[string]]::new()
-        $_added = $false
-        foreach ($_l in $_lines) {
-            if ($_l -match '^\[wsl2\]') {
-                $_in = $true; $_out.Add($_l)
-                if (-not $_added) { foreach ($_kv in $_keyLines) { $_out.Add($_kv) }; $_added = $true }
-                continue
-            } elseif ($_l -match '^\[') { $_in = $false }
-            if ($_in -and $_l -match '^(memory|networkingMode|localhostForwarding|firewall|guiApplications)\s*=') { continue }
-            $_out.Add($_l)
-        }
-        [System.IO.File]::WriteAllLines($_wslCfg, $_out, (New-Object System.Text.UTF8Encoding($false)))
-    }
-    Write-Host "  [+] .wslconfig: $_netMode mode and ${_wslRamGB}GB RAM written from mios.toml (pre-Phase-0)" -ForegroundColor Green
+# Reconcile the entire managed key set, including a stale firewall=false even when all resource keys match.
+$_desiredWslConfig = Get-MiosWslConfigText -Existing $_wslCfgRaw -ManagedLines $_keyLines.ToArray() -Firewall $_fwall
+if ($_desiredWslConfig -cne $_wslCfgRaw) {
+    [IO.File]::WriteAllText($_wslCfg, $_desiredWslConfig, (New-Object Text.UTF8Encoding($false)))
+    Write-Host "  [+] .wslconfig: $_netMode mode, ${_wslRamGB}GB RAM and SSOT firewall filtering reconciled" -ForegroundColor Green
     & wsl.exe --shutdown 2>$null | Out-Null
 }
 

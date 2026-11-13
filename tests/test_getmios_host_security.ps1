@@ -31,7 +31,7 @@ function Import-MiosFunctions([string]$Path) {
         'Assert-MiosNoReparsePath', 'Set-MiosHostTierAcl', 'Initialize-MiosHostTierDirectory', 'Write-MiosHostToml',
         'Repair-MiosHostTierCredentials', 'Get-MiosTomlTableArray', 'ConvertTo-MiosWindowsPath', 'Test-MiosDefenderExclusionRefused',
         'Get-MiosDefenderExclusionPlan', 'Add-MiosDefenderExclusions', 'Set-MiosWslFirewallPolicy', 'Set-MiosPrivateUserTomlAcl',
-        'Import-MiosUserToml', 'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder')
+        'Import-MiosUserToml', 'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder', 'Get-MiosUserTomlReceiverScript', 'Get-MiosWslConfigText')
     $defs = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) |
         Where-Object { $want -contains $_.Name })
     foreach ($name in $want) { if (@($defs | Where-Object Name -eq $name).Count -ne 1) { throw "Missing/duplicate canonical function $name" } }
@@ -224,9 +224,74 @@ reason = 'Fixture only'
         Expect-Throw { Set-MiosWslFirewallPolicy } "unscoped remote $bad is refused"
         $script:fixtureVendor = $script:fixtureVendor.Replace($bad, '192.0.2.0/24')
     }
+    $managed = @('memory=8GB', 'networkingMode=NAT', 'localhostForwarding=true')
+    $existing = "[wsl2]`n" + ($managed -join "`n") + "`nfirewall=false`ncustom=value`n[experimental]`ncustomExperimental=keep`n"
+    $updated = Get-MiosWslConfigText -Existing $existing -ManagedLines $managed -Firewall $true
+    Check ($updated -match '(?m)^firewall=true\r?$' -and $updated -notmatch '(?m)^firewall=false') 'SSOT true replaces stale false when all other managed keys already match'
+    Check ($updated.Contains('custom=value') -and $updated.Contains('[experimental]') -and $updated.Contains('customExperimental=keep')) 'unmanaged WSL keys and sections remain'
+    Check ((Get-MiosWslConfigText -Existing $updated -ManagedLines $managed -Firewall $true) -ceq $updated) 'WSL firewall reconciliation is stable on retry'
+    Expect-Throw { Get-MiosWslConfigText -Existing $existing -ManagedLines $managed -Firewall $false } 'an explicit insecure SSOT firewall=false fails closed'
+    Invoke-ReceiverProtocolChecks
     Write-Host "SOURCE_FIXTURE_ASSERTIONS $($script:checks)"
     return $script:fail
 }
+function Invoke-ReceiverProtocolChecks {
+    $shell = Get-Command sh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $shell) { Write-Host 'SOURCE_RECEIVER_PROTOCOL_UNRUN (sh unavailable)'; return }
+    $receiverHome = Join-Path $scratch 'receiver-home'
+    $receiverDirectory = Join-Path (Join-Path $receiverHome '.config') 'mios'
+    New-Item -ItemType Directory -Path $receiverDirectory -Force -ErrorAction Stop | Out-Null
+    $target = Join-Path $receiverDirectory 'mios.toml'
+    $content = (New-Object Text.UTF8Encoding($false)).GetBytes('fixture-' + [char]0x03bb + '-without-final-newline')
+    $old = (New-Object Text.UTF8Encoding($false)).GetBytes('fixture-old-canonical')
+    foreach ($mode in @('complete', 'short', 'interrupted')) {
+        Get-ChildItem -LiteralPath $receiverDirectory -Filter '.mios.*' -Force | Remove-Item -Force -ErrorAction Stop
+        [IO.File]::WriteAllBytes($target, $old)
+        $program = Get-MiosUserTomlReceiverScript -ExpectedBytes $content.LongLength
+        $psi = New-Object Diagnostics.ProcessStartInfo
+        $psi.FileName = $shell.Source
+        $psi.Arguments = (@('-c', $program) | ForEach-Object { ConvertTo-MiosNativeArgument $_ }) -join ' '
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+        $psi.EnvironmentVariables['HOME'] = $receiverHome
+        $process = New-Object Diagnostics.Process
+        $process.StartInfo = $psi
+        try {
+            if (-not $process.Start()) { throw 'Fixture receiver could not start.' }
+            $stdout = $process.StandardOutput.ReadToEndAsync(); $stderr = $process.StandardError.ReadToEndAsync()
+            $count = if ($mode -eq 'complete') { $content.Length } else { [int][math]::Floor($content.Length / 2) }
+            $process.StandardInput.BaseStream.Write($content, 0, $count)
+            $process.StandardInput.BaseStream.Flush()
+            if ($mode -eq 'interrupted') {
+                $pendingSeen = $false
+                for ($attempt = 0; $attempt -lt 200; $attempt++) {
+                    if (@(Get-ChildItem -LiteralPath $receiverDirectory -Filter '.mios.*' -Force).Count) { $pendingSeen = $true; break }
+                    [Threading.Thread]::Sleep(10)
+                }
+                Check $pendingSeen 'interrupted receiver started its private pending write'
+                if (-not $process.HasExited) { $process.Kill() }
+            }
+            $process.StandardInput.Close()
+            if (-not $process.WaitForExit(10000)) { $process.Kill(); throw 'Fixture receiver did not exit.' }
+            $null = $stdout.GetAwaiter().GetResult(); $null = $stderr.GetAwaiter().GetResult()
+            $actual = [Convert]::ToBase64String([IO.File]::ReadAllBytes($target))
+            if ($mode -eq 'complete') {
+                Check ($process.ExitCode -eq 0 -and $actual -ceq [Convert]::ToBase64String($content)) 'complete receiver publishes exact UTF8 bytes without an added newline'
+                if ($env:OS -ne 'Windows_NT') {
+                    $modeText = (& stat -c '%a' $target) -join ''
+                    Check ($LASTEXITCODE -eq 0 -and $modeText.Trim() -eq '600') 'complete receiver publishes mode 0600'
+                }
+            } else {
+                Check ($process.ExitCode -ne 0 -and $actual -ceq [Convert]::ToBase64String($old)) "$mode receiver input retains the old canonical TOML"
+            }
+        } finally {
+            try { if (-not $process.HasExited) { $process.Kill() } } catch {}
+            $process.Dispose()
+        }
+    }
+    Write-Host 'SOURCE_RECEIVER_PROTOCOL PASS'
+}
+
 function Invoke-WindowsAclChecks {
     if ($env:OS -ne 'Windows_NT') { throw '-WindowsAcl requires a Windows host; no Windows API acceptance is claimed.' }
     $null = Import-MiosFunctions $realScript

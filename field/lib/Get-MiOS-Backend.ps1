@@ -1,4 +1,4 @@
-# AI-hint: Primary entry point for MiOS installation; handles admin elevation, environment validation, and fresh-clone of the bootstrap repo to initiate the preflight, VM setup, and OCI build pipeline.
+# AI-hint: Primary entry point for MiOS installation; handles admin elevation, environment validation, and lossless refresh of the bootstrap repo to initiate the preflight, VM setup, and OCI build pipeline.
 # AI-related: /usr/share/mios/mios.toml, /etc/mios/mios.toml, /etc/mios/., /usr/share/mios/branding/mios.txt, /usr/share/mios/branding/mios, mios-dev, mios-bootstrap, mios-pull, mios-launch, mios-install
 # AI-functions: Disable-ConsoleQuickEdit, Resolve-MiosTomlText, Get-MiosTomlValue, Show-MiOSBanner, Show-MiOSAgreement, Invoke-MiOSAgreementGate, _Center-MiOSGateConsole, Get-MiosPalette, _hex, Test-MiOSFontInstalled, Wait-MiOSWindowsTerminalReady, Ensure-MiOSWinget
 <#
@@ -14,9 +14,9 @@
       2. Resizes the host window to ~100x40 so the build dashboard
          frame (80 cols + breathing room) fits without wrapping.
       3. Verifies Git + Podman are present.
-      4. Force-cleans + fresh-clones the mios-bootstrap repo into
-         $env:TEMP\mios-bootstrap. Every run is fresh; no persistent
-         working tree, no fetch/pull update branch.
+      4. Refreshes clean source checkouts only by fast-forward; local
+         commits, staged edits, untracked files and ignored files are
+         preserved. New clones never replace existing source trees.
       5. Hands off to bootstrap.ps1 -- the new split-bootstrap entry
          (default: -BootstrapOnly = preflight + dev VM + Windows
          install; the deployable OCI image is built later via the
@@ -37,17 +37,9 @@
     Branch to clone (default: main).
 
 .PARAMETER RepoDir
-    Temp clone target. Default: $env:TEMP\mios-bootstrap-<random8>.
-    Each invocation gets a fresh GUID-suffixed dir so a locked
-    leftover from a previous run never blocks a new start. Operators
-    who genuinely want to point at a local checkout (e.g. for
-    development) can pass an explicit -RepoDir; the script will
-    refuse to delete it if it's outside %TEMP%. There is NO update /
-    fetch / pull branch here -- always fresh-clone. A persistent path
-    like $env:USERPROFILE\MiOS-bootstrap is FORBIDDEN as the bootstrap
-    working tree (it accumulates stale state across runs and was the
-    root cause of every "FATAL: From https://...", "FATAL: Cloning
-    into ...", and "FATAL: vm already exists" surface we kept fixing).
+    Bootstrap checkout path. Existing local changes and local commits are
+    preserved; clean checkouts fast-forward only. A failed fresh clone is
+    retained for inspection rather than deleted before retrying.
 
 .PARAMETER FullBuild
     Run the full pipeline in one shot (preflight + dev VM + Windows
@@ -112,29 +104,175 @@ Disable-ConsoleQuickEdit
 # mios-bootstrap repo isn't cloned yet -- the Default bootstrap clones it, but these actions run
 # FIRST (this router precedes the bootstrap). Fetch it here (git if present, else a GitHub zip)
 # so a factory Windows can go straight from the web one-liner to a build/flash with no manual clone.
-function Ensure-MiosBootstrapRepo {
-    $root = 'C:\mios-bootstrap'
-    if (Test-Path (Join-Path $root 'field\autounattend\Build-MiOSXboxISO.ps1')) { return $root }
-    Write-Host "  [*] mios-bootstrap not present -- fetching it for this action (bare-Windows path)..." -ForegroundColor Cyan
-    if (Get-Command git -ErrorAction SilentlyContinue) {
-        try { & git clone --depth 1 'https://github.com/mios-dev/mios-bootstrap.git' $root 2>&1 | Out-Null } catch {}
-    }
-    if (-not (Test-Path (Join-Path $root 'field\autounattend\Build-MiOSXboxISO.ps1'))) {
-        $zip = Join-Path $env:TEMP 'mios-bootstrap.zip'
-        $tmp = Join-Path $env:TEMP ('mios-bs-' + [System.Guid]::NewGuid().ToString('N').Substring(0,8))
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri 'https://codeload.github.com/mios-dev/mios-bootstrap/zip/refs/heads/main' -OutFile $zip -UseBasicParsing -ErrorAction Stop
-            Expand-Archive -Path $zip -DestinationPath $tmp -Force
-            $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
-            if ($inner) { New-Item -ItemType Directory -Force -Path $root | Out-Null; Copy-Item -Path (Join-Path $inner.FullName '*') -Destination $root -Recurse -Force }
-        } catch {
-            Write-Host "  [!] Could not fetch mios-bootstrap: $($_.Exception.Message)" -ForegroundColor Yellow
-        } finally {
-            Remove-Item $zip,$tmp -Recurse -Force -ErrorAction SilentlyContinue
+function Get-MiosFieldSourceParent {
+    param([Parameter(Mandatory)][string]$Destination)
+    $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $full = [IO.Path]::GetFullPath($Destination)
+    $target = $full.TrimEnd($separators)
+    if ($target -eq [IO.Path]::GetPathRoot($full).TrimEnd($separators)) { throw 'A Field source target must be a new directory below an existing parent.' }
+    $parent = [IO.Directory]::GetParent($target)
+    if (-not $parent) { throw 'The Field source target has no publication parent.' }
+    # Walk lexical ancestors: a junction/symlink may redirect a sibling onto another volume or tree.
+    $ancestor = $parent
+    while ($ancestor) {
+        $item = Get-Item -LiteralPath $ancestor.FullName -Force -ErrorAction Stop
+        if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'Field source publication refuses a reparse point or non-directory in its parent chain.'
         }
+        $ancestor = $ancestor.Parent
     }
-    return $root
+    return $parent.FullName
+}
+
+function Protect-MiosFieldSourceStaging {
+    param([Parameter(Mandatory)][string]$Path)
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.SetOwner($sid)
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+    $acl.AddAccessRule($rule)
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+    $actual = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $owner = $actual.GetOwner([Security.Principal.SecurityIdentifier])
+    $rules = @($actual.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $control = [Security.AccessControl.FileSystemRights]::FullControl
+    if (-not $actual.AreAccessRulesProtected -or $owner.Value -ne $sid.Value -or $rules.Count -ne 1 -or
+        $rules[0].IdentityReference.Value -ne $sid.Value -or [string]$rules[0].AccessControlType -ne 'Allow' -or
+        ($rules[0].FileSystemRights -band $control) -ne $control -or $rules[0].InheritanceFlags -ne $inheritance -or
+        [string]$rules[0].PropagationFlags -ne 'None') {
+        throw 'Field source staging did not read back a private owner-only ACL; acquisition stopped.'
+    }
+}
+
+function Remove-MiosFieldPrivateSourceStaging {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ExpectedParent)
+    try {
+        if ([IO.Path]::GetFileName($Path) -notmatch '^\.mios-field-source-[a-f0-9]{32}$' -or
+            (Get-MiosFieldSourceParent -Destination $Path) -cne $ExpectedParent) { throw 'Staging ownership path changed.' }
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Staging became a link.' }
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+    } catch {
+        Write-Host '  [!] Private Field staging was retained because safe cleanup could not be established.' -ForegroundColor Yellow
+    }
+}
+
+function New-MiosFieldPrivateSourceStaging {
+    param([Parameter(Mandatory)][string]$Destination)
+    $parent = Get-MiosFieldSourceParent -Destination $Destination
+    # A sibling shares the publication volume even when TEMP is redirected to another disk.
+    $path = Join-Path $parent ('.mios-field-source-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $path -ErrorAction Stop
+    try {
+        Protect-MiosFieldSourceStaging -Path $path
+        return $path
+    } catch {
+        # Only the invocation's private sibling is eligible for cleanup; changed ancestry is preserved.
+        Remove-MiosFieldPrivateSourceStaging -Path $path -ExpectedParent $parent
+        throw
+    }
+}
+
+function Expand-MiosFieldSourceArchive {
+    param([Parameter(Mandatory)][string]$Archive, [Parameter(Mandatory)][string]$Destination)
+    # Fixed safety ceilings for a source archive, independent of installer/profile preferences.
+    if ((Get-Item -LiteralPath $Archive -ErrorAction Stop).Length -gt 256MB) { throw 'Field source archive exceeds the compressed size limit.' }
+    if (Test-Path -LiteralPath $Destination) { throw 'Field source extraction requires a new private destination.' }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        if ($zip.Entries.Count -gt 50000) { throw 'Field source archive exceeds the entry limit.' }
+        $root = [IO.Path]::GetFullPath($Destination).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+        $total = [long]0
+        foreach ($entry in $zip.Entries) {
+            $name = $entry.FullName.Replace('\', '/')
+            $mode = ($entry.ExternalAttributes -shr 16) -band 0xF000
+            if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('/') -or $name.Contains(':') -or
+                $name.IndexOf([char]0) -ge 0 -or $name -match '(^|/)\.\.?(/|$)' -or $mode -notin @(0, 0x4000, 0x8000)) {
+                throw 'Field source archive contains an unsafe path or entry type.'
+            }
+            foreach ($segment in ($name -split '/' | Where-Object { $_ })) {
+                if ($segment -match '[<>"|?*\x00-\x1f]' -or $segment -match '[. ]$' -or
+                    $segment -match '^(?i:CON|PRN|AUX|NUL|COM[0-9\u00b9\u00b2\u00b3]|LPT[0-9\u00b9\u00b2\u00b3])(?:\.|$)') {
+                    throw 'Field source archive contains an unsafe path or entry type.'
+                }
+            }
+            $target = [IO.Path]::GetFullPath((Join-Path $Destination $name))
+            if (-not $target.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw 'Field source archive escapes its extraction directory.' }
+            $total += $entry.Length
+            if ($entry.Length -gt 256MB -or $total -gt 1GB) { throw 'Field source archive exceeds the expanded size limit.' }
+        }
+        $null = [IO.Directory]::CreateDirectory($Destination)
+        $buffer = New-Object byte[] 65536
+        foreach ($entry in $zip.Entries) {
+            $name = $entry.FullName.Replace('\', '/')
+            $target = [IO.Path]::GetFullPath((Join-Path $Destination $name))
+            if ($name.EndsWith('/')) { $null = [IO.Directory]::CreateDirectory($target); continue }
+            $null = [IO.Directory]::CreateDirectory((Split-Path $target -Parent))
+            $entryInputStream = $null; $entryOutputStream = $null
+            try {
+                $entryInputStream = $entry.Open()
+                $entryOutputStream = [IO.File]::Open($target, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                $copied = [long]0
+                while (($read = $entryInputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    $copied += $read
+                    if ($copied -gt $entry.Length -or $copied -gt 256MB) { throw 'Field source archive entry exceeded its declared size.' }
+                    $entryOutputStream.Write($buffer, 0, $read)
+                }
+                if ($copied -ne $entry.Length) { throw 'Field source archive entry was truncated.' }
+            } finally {
+                if ($entryOutputStream) { $entryOutputStream.Dispose() }
+                if ($entryInputStream) { $entryInputStream.Dispose() }
+            }
+        }
+    } finally { $zip.Dispose() }
+}
+
+function Ensure-MiosBootstrapRepo {
+    param([string]$Root = 'C:\mios-bootstrap')
+    $Root = [IO.Path]::GetFullPath($Root)
+    $destinationParent = Get-MiosFieldSourceParent -Destination $Root
+    $rootErrors = @()
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction SilentlyContinue -ErrorVariable rootErrors
+    if ($rootErrors.Count -and [string]$rootErrors[0].CategoryInfo.Category -ne 'ObjectNotFound') {
+        throw 'The Field source target cannot be inspected safely; acquisition stopped.'
+    }
+    if ($rootItem) {
+        if ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'An existing Field source target link is preserved; choose a separate source directory.' }
+        if (Test-Path -LiteralPath (Join-Path $Root 'field\autounattend\Build-MiOSXboxISO.ps1') -PathType Leaf) { return $Root }
+        # An empty directory may be populated concurrently. Never remove it to permit publication.
+        throw 'The Field source directory contains an incomplete or existing tree, including an empty target; it was preserved. Select a separate complete checkout.'
+    }
+    Write-Host '  [*] Fetching a new bootstrap checkout for this action...' -ForegroundColor Cyan
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        try { & git clone -- 'https://github.com/mios-dev/mios-bootstrap.git' $Root 2>&1 | Out-Null } catch {}
+    }
+    if (Test-Path -LiteralPath (Join-Path $Root 'field\autounattend\Build-MiOSXboxISO.ps1')) { return $Root }
+    if (Test-Path -LiteralPath $Root) {
+        throw 'The Field clone did not complete; its target was preserved. Review it or choose a new source path before retrying.'
+    }
+    $staging = New-MiosFieldPrivateSourceStaging -Destination $Root
+    try {
+        $archive = Join-Path $staging 'source.zip'
+        $expanded = Join-Path $staging 'expanded'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri 'https://codeload.github.com/mios-dev/mios-bootstrap/zip/refs/heads/main' -OutFile $archive -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+        Expand-MiosFieldSourceArchive -Archive $archive -Destination $expanded
+        $roots = @(Get-ChildItem -LiteralPath $expanded -Force)
+        if ($roots.Count -ne 1 -or -not $roots[0].PSIsContainer -or
+            -not (Test-Path -LiteralPath (Join-Path $roots[0].FullName 'field\autounattend\Build-MiOSXboxISO.ps1') -PathType Leaf)) {
+            throw 'The Field source archive does not contain a complete bootstrap checkout.'
+        }
+        if ((Get-MiosFieldSourceParent -Destination $Root) -cne $destinationParent) { throw 'The Field source publication parent changed; acquisition stopped.' }
+        # The sibling rename is on one volume and refuses a destination created during download.
+        [IO.Directory]::Move($roots[0].FullName, [IO.Path]::GetFullPath($Root))
+    } finally {
+        # Only private staging with unchanged safe ancestry is removed; source targets are never deleted.
+        Remove-MiosFieldPrivateSourceStaging -Path $staging -ExpectedParent $destinationParent
+    }
+    return $Root
 }
 
 # Consolidated Action Router
@@ -3757,6 +3895,10 @@ function Install-MiOSPowerShellProfile {
         }) -join ', '
     ) + ')'
 
+    $windowsRefreshBlock = Get-MiosFieldCheckoutProfileBlock
+    $miosBuildRef = [string](Get-MiosTomlValue -Section 'bootstrap' -Key 'mios_ref' -Default 'main')
+    $miosBuildRefLiteral = "'" + $miosBuildRef.Replace("'", "''") + "'"
+
     $miosScriptBody = @"
 # MiOS PowerShell profile -- PSReadLine reload + fastfetch MOTD +
 # oh-my-posh init.
@@ -4444,6 +4586,8 @@ if (`$true) {
 
 `$Script:MiosBootstrapRaw = '$($Script:MiosBootstrapRaw)'
 
+$windowsRefreshBlock
+
 function mios-build {
     [CmdletBinding()]
     param([Parameter(ValueFromRemainingArguments)]`$Args)
@@ -4554,11 +4698,7 @@ function mios-build {
         }
     }
 
-    # -- Step 3: sync overlay so the build sees the latest mios.toml -
-    # Note: this runs AFTER the Downloads-promote step so mios-pull
-    # sees the just-promoted files in M:\etc\mios. mios-pull's git
-    # reset --hard would otherwise blow away the operator's changes
-    # if they lived in the tracked tree.
+    # -- Step 3: refresh only a clean fast-forward; saved operator edits remain in place.
     if (-not `$skipPull) {
         Write-Host ''
         Write-Host '  [3/4] Syncing M:\ overlay (mios.git + mios-bootstrap)...' -ForegroundColor Cyan
@@ -4587,16 +4727,7 @@ function mios-pull {
         Write-Host '  [!] M:\ is not a git working tree -- run mios-build first.' -ForegroundColor Yellow
         return
     }
-    Push-Location 'M:\'
-    try {
-        git fetch --depth=1 origin main
-        if (`$LASTEXITCODE -eq 0) {
-            git reset --hard FETCH_HEAD
-            Write-Host '  [+] M:\ overlay synced to origin/main.' -ForegroundColor Green
-        } else {
-            Write-Host '  [!] git fetch failed -- check network.' -ForegroundColor Yellow
-        }
-    } finally { Pop-Location }
+    Update-MiosWindowsBuildCheckout -Path 'M:\' -Ref $miosBuildRefLiteral
 }
 
 function mios-config {
@@ -4750,7 +4881,7 @@ function mios-help {
     Write-Host '                  or use mios-<verb> directly:' -ForegroundColor DarkGray
     Write-Host '  mios build    run the full MiOS OS bootstrap (WSL2 + podman + dev VM)' -ForegroundColor White
     Write-Host '  mios update   re-run Get-MiOS.ps1 (refresh terminal install)' -ForegroundColor White
-    Write-Host '  mios pull     git fetch + hard reset M:\ to origin/main' -ForegroundColor White
+    Write-Host '  mios pull     clean fast-forward of M:\; preserve local work' -ForegroundColor White
     Write-Host '  mios config   open the HTML configurator (mios.toml editor)' -ForegroundColor White
     Write-Host '  mios ai       open Open WebUI (rich LLM interface) in your browser' -ForegroundColor White
     Write-Host '  mios dev      wsl into the MiOS-DEV distro (root /, user mios)' -ForegroundColor White
@@ -5148,190 +5279,111 @@ function Ensure-Winget {
     return $false
 }
 
-function Enable-MiOSWindowsFeatures {
-    # Detect + enable the OS-level features MiOS needs:
-    #   Microsoft-Windows-Subsystem-Linux   -- WSL substrate
-    #   VirtualMachinePlatform              -- WSL2 (HCS) + Hyper-V hypervisor
-    #   Microsoft-Hyper-V                   -- Hyper-V Manager + VMs (Pro/Ent)
-    #
-    # All require admin (DISM-level feature toggles). Caller is responsible
-    # for admin context -- Get-MiOS.ps1 self-elevates via UAC before any
-    # call site reaches this function, so we hard-fail with a clear message
-    # rather than silently skipping if we somehow land here as a normal user.
-    #
-    # "pwsh7+, podman, wsl, hyper-v, etc-etc are all
-    # fecthed and installed during irm|iex installations -- THE FIRST
-    # STEPS AFTER DISK CREATION". This function is Step 0.6 in Pass-2,
-    # immediately after Initialize-DataDisk + Set-PodmanMachineStorageOnM
-    # + Set-WingetStorageOnM + mios.toml promotion to M:\.
-    #
-    # Reboot policy: enables with -NoRestart and aggregates which features
-    # required a reboot. Surfaces a clear warning at the end if any
-    # reboot is pending; doesn't reboot automatically (operator-flagged:
-    # NO automatic mid-install reboots).
-    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $isAdmin) {
-        Write-Host "  [!] Enable-MiOSWindowsFeatures needs admin -- deferring (auto-elevation will rerun this)." -ForegroundColor Yellow
-        return $false
+function Get-MiosFieldCanonicalPath {
+    if (-not $PSScriptRoot) { throw 'Field platform preparation requires its file-backed bootstrap checkout.' }
+    return [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../Get-MiOS.ps1'))
+}
+
+function Get-MiosFieldCanonicalFunctions {
+    # Import function definitions only. Get-MiOS.ps1 top-level performs installation and must never run here.
+    param([Parameter(Mandatory)][string]$Path)
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw 'The canonical platform source does not parse; Field preparation stopped.' }
+    $names = @('Split-MiosTomlKeyLine', 'Get-MiosTomlTableArray', 'Get-MiosTomlValue',
+        'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Test-MiosElevated', 'Enable-MiOSWindowsFeatures',
+        'Test-MiosWslVmCreator', 'Register-MiosWslVmCreator', 'Set-MiosWslFirewallPolicy',
+        'Invoke-MiosPlatformGate', 'Get-MiosWslConfigText', 'Invoke-MiOSFullReap', 'Update-MiosWindowsBuildCheckout')
+    $definitions = @($ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names
+    }, $true))
+    foreach ($name in $names) {
+        if (@($definitions | Where-Object Name -eq $name).Count -ne 1) { throw "Missing or duplicate canonical platform helper: $name" }
     }
+    return [scriptblock]::Create((($definitions | ForEach-Object { $_.Extent.Text }) -join "`n"))
+}
 
-    # TOML-first per AGENTS.md §3 -- feature DISM names resolve from
-    # mios.toml [bootstrap.prereqs.features].* so operators can swap
-    # Hyper-V for Hyper-V-Core, add Containers/SMBDirect, etc., via
-    # mios.html. Order matters (WSL substrate before VMP before Hyper-V);
-    # use [ordered] to preserve insertion order. Build via .Add() (void
-    # return) instead of $features[k]=v to avoid any indexer-emit leak
-    # into the function's pipeline output (operator-confirmed
-    # the indexer-assignment form leaked the assigned value into the
-    # function's return stream, making `$_featResult -eq 'reboot-required'`
-    # filter-match a multi-element array even when rebootPending stayed
-    # $false -- spurious Pass-2 halt despite all 3 features already
-    # Enabled).
-    $features = [ordered]@{}
-    $features.Add([string](Get-MiosTomlValue -Section 'bootstrap.prereqs.features' -Key 'wsl'    -Default 'Microsoft-Windows-Subsystem-Linux'), 'Windows Subsystem for Linux')
-    $features.Add([string](Get-MiosTomlValue -Section 'bootstrap.prereqs.features' -Key 'vmp'    -Default 'VirtualMachinePlatform'),            'Virtual Machine Platform (WSL2 + Hyper-V hypervisor)')
-    $features.Add([string](Get-MiosTomlValue -Section 'bootstrap.prereqs.features' -Key 'hyperv' -Default 'Microsoft-Hyper-V'),                 'Hyper-V (manager + VMs)')
+function Update-MiosFieldCheckout {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Ref,
+        [string]$CanonicalPath = (Get-MiosFieldCanonicalPath))
+    $definitions = Get-MiosFieldCanonicalFunctions -Path $CanonicalPath
+    & {
+        param([scriptblock]$Definitions, [string]$Checkout, [string]$SourceRef)
+        . $Definitions
+        Update-MiosWindowsBuildCheckout -Path $Checkout -Ref $SourceRef
+    } $definitions $Path $Ref
+}
 
-    $rebootPending = $false
-    foreach ($name in $features.Keys) {
-        $label = $features[$name]
-        try {
-            $state = Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction Stop
-        } catch {
-            # Get-WindowsOptionalFeature threw. Either the feature genuinely
-            # isn't on this edition (e.g. Hyper-V on Home), OR the legacy
-            # optional-feature name no longer exists because WSL is now
-            # Store-distributed (WSL 2.x MSIX needs only VirtualMachinePlatform,
-            # not the deprecated 'Microsoft-Windows-Subsystem-Linux' feature).
-            # If wsl.exe already works, the substrate is satisfied regardless
-            # of optional-feature state -- don't emit a scary "not available".
-            $_wslOk = $false
-            try { & wsl.exe --version *> $null; if ($LASTEXITCODE -eq 0) { $_wslOk = $true } } catch {}
-            if ($_wslOk -and ($name -like '*Subsystem-Linux*')) {
-                Write-Host "  [+] $label satisfied (wsl.exe present; Store-based WSL needs no optional feature)." -ForegroundColor DarkGray
-            } else {
-                Write-Host "  [-] $label not available on this Windows edition -- skipping." -ForegroundColor DarkGray
-            }
-            continue
+function Get-MiosFieldCheckoutProfileBlock {
+    param([string]$CanonicalPath = (Get-MiosFieldCanonicalPath))
+    $definitions = Get-MiosFieldCanonicalFunctions -Path $CanonicalPath
+    $refresh = @($definitions.Ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Update-MiosWindowsBuildCheckout'
+    }, $true))
+    if ($refresh.Count -ne 1) { throw 'The canonical source refresh helper is unavailable; profile preparation stopped.' }
+    return $refresh[0].Extent.Text
+}
+
+function Initialize-MiosFieldSourceCheckout {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$RepoUrl,
+        [Parameter(Mandatory)][string]$Ref, [string]$CanonicalPath = (Get-MiosFieldCanonicalPath))
+    if (Test-Path -LiteralPath $Path) {
+        if (Test-Path -LiteralPath (Join-Path $Path '.git')) {
+            Update-MiosFieldCheckout -Path $Path -Ref $Ref -CanonicalPath $CanonicalPath
+            return
         }
-        if ($state.State -eq 'Enabled') {
-            Write-Host "  [+] $label already enabled." -ForegroundColor DarkGray
-            continue
-        }
-        Write-Host "  [*] Enabling $label..." -ForegroundColor Cyan
-        try {
-            $r = Enable-WindowsOptionalFeature -Online -FeatureName $name -NoRestart -ErrorAction Stop
-            if ($r.RestartNeeded) { $rebootPending = $true }
-            Write-Host "  [+] $label enabled." -ForegroundColor Green
-        } catch {
-            Write-Host "  [!] Enable-WindowsOptionalFeature $name failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        if (-not (Test-Path -LiteralPath $Path -PathType Container) -or
+            @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop).Count) {
+            throw 'The selected Field source path contains existing non-checkout data; preserve it and choose an empty path.'
         }
     }
-
-    # --- WSL bootstrap on fresh Windows ----------------------------------
-    # Fresh Windows 11 doesn't ship wsl.exe -- it's a separate Store-distributed
-    # MSIX app since 2022. On a clean machine, DISM enables the Windows feature
-    # ("Microsoft-Windows-Subsystem-Linux") but the actual wsl.exe binary +
-    # the WSL kernel are downloaded from the Store. `wsl --install` (DISM-era
-    # path) auto-pulls them on first run; we drive it explicitly so the
-    # operator sees a known transcript instead of waiting on opaque downloads.
-    #
-    # Operator-flagged "MiOS should be running preview builds
-    # of WSL. Make sure the irm|iex installer can STILL install on a fresh
-    # Windows System with NOTHING installed".
-    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
-        # TOML-first -- WSL Store MSIX winget ID from mios.toml
-        # [bootstrap.prereqs].wsl_pkg (operator can pin to Microsoft.WSL
-        # preview channel via mios.html).
-        $_wslPkg = [string](Get-MiosTomlValue -Section 'bootstrap.prereqs' -Key 'wsl_pkg' -Default 'Microsoft.WSL')
-        Write-Host "  [*] wsl.exe not on PATH -- installing WSL ($_wslPkg via Microsoft Store MSIX)..." -ForegroundColor Cyan
-        # Path A: winget install (preferred on Win11; pulls the Store version + dependencies)
-        if (Get-Command winget -ErrorAction SilentlyContinue) {
-            try {
-                & winget install --id $_wslPkg --silent --accept-source-agreements --accept-package-agreements 2>&1 |
-                    ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
-            } catch {
-                Write-Host "  [!] winget install $_wslPkg : $($_.Exception.Message)" -ForegroundColor Yellow
-            }
-        }
-        # Path B: fallback to `wsl --install --no-distribution` (works on
-        # any Win10 22H2+ / Win11 with the Windows-feature already enabled).
-        if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
-            try {
-                $sysWsl = Join-Path $env:SystemRoot 'System32\wsl.exe'
-                if (Test-Path $sysWsl) {
-                    Write-Host "  [*] Falling back to '$sysWsl --install --no-distribution'..." -ForegroundColor Cyan
-                    & $sysWsl --install --no-distribution --web-download 2>&1 |
-                        ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
-                }
-            } catch {
-                Write-Host "  [!] wsl --install fallback failed: $($_.Exception.Message)" -ForegroundColor Yellow
-            }
-        }
+    $valid = Invoke-GitProc -ArgList @('check-ref-format', '--branch', $Ref)
+    if ($valid.ExitCode -ne 0) { throw 'The selected Field source ref is invalid; no source was changed.' }
+    # Clone once without deleting a partial target. A failed clone may contain work saved concurrently.
+    $clone = Invoke-GitProc -ArgList @('clone', '--branch', $Ref, '--', $RepoUrl, $Path)
+    if ($clone.ExitCode -ne 0) {
+        throw 'Field source clone failed; the target was preserved. Review it or select another empty path before retrying.'
     }
+}
 
-    # WSL kernel update + opt into PRE-RELEASE channel (preview builds).
-    # `wsl --update` pulls the latest MSIX kernel from Microsoft Store;
-    # `--pre-release` flag (added in WSL 2.0.0, available on every modern
-    # Windows + WSL combo) opts into the preview build channel which has
-    # the newer compositor + gnome-shell --nested fixes operator needs
-    # for the Enhanced Session full-desktop path.
-    # `--set-default-version 2` ensures wsl --install / `wsl --import`
-    # use WSL2 (HCS via VirtualMachinePlatform) by default.
-    if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
-        try {
-            Write-Host "  [*] Running 'wsl --update --pre-release' (preview channel)..." -ForegroundColor Cyan
-            & wsl.exe --update --pre-release 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
-            & wsl.exe --set-default-version 2 2>&1 | Out-Null
-            Write-Host "  [+] WSL: preview channel + default version 2" -ForegroundColor Green
-            # Surface what we actually got
-            try {
-                $verOut = (& wsl.exe --version 2>&1) -join "`n"
-                Write-Host "  [.] wsl --version:" -ForegroundColor DarkGray
-                $verOut -split "`n" | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
-            } catch {}
-        } catch {
-            Write-Host "  [!] wsl --update --pre-release: $($_.Exception.Message)" -ForegroundColor Yellow
-            # Fallback: try without --pre-release in case the flag isn't
-            # supported by the very-old WSL kernel installed.
-            try { & wsl.exe --update 2>&1 | Out-Null } catch {}
-            try { & wsl.exe --set-default-version 2 2>&1 | Out-Null } catch {}
-        }
-    } else {
-        Write-Host "  [-] wsl.exe still not on PATH after install attempts -- next-session reboot may surface it." -ForegroundColor DarkGray
-        $rebootPending = $true
-    }
+function Invoke-MiosFieldPlatformGate {
+    param([string]$CanonicalPath = (Get-MiosFieldCanonicalPath))
+    $definitions = Get-MiosFieldCanonicalFunctions -Path $CanonicalPath
+    $resolvedText = Resolve-MiosTomlText
+    if ([string]::IsNullOrWhiteSpace($resolvedText)) { throw 'The resolved Field TOML is unavailable; platform preparation stopped.' }
+    # Keep Field's selected configuration in memory. Local resolver adapters prevent the canonical helpers
+    # from reading a different administrator profile or fetching another vendor revision during this gate.
+    return & {
+        param([scriptblock]$Definitions, [string]$FieldText)
+        . $Definitions
+        function Resolve-MiosTomlText { return '' }
+        function Resolve-MiosVendorTomlText { return $FieldText }
+        Invoke-MiosPlatformGate
+    } $definitions $resolvedText
+}
 
-    if ($rebootPending) {
-        # TOML-first -- mios.toml [bootstrap.prereqs.features].require_reboot_to_continue
-        # decides whether Pass-2 halts here (so downstream WSL-dependent
-        # steps don't cascade-fail) or surfaces a warning and continues.
-        # Operator default: halt (true), since on a truly fresh Windows
-        # the dev VM, podman machine init, and OCI build all REQUIRE the
-        # reboot; trying to run them just produces noise + half-broken
-        # state. Operator opts to "continue anyway and watch what
-        # survives" by setting it to false in mios.html.
-        $_haltOnReboot = ([string](Get-MiosTomlValue -Section 'bootstrap.prereqs.features' -Key 'require_reboot_to_continue' -Default 'true')) -ieq 'true'
-        Write-Host ''
-        Write-Host '  +==============================================================+' -ForegroundColor Yellow
-        Write-Host '  | REBOOT PENDING -- Windows features enabled this session need |' -ForegroundColor Yellow
-        Write-Host '  | a reboot to take full effect. WSL2, the dev VM, podman       |' -ForegroundColor Yellow
-        Write-Host '  | machine init, and the OCI build will fail until you reboot.  |' -ForegroundColor Yellow
-        Write-Host '  +==============================================================+' -ForegroundColor Yellow
-        if ($_haltOnReboot) {
-            Write-Host ''
-            Write-Host '  REBOOT NOW, then re-run the irm|iex one-liner. Pass-0 reaps' -ForegroundColor Cyan
-            Write-Host '  prior state automatically; the next run starts clean and'  -ForegroundColor Cyan
-            Write-Host '  proceeds straight through.' -ForegroundColor Cyan
-            Write-Host ''
-            return [pscustomobject]@{ Status = 'ok';  RebootRequired = $true; HaltRequested = $true }
+function Get-MiosFieldWslConfigText {
+    param([AllowEmptyString()][string]$Existing, [string[]]$ManagedLines,
+        [Parameter(Mandatory)][bool]$Firewall, [string]$CanonicalPath = (Get-MiosFieldCanonicalPath))
+    $definitions = Get-MiosFieldCanonicalFunctions -Path $CanonicalPath
+    return & {
+        param([scriptblock]$Definitions, [string]$Text, [string[]]$Lines, [bool]$Enabled)
+        . $Definitions
+        Get-MiosWslConfigText -Existing $Text -ManagedLines $Lines -Firewall $Enabled
+    } $definitions $Existing $ManagedLines $Firewall
+}
+
+function Complete-MiosFieldPlatformGate {
+    param([Parameter(Mandatory)]$Result)
+    switch ([string]$Result.Status) {
+        'ready' { return }
+        'pending' {
+            Write-Host '  [*] Windows restart required; existing state is preserved.' -ForegroundColor Cyan
+            Write-Host '      Restart Windows, sign in as the same user, then rerun the same Field launcher.' -ForegroundColor Cyan
+            exit 0
         }
-        Write-Host '  [bootstrap.prereqs.features].require_reboot_to_continue=false ' -ForegroundColor DarkGray
-        Write-Host '  -- continuing despite reboot-pending; expect cascade failures.' -ForegroundColor DarkGray
-        Write-Host ''
-        return [pscustomobject]@{ Status = 'ok'; RebootRequired = $true; HaltRequested = $false }
+        default { throw 'Field platform readiness was not established; provisioning stopped before MiOS-DEV.' }
     }
-    return [pscustomobject]@{ Status = 'ok'; RebootRequired = $false; HaltRequested = $false }
 }
 
 function Ensure-Git {
@@ -5537,473 +5589,17 @@ function Ensure-PodmanDesktop {
     }
 }
 
-# -----------------------------------------------------------------------------
-# Invoke-MiOSFullReap -- Phase 0 reap of every prior MiOS artifact
-# -----------------------------------------------------------------------------
-# Per feedback_mios_entry_full_reset memory:
-#   "every irm|iex must reap ALL prior MiOS state: temp clones, persistent
-#   clones, WSL distros (MiOS / MiOS-DEV / podman-MiOS-DEV / MiOS-BUILDER),
-#   podman machines, Hyper-V VMs (MiOS-*), install dirs (M:\ contents +
-#   %PROGRAMDATA%\MiOS / %LOCALAPPDATA%\MiOS / %APPDATA%\MiOS), Start Menu
-#   shortcuts, registry uninstall key. No partial state; no carry-over."
-# C:\MiOS + C:\mios-bootstrap are PROTECTED -- operator dev working trees
-# of mios.git + mios-bootstrap.git per feedback_mios_no_c_drive_fallback.
-#
-# AND per "If the uninstaller actually uninstalled
-# things automatically every time; I wouldn't have to Manually uninstall
-# anything EVERY TIME it fails!!!!"
-#
-# Two callers:
-#   1. Phase 0 of the irm|iex main flow -- runs BEFORE Initialize-DataDisk
-#      so every install starts from zero state regardless of prior runs.
-#   2. The top-level failure trap -- runs on any unhandled exception so a
-#      half-broken install never leaves stale state behind.
-#
-# Idempotent: every block is wrapped in EAP=SilentlyContinue + try/catch so
-# missing artifacts are no-ops. Logs each category's outcome to stdout in
-# DarkGray so the operator sees what's being reaped without noise.
-#
-# Scope (matches uninstall.ps1's 12-category contract + Hyper-V + persistent
-# clones):
-#   1. Podman machines (MiOS-DEV, MiOS-BUILDER, plus any podman-MiOS-* WSL distro)
-#   2. WSL distros (MiOS, MiOS-DEV, podman-MiOS-DEV, MiOS-BUILDER, podman-MiOS-BUILDER)
-#   3. Hyper-V VMs matching MiOS-*
-#   4. Install dirs: M:\ contents (everything except drive root metadata),
-#      %PROGRAMDATA%\MiOS, %LOCALAPPDATA%\MiOS, %APPDATA%\MiOS.
-#      NEVER C:\MiOS (operator dev tree of mios.git -- protected).
-#   5. WT settings.json -- launchMode, profiles.defaults MiOS keys, MiOS scheme,
-#      MiOS / MiOS-WIN / MiOS-DEV / podman-MiOS-* profiles
-#   6. PowerShell profile redirector blocks (10 candidate paths, marker-delimited)
-#   7. Fonts: Geist + symbols-only Nerd Font + matching HKCU font reg entries
-#   8. PATH env entries pointing into M:\MiOS\bin (HKCU + HKLM)
-#   9. HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\MiOS
-#  10. Start Menu folder + Desktop .lnk shortcuts (every legacy variant)
-#  11. AppUserModelID HKCU/HKLM\Software\Classes\AppUserModelId\MiOS.Workstation
-#  12. podman-machine state symlinks (3 candidate paths)
-#  13. MIOS_*/MiOS_* environment variables (HKCU + HKLM)
-#
-# Non-destructive: NEVER touches C:\mios-bootstrap OR C:\MiOS (both are
-# operator dev clones -- may have uncommitted work), the operator's
-# pwsh profile body outside the >>> MiOS ... >>> markers, or any
-# non-MiOS WT profiles / schemes / fonts.
+# Installation and failure recovery preserve existing machines, distributions and operator state.
+# Keep the legacy compatibility name, with the same canonical implementation as the one-liner.
 function Invoke-MiOSFullReap {
-    param([switch]$Quiet)
-    $reapEAP = $ErrorActionPreference
-    $ErrorActionPreference = 'SilentlyContinue'
-
-    # SSOT: every operator-visible reap string resolves through
-    # mios.toml [messages.reap].* with the hardcoded fallback as Default.
-    # Per feedback_mios_messages_section_ssot: no Write-Host literals.
-    $_msgBanner   = Get-MiosTomlValue -Section 'messages.reap' -Key 'banner'   -Default '[*] Phase 0: Reaping all prior MiOS state (zero-carry-over contract)...'
-    $_msgComplete = Get-MiosTomlValue -Section 'messages.reap' -Key 'complete' -Default '[+] Phase 0 reap complete -- proceeding with fresh install.'
-    $_lookupReap = {
-        param([string]$Key, [string]$Default)
-        $v = Get-MiosTomlValue -Section 'messages.reap' -Key $Key -Default $Default
-        if ([string]::IsNullOrWhiteSpace($v)) { return $Default }
-        return $v
-    }
-
-    $_log = {
-        param([string]$msg, [string]$color = 'DarkGray')
-        if (-not $Quiet) { Write-Host "    $msg" -ForegroundColor $color }
-    }
-
-    if (-not $Quiet) {
-        Write-Host ''
-        Write-Host "  $_msgBanner" -ForegroundColor Cyan
-    }
-
-    # 1. Podman machines
-    & $_log (& $_lookupReap 'category_1' '[1/13] podman machine stop + rm (MiOS-DEV, MiOS-BUILDER) ...')
-    foreach ($mch in @('MiOS-DEV','MiOS-BUILDER','podman-MiOS-DEV','podman-MiOS-BUILDER')) {
-        try { & podman machine stop $mch *>$null } catch {}
-        try { & podman machine rm -f $mch *>$null } catch {}
-    }
-    try { & podman system reset --force *>$null } catch {}
-
-    # 2. WSL distros (every variant the install pipeline has used)
-    & $_log (& $_lookupReap 'category_2' '[2/13] wsl --unregister (MiOS, MiOS-DEV, podman-MiOS-*, MiOS-BUILDER) ...')
-    foreach ($d in @('MiOS','MiOS-DEV','podman-MiOS-DEV','MiOS-BUILDER','podman-MiOS-BUILDER')) {
-        try { & wsl.exe --unregister $d 2>$null | Out-Null } catch {}
-    }
-    try { & wsl.exe --shutdown 2>$null | Out-Null } catch {}
-
-    # 3. Hyper-V VMs matching MiOS-*
-    & $_log (& $_lookupReap 'category_3' '[3/13] Hyper-V VMs (MiOS-*) ...')
-    try {
-        if (Get-Command Get-VM -ErrorAction SilentlyContinue) {
-            Get-VM -Name 'MiOS-*' -ErrorAction SilentlyContinue | ForEach-Object {
-                try { Stop-VM -Name $_.Name -TurnOff -Force -ErrorAction SilentlyContinue } catch {}
-                try { Remove-VM -Name $_.Name -Force -ErrorAction SilentlyContinue } catch {}
-            }
-        }
-    } catch {}
-
-    # 4. Install dirs. PROTECTED FROM REAP -- operator-owned dev trees:
-    #   * C:\MiOS            -- dev working tree of mios.git (memory:
-    #                            feedback_mios_no_c_drive_fallback;
-    #                            ".git IS /" working tree). End consumers
-    #                            never have this dir, so deleting it
-    #                            only ever destroys operator dev work.
-    # Operator-flagged after this
-    #                            trap fired on a Phase-3 reap-on-failure
-    #                            and wiped their checkout (uncommitted
-    #                            edits unrecoverable -- no shadow copies).
-    #   * C:\mios-bootstrap  -- dev working tree of mios-bootstrap.git
-    #                            (same protected category).
-    #
-    # MiOS owns M:\ exclusively (see block below) + a few %ProgramData% /
-    # %LOCALAPPDATA% / %APPDATA% caches that ARE install-managed.
-    & $_log (& $_lookupReap 'category_4' '[4/13] Install dirs (%PROGRAMDATA%\MiOS, %LOCALAPPDATA%\MiOS, %APPDATA%\MiOS) -- skipping C:\MiOS + C:\mios-bootstrap ...')
-    foreach ($p in @(
-        (Join-Path $env:ProgramData    'MiOS'),
-        (Join-Path $env:LOCALAPPDATA   'MiOS'),
-        (Join-Path $env:APPDATA        'MiOS')
-    )) {
-        if ([string]::IsNullOrWhiteSpace($p)) { continue }
-        if (Test-Path -LiteralPath $p) {
-            try { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue } catch {}
-        }
-    }
-    # M:\ contents -- wipe everything at the drive root (the partition itself
-    # stays; Initialize-DataDisk's idempotent check sees M:\ exists with
-    # label=MIOS-DEV and skips re-creation). MiOS owns this entire volume.
-    if (Test-Path -LiteralPath 'M:\') {
-        try {
-            Get-ChildItem -LiteralPath 'M:\' -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -ne 'System Volume Information' -and $_.Name -ne '$RECYCLE.BIN' } |
-                ForEach-Object {
-                    try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
-                }
-        } catch {}
-    }
-
-    # 5. WT settings.json -- remove only MiOS-set keys, preserve everything else
-    & $_log (& $_lookupReap 'category_5' '[5/13] Windows Terminal settings.json (MiOS scheme + profiles + defaults) ...')
-    foreach ($wtPath in @(
-        (Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'),
-        (Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json')
-    )) {
-        if (-not (Test-Path -LiteralPath $wtPath)) { continue }
-        try {
-            $raw = Get-Content -LiteralPath $wtPath -Raw
-            $stripped = [regex]::Replace($raw, '(?ms)/\*.*?\*/', '')
-            $stripped = [regex]::Replace($stripped, '(?m)^\s*//.*$', '')
-            $stripped = [regex]::Replace($stripped, ',(\s*[\}\]])', '$1')
-            $j = $stripped | ConvertFrom-Json -ErrorAction Stop
-            $changed = $false
-            if ($j.PSObject.Properties['launchMode'] -and $j.launchMode -in @('focus','maximizedFocus','focusFullscreen')) {
-                $j.PSObject.Properties.Remove('launchMode'); $changed = $true
-            }
-            if ($j.profiles -and $j.profiles.defaults) {
-                foreach ($k in @('scrollbarState','padding','useAcrylic','opacity','systemBackdrop','suppressApplicationTitle','disableAnimations','useAtlasEngine','experimental.detectURLs','experimental.input.forceVT','experimental.rendering.forceFullRepaint')) {
-                    if ($j.profiles.defaults.PSObject.Properties[$k]) {
-                        $j.profiles.defaults.PSObject.Properties.Remove($k); $changed = $true
-                    }
-                }
-            }
-            if ($j.schemes) {
-                $keepSchemes = @($j.schemes | Where-Object { $_.name -ne 'MiOS' })
-                if ($keepSchemes.Count -ne $j.schemes.Count) { $j.schemes = [object[]]$keepSchemes; $changed = $true }
-            }
-            if ($j.profiles -and $j.profiles.list) {
-                $keepProfiles = @($j.profiles.list | Where-Object {
-                    $_.name -ne 'MiOS' -and $_.name -ne 'MiOS-WIN' -and $_.name -ne 'MiOS-DEV' -and $_.name -ne 'MiOS-Bootstrap' -and $_.name -notmatch '^podman-MiOS-' -and $_.guid -ne '{a8b5c2d3-e4f5-6789-abcd-ef0123456789}' -and $_.guid -ne '{a8b5c2d3-e4f5-6789-abcd-ef0123456790}'
-                })
-                if ($keepProfiles.Count -ne $j.profiles.list.Count) { $j.profiles.list = [object[]]$keepProfiles; $changed = $true }
-            }
-            if ($changed) {
-                ($j | ConvertTo-Json -Depth 32) | Set-Content -LiteralPath $wtPath -Encoding UTF8
-            }
-        } catch {}
-    }
-
-    # 6. PowerShell profile redirector blocks (marker-delimited removal)
-    & $_log (& $_lookupReap 'category_6' '[6/13] PowerShell profile redirector blocks (MiOS markers) ...')
-    function script:Remove-MiosMarkerBlock {
-        param([string]$Text, [string]$StartMarker, [string]$EndMarker)
-        while ($true) {
-            $si = $Text.IndexOf($StartMarker)
-            if ($si -lt 0) { return $Text }
-            $ei = $Text.IndexOf($EndMarker, $si)
-            if ($ei -lt 0) { return $Text }
-            $endPos = $ei + $EndMarker.Length
-            if ($endPos -lt $Text.Length -and $Text[$endPos] -eq "`r") { $endPos++ }
-            if ($endPos -lt $Text.Length -and $Text[$endPos] -eq "`n") { $endPos++ }
-            $Text = $Text.Substring(0, $si) + $Text.Substring($endPos)
-        }
-    }
-    $pwshProfileCandidates = @(
-        (Join-Path $env:USERPROFILE 'Documents\PowerShell\profile.ps1'),
-        (Join-Path $env:USERPROFILE 'Documents\PowerShell\Microsoft.PowerShell_profile.ps1'),
-        (Join-Path $env:USERPROFILE 'Documents\WindowsPowerShell\profile.ps1'),
-        (Join-Path $env:USERPROFILE 'Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1'),
-        (Join-Path $env:USERPROFILE 'OneDrive\Documents\PowerShell\profile.ps1'),
-        (Join-Path $env:USERPROFILE 'OneDrive\Documents\PowerShell\Microsoft.PowerShell_profile.ps1'),
-        (Join-Path $env:USERPROFILE 'OneDrive\Documents\WindowsPowerShell\profile.ps1'),
-        (Join-Path $env:USERPROFILE 'OneDrive\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1')
-    ) | Where-Object { $_ } | Sort-Object -Unique
-    foreach ($pp in $pwshProfileCandidates) {
-        if (-not (Test-Path -LiteralPath $pp)) { continue }
-        try {
-            $body = Get-Content -LiteralPath $pp -Raw
-            $body = Remove-MiosMarkerBlock -Text $body -StartMarker '# >>> MiOS oh-my-posh init >>>' -EndMarker '# <<< MiOS oh-my-posh init <<<'
-            $body = Remove-MiosMarkerBlock -Text $body -StartMarker '# >>> MiOS dash function >>>'   -EndMarker '# <<< MiOS dash function <<<'
-            $body = $body.Trim()
-            if ([string]::IsNullOrWhiteSpace($body)) {
-                Remove-Item -LiteralPath $pp -Force -ErrorAction SilentlyContinue
-            } else {
-                Set-Content -LiteralPath $pp -Value $body -Encoding UTF8 -NoNewline
-            }
-        } catch {}
-    }
-
-    # 7. Fonts (Geist + Symbols-Only Nerd Font + matching HKCU reg entries)
-    & $_log (& $_lookupReap 'category_7' '[7/13] Fonts (Geist*, *NerdFont*, SymbolsOnly*) + HKCU font reg ...')
-    $fontDir = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Fonts'
-    $fontReg = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Fonts'
-    if (Test-Path -LiteralPath $fontDir) {
-        Get-ChildItem -LiteralPath $fontDir -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^(Geist|.*NerdFontMono|.*NerdFontPropo|.*NerdFont|SymbolsOnly|.*Symbols.*)' } |
-            ForEach-Object {
-                $fname = $_.Name
-                try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } catch {}
-                if (Test-Path -LiteralPath $fontReg) {
-                    $face = [System.IO.Path]::GetFileNameWithoutExtension($fname)
-                    foreach ($suffix in @(' (TrueType)',' (OpenType)')) {
-                        $regName = "$face$suffix"
-                        try { Remove-ItemProperty -LiteralPath $fontReg -Name $regName -ErrorAction SilentlyContinue } catch {}
-                    }
-                }
-            }
-    }
-
-    # 8. PATH env (HKCU + HKLM if admin) -- strip M:\MiOS\bin entries
-    & $_log (& $_lookupReap 'category_8' '[8/13] PATH env entries (M:\MiOS\bin from HKCU + HKLM) ...')
-    foreach ($scope in @('User','Machine')) {
-        try {
-            $cur = [Environment]::GetEnvironmentVariable('Path', $scope)
-            if (-not $cur) { continue }
-            $parts = $cur -split ';' | Where-Object {
-                $_ -and ($_ -notmatch '[Mm]:\\\\?MiOS\\\\bin') -and ($_ -notmatch '[Mm]:\\MiOS\\bin')
-            }
-            $new = ($parts -join ';')
-            if ($new -ne $cur) {
-                [Environment]::SetEnvironmentVariable('Path', $new, $scope)
-            }
-        } catch {}
-    }
-
-    # 9. HKCU uninstall reg key
-    & $_log (& $_lookupReap 'category_9' '[9/13] HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MiOS ...')
-    $uninstKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\MiOS'
-    if (Test-Path -LiteralPath $uninstKey) {
-        try { Remove-Item -LiteralPath $uninstKey -Recurse -Force -ErrorAction SilentlyContinue } catch {}
-    }
-
-    # 10. Start Menu folder + Desktop .lnk shortcuts (every legacy name)
-    & $_log (& $_lookupReap 'category_10' '[10/13] Start Menu folder + Desktop .lnk shortcuts ...')
-    $lnkNames = @(
-        'MiOS.lnk','MiOS-WIN.lnk','MiOS-DEV.lnk','MiOS Config.lnk','MiOS Help.lnk','Uninstall MiOS.lnk',
-        'MiOS Setup.lnk','Build MiOS.lnk','MiOS Configurator.lnk','MiOS Terminal.lnk',
-        'MiOS Dev Shell.lnk','MiOS Podman Shell.lnk','MiOS Build.lnk','MiOS Dashboard.lnk',
-        'MiOS Update.lnk','MiOS Pull.lnk'
-    )
-    $shortcutDirs = @(
-        [Environment]::GetFolderPath('Desktop'),
-        (Join-Path $env:USERPROFILE 'OneDrive\Desktop'),
-        'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\MiOS',
-        (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\MiOS')
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Sort-Object -Unique
-    # Desktop folders also collect Windows scratch artifacts like
-    # `.tmp.driveu...` from disk-shrink/format operations. These aren't
-    # MiOS-managed but they appear during the Initialize-DataDisk shrink
-    # and confuse the operator (they look like leftover MiOS junk).
-    # Reap any .tmp.* item from desktop dirs only (NOT Start Menu --
-    # those are the actual install targets for MiOS shortcuts).
-    foreach ($dir in $shortcutDirs) {
-        if ($dir -match 'Desktop$') {
-            try {
-                Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -like '.tmp.*' -or $_.Name -like '*.tmp.driveu*' } |
-                    ForEach-Object {
-                        try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
-                    }
-            } catch {}
-        }
-        foreach ($ln in $lnkNames) {
-            $lp = Join-Path $dir $ln
-            if (Test-Path -LiteralPath $lp) {
-                try { Remove-Item -LiteralPath $lp -Force -ErrorAction SilentlyContinue } catch {}
-            }
-        }
-        # Recursively remove MiOS\Linux Apps\ subfolder (Files / Web / VSCodium /
-        # Flatseal / Extension Manager / Ptyxis / System Monitor / Settings)
-        # created by Install-WindowsBranding's Linux Apps loop. Operator
-        # "uninstaller STILL doesn't uninstall everything from
-        # windows" -- the named-.lnk loop above left Linux Apps\ orphaned.
-        if ($dir -match 'Start Menu\\Programs\\MiOS$') {
-            $linuxAppsSub = Join-Path $dir 'Linux Apps'
-            if (Test-Path -LiteralPath $linuxAppsSub) {
-                try { Remove-Item -LiteralPath $linuxAppsSub -Recurse -Force -ErrorAction SilentlyContinue } catch {}
-            }
-        }
-        if ($dir -match 'Start Menu\\Programs\\MiOS$') {
-            if ((Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) {
-                try { Remove-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue } catch {}
-            }
-        }
-    }
-
-    # 11. AppUserModelID HKCU/HKLM registrations
-    & $_log (& $_lookupReap 'category_11' '[11/13] AppUserModelID (MiOS.Workstation) HKCU + HKLM ...')
-    foreach ($aumKey in @(
-        'HKCU:\Software\Classes\AppUserModelId\MiOS.Workstation',
-        'HKLM:\Software\Classes\AppUserModelId\MiOS.Workstation'
-    )) {
-        if (Test-Path -LiteralPath $aumKey) {
-            try { Remove-Item -LiteralPath $aumKey -Recurse -Force -ErrorAction SilentlyContinue } catch {}
-        }
-    }
-
-    # 12. podman-machine state symlinks (3 candidate paths)
-    & $_log (& $_lookupReap 'category_12' '[12/13] podman-machine state symlinks (LOCALAPPDATA / .local\\share / ProgramData) ...')
-    foreach ($pmLink in @(
-        (Join-Path $env:LOCALAPPDATA 'containers\podman\machine'),
-        (Join-Path $env:USERPROFILE  '.local\share\containers\podman\machine'),
-        'C:\ProgramData\containers\podman\machine'
-    )) {
-        if (Test-Path -LiteralPath $pmLink) {
-            try {
-                $item = Get-Item -LiteralPath $pmLink -Force -ErrorAction SilentlyContinue
-                if ($item -and ($item.LinkType -eq 'SymbolicLink' -or $item.LinkType -eq 'Junction' -or $item.Target)) {
-                    Remove-Item -LiteralPath $pmLink -Force -ErrorAction SilentlyContinue
-                } elseif ($item) {
-                    Remove-Item -LiteralPath $pmLink -Recurse -Force -ErrorAction SilentlyContinue
-                }
-            } catch {}
-        }
-    }
-
-    # 13. MIOS_*/MiOS_*/BTOP_CONFIG_DIR environment variables (HKCU + HKLM)
-    & $_log (& $_lookupReap 'category_13' '[13/17] MIOS_* + BTOP_CONFIG_DIR environment variables ...')
-    foreach ($scope in @('User','Machine')) {
-        try {
-            $envKey = if ($scope -eq 'User') { 'HKCU:\Environment' }
-                       else { 'HKLM:\System\CurrentControlSet\Control\Session Manager\Environment' }
-            if (Test-Path -LiteralPath $envKey) {
-                (Get-Item -LiteralPath $envKey).Property | Where-Object { $_ -match '^(MIOS_|MiOS_|BTOP_CONFIG_DIR$)' } |
-                    ForEach-Object { try { Remove-ItemProperty -LiteralPath $envKey -Name $_ -ErrorAction SilentlyContinue } catch {} }
-            }
-        } catch {}
-    }
-
-    # 14. HKCU\Run autostart + kill mios-gui-watch.ps1 daemon
-    & $_log '[14/17] HKCU\Run autostart entries + mios-gui-watch daemon + scheduled tasks ...'
-    foreach ($runVal in @('MiOS-GuiWatch','MiOS','MiOSGuiWatch','MiOS-Autostart')) {
-        try { Remove-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name $runVal -ErrorAction SilentlyContinue } catch {}
-    }
-    try {
-        Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -match 'mios-gui-watch' } |
-            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
-    } catch {}
-    try {
-        if (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue) {
-            Unregister-ScheduledTask -TaskName 'MiOS-Autostart' -Confirm:$false -ErrorAction SilentlyContinue
-        }
-    } catch {}
-    try {
-        $stagedAutostart = Join-Path $env:ProgramData 'MiOS\mios-autostart.ps1'
-        if (Test-Path $stagedAutostart) {
-            Remove-Item -Path $stagedAutostart -Force -ErrorAction SilentlyContinue
-        }
-    } catch {}
-
-    # 15. Windows Defender exclusions (paired with Add-MiosDefenderExclusions)
-    & $_log '[15/17] Windows Defender exclusions (paths + processes) ...'
-    try {
-        if (Get-Command Remove-MpPreference -ErrorAction SilentlyContinue) {
-            foreach ($excPath in @('M:\','M:\MiOS','M:\MiOS\bin','M:\MiOS\repo',(Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet'),$env:TEMP)) {
-                try { Remove-MpPreference -ExclusionPath $excPath -ErrorAction SilentlyContinue } catch {}
-            }
-            foreach ($excProc in @('pwsh.exe','wsl.exe','wslservice.exe','podman.exe','msrdc.exe')) {
-                try { Remove-MpPreference -ExclusionProcess $excProc -ErrorAction SilentlyContinue } catch {}
-            }
-        }
-    } catch {}
-
-    # 16a. Windows Firewall inbound rules with the "MiOS -" prefix.
-    # Paired with build-mios.ps1 :: Set-MiosLanFirewallRules. Sweep by
-    # DisplayName prefix so we never touch operator-authored rules.
-    & $_log '[16a/17] Windows Firewall rules (DisplayName "MiOS - *") ...'
-    try {
-        if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) {
-            Get-NetFirewallRule -DisplayName 'MiOS - *' -ErrorAction SilentlyContinue |
-                ForEach-Object {
-                    try { Remove-NetFirewallRule -InputObject $_ -ErrorAction SilentlyContinue } catch {}
-                }
-        }
-    } catch {}
-
-    # 16. WSL service host caches + any in-flight wslhost/msrdc procs
-    & $_log '[16/17] Killing in-flight wslhost / msrdc / mios-gui-watch host processes ...'
-    foreach ($pn in @('wslhost','msrdc','wsl','vmmemWSL')) {
-        try { Get-Process -Name $pn -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
-    }
-    try { & wsl.exe --shutdown 2>$null | Out-Null } catch {}
-
-    # 17. Prepare M:\ for a fresh MiOS tree. HISTORICALLY this FULL-formatted
-    # M:\ on the premise "MiOS owns this entire volume" -- true on a clean
-    # provision. But a MiOS-Xbox-provisioned host (this machine was the first
-    # MiOS-Xbox deployment) can later carry the ACTIVE Windows pagefile and
-    # Windows UUP staging on M:\ because C:\ is too small to hold them.
-    # Formatting there would strip the live pagefile with nowhere to recreate
-    # it (C:\ full) and destroy unrelated data. So: full-format ONLY when M:\
-    # is a DEDICATED MiOS volume (no pagefile, nothing but MiOS artifacts);
-    # otherwise surgically remove just the MiOS dirs and preserve the rest.
-    & $_log '[17/17] Preparing M:\ (format if dedicated MiOS volume, else clean MiOS dirs) ...'
-    try {
-        $mVol = Get-Volume -DriveLetter M -ErrorAction SilentlyContinue
-        if ($mVol -and $mVol.FileSystemLabel -match '^MIOS') {
-            # KEEP  = never delete (pagefile + system/volume metadata + genuine user data).
-            # PURGE = disposable junk cleared for a fresh MiOS state (Windows UUP staging).
-            # MIOS_DIRS = the FHS/repo/runtime tree MiOS itself lays down on M:\.
-            $_keep  = @('$RECYCLE.BIN','System Volume Information','pagefile.sys','swapfile.sys',
-                        'hiberfil.sys','DumpStack.log.tmp','SteamLibrary','winget','images','research','config')
-            $_purge = @('W10UIuup','MountUUP')
-            $_miosDirs = @('.devcontainer','.forgejo','.git','.github','automation','etc','MiOS',
-                           'podman','root','src','tests','tools','usr','var','powershell')
-            $_hasPagefile = [bool](Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue |
-                                   Where-Object { $_.Name -match '^M:' })
-            $_foreign = @(Get-ChildItem 'M:\' -Force -ErrorAction SilentlyContinue |
-                          Where-Object { $_keep -notcontains $_.Name -and $_purge -notcontains $_.Name -and $_miosDirs -notcontains $_.Name })
-            if (-not $_hasPagefile -and $_foreign.Count -eq 0) {
-                Format-Volume -DriveLetter M -FileSystem NTFS -NewFileSystemLabel 'MIOS-DEV' -Force -Confirm:$false -ErrorAction Stop | Out-Null
-                & $_log '  [+] M:\ reformatted (dedicated MiOS volume, NTFS, label MIOS-DEV, empty)'
-            } else {
-                $_why = if ($_hasPagefile) { 'active pagefile on M:\' } else { "non-MiOS data present ($(($_foreign.Name) -join ', '))" }
-                & $_log "  M:\ is a SHARED volume ($_why); preserving pagefile/user data -- clearing MiOS tree + UUP staging."
-                foreach ($_d in ($_miosDirs + $_purge)) {
-                    $_p = Join-Path 'M:\' $_d
-                    if (Test-Path -LiteralPath $_p) {
-                        try { Remove-Item -LiteralPath $_p -Recurse -Force -ErrorAction Stop; & $_log "    [removed] M:\$_d" }
-                        catch { & $_log "    [!] could not remove M:\$_d -- $($_.Exception.Message)" }
-                    }
-                }
-            }
-        } else {
-            & $_log '  M:\ not present or label != MIOS-DEV; skipping (safety guard)'
-        }
-    } catch {
-        & $_log ("  [!] M:\ prepare failed: " + $_.Exception.Message)
-    }
-
-    if (-not $Quiet) {
-        Write-Host "  $_msgComplete" -ForegroundColor Green
-        Write-Host ''
-    }
-    $ErrorActionPreference = $reapEAP
+    param([switch]$Quiet, [string]$CanonicalPath = (Get-MiosFieldCanonicalPath))
+    # Installation and failure recovery share the canonical preservation helper. Uninstall owns destruction.
+    $definitions = Get-MiosFieldCanonicalFunctions -Path $CanonicalPath
+    & {
+        param([scriptblock]$Definitions, [bool]$QuietFlag)
+        . $Definitions
+        Invoke-MiOSFullReap -Quiet:$QuietFlag
+    } $definitions ([bool]$Quiet)
 }
 
 function Initialize-DataDisk {
@@ -6259,32 +5855,11 @@ function Add-MiosDefenderExclusions {
 }
 try { Add-MiosDefenderExclusions } catch { Write-Host "  [!] Defender exclusion add failed (non-fatal, AMSI may still block): $($_.Exception.Message)" -ForegroundColor Yellow }
 
-# -- Pre-Phase-0: write .wslconfig BEFORE the very first wsl.exe call ---------
-# Mirrored networking + firewall=false are read by WSL2 when the
-# UTILITY VM starts. The utility VM starts on the FIRST wsl.exe
-# invocation anywhere in this run -- and Invoke-MiOSFullReap below
-# calls `wsl --unregister` + `wsl --shutdown` before anything else.
-# If .wslconfig isn't on disk by then, the utility VM that those reap
-# calls implicitly boot lands in legacy NAT mode and STAYS there until
-# the next time someone explicitly stops it. Symptom the operator hit
-# every container port (cockpit 8090, forge_http 8300,
-# open_webui 8033, hermes 8642, searxng 8899, llm-light 8450) timed out from
-# Windows even though `ss -tlnp` inside MiOS-DEV showed the binds, and
-# the host showed `vEthernet (WSL (Hyper-V firewall))` (NAT-only
-# adapter) instead of the IP-mirrored topology.
-# build-mios.ps1 Phase 3 still writes .wslconfig before podman-machine
-# init (belt-and-suspenders); this earlier write is what makes that
-# work even after the reap's wsl.exe calls.
-# Pre-Phase-0 .wslconfig writer -- TOML-first per AGENTS.md §3 / mios.toml
-# is THE singular SSOT for every operator-visible value. Resolve from the
-# layered overlay (~/.config > /etc > /usr/share); falls back to the
-# safe default (NAT + localhostForwarding) on a fresh host where mios.toml
-# isn't deployed yet. Mirrored mode opt-in: edit [wsl2].networking_mode
-# in mios.html, save, re-run irm|iex (read the [wsl2] comment block in
-# the vendor mios.toml for the prerequisites).
+# Resolve .wslconfig before the first WSL call. The canonical formatter enforces firewall=true,
+# preserves unmanaged settings and rejects duplicate/ambiguous WSL2 sections.
 $_netMode  = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'networking_mode'      -Default 'NAT')
 $_lhfwd    = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'localhost_forwarding' -Default 'true')
-$_fwall    = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'firewall'             -Default 'false')
+$_fwall    = Get-MiosTomlValue -Section 'wsl2' -Key 'firewall' -Default $true
 $_gui      = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'gui_applications'     -Default 'true')
 $_isMirror = ($_netMode -ieq 'mirrored')
 
@@ -6294,85 +5869,27 @@ $_wslCfgRaw = if (Test-Path $_wslCfg) { Get-Content $_wslCfg -Raw } else { "" }
 # Build the section body from TOML-resolved values.
 $_keyLines = New-Object System.Collections.Generic.List[string]
 $_keyLines.Add("networkingMode=$_netMode")
-if ($_isMirror) {
-    if ($_fwall -ieq 'true') { $_keyLines.Add('firewall=true') }
-} else {
+if (-not $_isMirror) {
     if ($_lhfwd -ieq 'true') { $_keyLines.Add('localhostForwarding=true') }
 }
 if ($_gui -ieq 'true') { $_keyLines.Add('guiApplications=true') }
 
-# Detect divergence: any required key missing or value mismatched.
-$_needWrite = $false
-foreach ($_kv in $_keyLines) {
-    $_pat = '^' + [regex]::Escape($_kv) + '\s*$'
-    if ($_wslCfgRaw -notmatch $_pat) { $_needWrite = $true; break }
-}
-if ($_needWrite) {
-    if ($_wslCfgRaw -notmatch "\[wsl2\]") {
-        $_baseline = @"
-
-[wsl2]
-# MiOS pre-Phase-0 minimum, generated from mios.toml [wsl2].* by
-# Get-MiOS.ps1 on every irm|iex. Edit values in mios.html, not here --
-# this block is regenerated.
-$($_keyLines -join "`r`n")
-"@
-        [System.IO.File]::WriteAllText($_wslCfg, $_baseline, (New-Object System.Text.UTF8Encoding($false)))
-    } else {
-        # [wsl2] section exists -- replace its keys with the TOML-resolved
-        # set. Strip ALL legacy networking keys (networkingMode,
-        # localhostForwarding, firewall) so a prior mode doesn't survive.
-        $_lines = Get-Content $_wslCfg
-        $_in    = $false
-        $_out   = [System.Collections.Generic.List[string]]::new()
-        $_added = $false
-        foreach ($_l in $_lines) {
-            if ($_l -match '^\[wsl2\]') {
-                $_in = $true; $_out.Add($_l)
-                if (-not $_added) { foreach ($_kv in $_keyLines) { $_out.Add($_kv) }; $_added = $true }
-                continue
-            } elseif ($_l -match '^\[') { $_in = $false }
-            if ($_in -and $_l -match '^(networkingMode|localhostForwarding|firewall|guiApplications)\s*=') { continue }
-            $_out.Add($_l)
-        }
-        [System.IO.File]::WriteAllLines($_wslCfg, $_out, (New-Object System.Text.UTF8Encoding($false)))
-    }
-    Write-Host "  [+] .wslconfig: $_netMode mode written from mios.toml [wsl2].* (pre-Phase-0)" -ForegroundColor Green
+$_wslCfgNext = Get-MiosFieldWslConfigText -Existing $_wslCfgRaw -ManagedLines $_keyLines.ToArray() -Firewall ([bool]$_fwall)
+if ($_wslCfgNext -cne $_wslCfgRaw) {
+    [IO.File]::WriteAllText($_wslCfg, $_wslCfgNext, (New-Object Text.UTF8Encoding($false)))
+    Write-Host "  [+] .wslconfig: $_netMode mode with required firewall policy written from mios.toml." -ForegroundColor Green
     & wsl.exe --shutdown 2>$null | Out-Null
 }
 
-# -- Phase 0: Reap ALL prior MiOS state BEFORE anything else -----------------
-# Per feedback_mios_entry_full_reset memory: "every irm|iex must reap ALL
-# prior MiOS state... No partial state; no carry-over." AND operator
-# "If the uninstaller actually uninstalled things automatically
-# every time; I wouldn't have to Manually uninstall anything EVERY TIME it
-# fails!!!!". Runs UNCONDITIONALLY on every irm|iex invocation -- even if
-# nothing prior is installed (idempotent no-op).
-try { Invoke-MiOSFullReap } catch { Write-Host "  [!] Invoke-MiOSFullReap failed: $($_.Exception.Message)" -ForegroundColor Yellow }
-
-# -- Failure-trap auto-reap --------------------------------------------------
-# Operator contract "If the uninstaller actually uninstalled
-# things automatically every time; I wouldn't have to Manually uninstall
-# anything EVERY TIME it fails!!!!". Phase 0 reap above already handled the
-# "next irm|iex starts clean" case. This trap handles the "current install
-# fails mid-way" case -- terminating errors here trigger a final reap so
-# Windows is left in zero-state immediately on failure (operator never sees
-# half-broken state). Runs in addition to (not replacing) Phase 0.
-#
-# SSOT: every operator-visible string resolves through mios.toml
-# [messages.failure_trap].* with the hardcoded fallback as Default.
+# Compatibility preparation preserves prior state. Any later terminating error does the same.
+Invoke-MiOSFullReap
 $_trapFmtFailed = Get-MiosTomlValue -Section 'messages.failure_trap' -Key 'install_failed_template' -Default '[!!] Install failed: {0}'
-$_trapAutoReap  = Get-MiosTomlValue -Section 'messages.failure_trap' -Key 'auto_reaping' -Default '[*]  Auto-reaping all MiOS state to leave Windows zero-state...'
-$_trapReapDone  = Get-MiosTomlValue -Section 'messages.failure_trap' -Key 'reap_complete' -Default '[+]  Reap complete -- re-run irm|iex one-liner to retry from clean state.'
-$_trapReapFail  = Get-MiosTomlValue -Section 'messages.failure_trap' -Key 'reap_on_failure_failed_template' -Default '[!] Reap-on-failure also failed: {0}'
 trap {
     Write-Host ''
     Write-Host ('  ' + ($_trapFmtFailed -f $_.Exception.Message)) -ForegroundColor Red
-    Write-Host "  $_trapAutoReap" -ForegroundColor Yellow
     try { Invoke-MiOSFullReap } catch {
-        Write-Host ('  ' + ($_trapReapFail -f $_.Exception.Message)) -ForegroundColor Yellow
+        Write-Host '  [!] Canonical preservation helper unavailable; no cleanup was attempted.' -ForegroundColor Yellow
     }
-    Write-Host "  $_trapReapDone" -ForegroundColor Green
     Write-Host ''
     exit 1
 }
@@ -6477,70 +5994,13 @@ Write-Host ''
 Write-Host "  $_msgStep06" -ForegroundColor Cyan
 try { Ensure-MiOSWinget | Out-Null } catch { Write-Host "  [!] Ensure-MiOSWinget failed: $($_.Exception.Message)" -ForegroundColor Yellow }
 
-# Hyper-V Firewall must allow inbound to the WSL VM. By default the WSL
-# VM Creator GUID {40E0AC32-46A5-438A-A0B2-2B479E8F2E90} is
-# NotConfigured, which inherits a deny-all-inbound policy and silently
-# drops every Windows-host -> WSL service request -- even when WSL2
-# native localhostForwarding, the in-distro firewalld, AND the netsh
-# portproxy are all open. Operator-confirmed with this
-# setting NotConfigured, every browser hit on http://localhost:PORT/
-# returned 000 across the entire MiOS stack. Setting it to Allow +
-# Enabled is what unblocks the inbound path.
-try {
-    $_hvWslGuid = '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}'
-    if (Get-Command Set-NetFirewallHyperVVMSetting -ErrorAction SilentlyContinue) {
-        Set-NetFirewallHyperVVMSetting -Name $_hvWslGuid `
-            -Enabled True `
-            -DefaultInboundAction Allow `
-            -DefaultOutboundAction Allow `
-            -LoopbackEnabled True `
-            -AllowHostPolicyMerge True `
-            -ErrorAction Stop
-        Write-Host '  [+] Hyper-V Firewall: WSL VM creator set to Allow + LoopbackEnabled.' -ForegroundColor Green
-    } else {
-        Write-Host '  [!] Set-NetFirewallHyperVVMSetting cmdlet missing -- Windows < 11 22H2? Hyper-V firewall step skipped.' -ForegroundColor Yellow
-    }
-} catch {
-    Write-Host "  [!] Hyper-V Firewall config failed: $($_.Exception.Message)" -ForegroundColor Yellow
+# The shared gate enables required features first and applies the canonical scoped inbound Block policy
+# only when they are active. Its errors are terminal; a pending restart cannot reach the dev VM.
+$_featResult = Invoke-MiosFieldPlatformGate
+Complete-MiosFieldPlatformGate -Result $_featResult
+if (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName 'MiOS-Resume-Bootstrap' -Confirm:$false -ErrorAction SilentlyContinue
 }
-try {
-    # Capture into [pscustomobject] -- if the function leaks ANY pipeline
-    # output (shouldn't, post-.Add refactor), grab the LAST
-    # value (the explicit return) so the structured-result check can't be
-    # confused by stray strings/objects upstream of the return statement.
-    $_featOut = @(Enable-MiOSWindowsFeatures)
-    $_featResult = $_featOut | Where-Object { $_ -is [pscustomobject] -and $_.PSObject.Properties['HaltRequested'] } | Select-Object -Last 1
-    if ($_featResult -and $_featResult.HaltRequested) {
-        # WSL/VirtualMachinePlatform were just enabled and need a reboot. Rather
-        # than making the operator re-paste the one-liner (the factory-fresh
-        # friction point), arm a run-once ELEVATED scheduled task that re-runs
-        # the one-liner AUTOMATICALLY at the next logon, then halt cleanly so the
-        # WSL/podman/build steps don't cascade-fail on a not-yet-rebooted host.
-        try {
-            $_resumeUrl = [string](Get-MiosTomlValue -Section 'bootstrap' -Key 'oneliner_url' -Default 'https://raw.githubusercontent.com/mios-dev/mios-bootstrap/main/Get-MiOS.ps1')
-            $_ps        = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            $_resumeArg = "-NoProfile -ExecutionPolicy Bypass -Command `"irm '$_resumeUrl' | iex`""
-            $_act  = New-ScheduledTaskAction -Execute $_ps -Argument $_resumeArg
-            $_trg  = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-            $_prin = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
-            $_set  = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-            Register-ScheduledTask -TaskName 'MiOS-Resume-Bootstrap' -Action $_act -Trigger $_trg -Principal $_prin -Settings $_set -Force | Out-Null
-            Write-Host '  [+] Auto-resume armed: MiOS continues automatically after you reboot and' -ForegroundColor Green
-            Write-Host '      sign back in -- no need to re-paste the one-liner.' -ForegroundColor Green
-        } catch {
-            Write-Host "  [!] Could not arm auto-resume ($($_.Exception.Message)); after reboot re-run" -ForegroundColor Yellow
-            Write-Host '      the irm|iex one-liner manually to continue.' -ForegroundColor Yellow
-        }
-        Write-Host '  [*] Halting to await reboot (WSL/VirtualMachinePlatform just enabled).' -ForegroundColor Cyan
-        exit 0
-    } else {
-        # Features already present (first run had them, OR this IS the post-reboot
-        # resume) -- clear any leftover auto-resume task so it fires exactly once.
-        if (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue) {
-            Unregister-ScheduledTask -TaskName 'MiOS-Resume-Bootstrap' -Confirm:$false -ErrorAction SilentlyContinue
-        }
-    }
-} catch { Write-Host "  [!] Enable-MiOSWindowsFeatures failed: $($_.Exception.Message)" -ForegroundColor Yellow }
 
 if ($true) {
     $isAdmin = $_isAdmin
@@ -6921,25 +6381,8 @@ Write-Good "Prerequisites OK (git, podman)"
 # AFTER winget has already created the dirs, we'd need to move the
 # contents over -- doable but racy. Idempotent: re-runs are no-ops if
 # the symlinks already point at M:\.
-# NOTE: Phase 0 above (Invoke-MiOSFullReap, called BEFORE Initialize-
-# DataDisk on every irm|iex run) has already nuked every prior MiOS
-# artifact on this machine: WSL distros, podman machines, Hyper-V VMs,
-# install dirs (%PROGRAMDATA%\MiOS / %LOCALAPPDATA%\MiOS / %APPDATA%\MiOS),
-# M:\ contents, WT MiOS scheme + profiles, Start Menu folder + Desktop
-# .lnks, HKCU uninstall reg key, AppUserModelID regs, podman-machine
-# state symlinks, MIOS_* env vars, fonts, PATH entries, MiOS Firewall
-# rules.
-#
-# C:\MiOS + C:\mios-bootstrap are NEVER touched: both are operator-
-# owned dev working trees of mios.git / mios-bootstrap.git (per the
-# feedback_mios_no_c_drive_fallback memory). End consumers never have
-# these dirs; reaping them only ever destroys operator dev work.
-# Operator-flagged after C:\MiOS got nuked.
-#
-# Per feedback_mios_entry_full_reset memory +
-# "every irm|iex must reap ALL prior MiOS state... No partial state;
-# no carry-over." M:\ is the MiOS-owned 256 GB partition; the reap
-# clears that + the AppData caches but never the dev-tree C:\ paths.
+# Platform admission and error recovery preserve existing distributions, source and persistent state.
+# Destructive cleanup belongs to the explicit uninstall surface.
 
 # Step 0 above (before Pass-1) ALREADY provisioned M:\ + symlinked
 # podman-machine + winget package storage onto M:\. Pass-1's winget
@@ -6954,21 +6397,8 @@ Write-Good "Prerequisites OK (git, podman)"
 $miosRepoDir = "M:\MiOS\repo"
 New-Item -ItemType Directory -Path $miosRepoDir -Force -ErrorAction SilentlyContinue | Out-Null
 
-# 5. Fresh-clone the mios-bootstrap repo to M:\MiOS\repo\mios-bootstrap.
-#
-# CONTRACT (per feedback_mios_irm_iex_always_temp_clone.md +
-# feedback_mios_entry_m_drive_clone.md): irm|iex ALWAYS clones a
-# fresh copy. There is NO update / fetch / pull branch. The clone
-# target is M:\MiOS\repo\mios-bootstrap (the canonical Windows-entry
-# working tree), NOT %TEMP% or %USERPROFILE%.
-#
-# Since the full reset above already wiped M:\MiOS, $RepoDir won't
-# exist when we get here -- no Remove-Item dance needed. (Operator
-# overrides with -RepoDir <other-path> still get the safety check.)
-if ((Test-Path $RepoDir) -and ($RepoDir -ne 'M:\MiOS\repo\mios-bootstrap')) {
-    Write-Err "-RepoDir $RepoDir already exists. Either delete it manually, or re-run without -RepoDir to use the canonical M:\MiOS\repo\mios-bootstrap."
-    exit 1
-}
+# 5. Refresh the selected bootstrap checkout without discarding local work.
+# Existing dirty/staged/untracked/diverged trees stay in place; ignored collisions fail closed.
 
 # Helper: run git with all streams drained via System.Diagnostics.Process
 # so PowerShell's pipeline never sees stderr (no EAP=Stop trap on git's
@@ -7007,83 +6437,7 @@ function Invoke-GitProc {
     }
 }
 
-# If $RepoDir already exists with a .git subdir from a prior run, do an
-# in-place fetch + reset --hard to bring it to origin/main. NEVER delete
-# operator-side files (per feedback_mios_entry_full_reset.md). If it
-# exists but isn't a git repo, fail with an actionable message rather
-# than silently nuking it.
-if (Test-Path $RepoDir) {
-    if (Test-Path (Join-Path $RepoDir '.git')) {
-        Write-Info "Updating existing bootstrap clone at $RepoDir (fetch + hard reset to origin/$Branch) ..."
-        $fr = Invoke-GitProc -ArgList @('fetch','--depth=1','origin',$Branch) -Cwd $RepoDir
-        if ($fr.ExitCode -ne 0) {
-            Write-Warning "git fetch in $RepoDir failed (exit $($fr.ExitCode)). Network may be unreachable."
-            Write-Warning "Using existing staged offline clone at $RepoDir without updating."
-        } else {
-            $rr = Invoke-GitProc -ArgList @('reset','--hard','FETCH_HEAD') -Cwd $RepoDir
-            if ($rr.ExitCode -ne 0) {
-                Write-Err "git reset --hard in $RepoDir failed (exit $($rr.ExitCode))."
-                Write-Err "Stderr: $($rr.Stderr.Trim())"
-                exit 1
-            }
-            Write-Good "Bootstrap clone updated to origin/$Branch in place at $RepoDir"
-        }
-    } elseif (@(Get-ChildItem -LiteralPath $RepoDir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
-        # Exists but EMPTY: a prior uninstall emptied it, yet a lingering WSL2 /
-        # minifilter handle can leave the now-empty dir undeletable (rmdir ->
-        # "device or resource busy", no Restart-Manager holder). git clone into
-        # an existing EMPTY dir succeeds, so don't abort the whole install over
-        # an empty leftover -- clone in place.
-        Write-Info "$RepoDir exists but is empty (undeletable leftover) -- cloning $RepoUrl into it in place ..."
-        $cr = $null
-        for ($_cattempt = 1; $_cattempt -le 3; $_cattempt++) {
-            $cr = Invoke-GitProc -ArgList @('clone','--branch',$Branch,'--depth','1',$RepoUrl,$RepoDir)
-            if ($cr.ExitCode -eq 0) { break }
-            if ($_cattempt -lt 3) { Start-Sleep -Seconds @(2,5,10)[$_cattempt-1] }
-        }
-        if ($cr.ExitCode -ne 0) {
-            Write-Err "git clone into empty $RepoDir failed (exit $($cr.ExitCode)). Stderr: $($cr.Stderr.Trim())"
-            exit 1
-        }
-        Write-Good "Fresh bootstrap clone into empty $RepoDir"
-    } else {
-        Write-Err "$RepoDir exists, is not a git repository, and is NOT empty."
-        Write-Err "I won't delete it -- contents may be operator-managed. Either:"
-        Write-Err "  - Move it aside:   Rename-Item `"$RepoDir`" `"$RepoDir.bak`""
-        Write-Err "  - Or pass -RepoDir <other-path> to use a different target."
-        exit 1
-    }
-} else {
-    Write-Info "Cloning $RepoUrl ($Branch, depth=1) -> $RepoDir ..."
-    # Ensure parent dir exists so git clone has a place to write.
-    $parent = Split-Path $RepoDir -Parent
-    if ($parent -and -not (Test-Path $parent)) {
-        New-Item -ItemType Directory -Path $parent -Force -ErrorAction SilentlyContinue | Out-Null
-    }
-    # Install-robustness retry the clone 3x with backoff. A single
-    # transient network blip (raw.githubusercontent / GitHub TLS reset) otherwise
-    # aborted the ENTIRE irm|iex install at the entry. Each retry wipes the partial
-    # clone so it starts clean.
-    $cr = $null
-    for ($_cattempt = 1; $_cattempt -le 3; $_cattempt++) {
-        if (Test-Path $RepoDir) { Remove-Item -Recurse -Force $RepoDir -ErrorAction SilentlyContinue }
-        $cr = Invoke-GitProc -ArgList @('clone','--branch',$Branch,'--depth','1',$RepoUrl,$RepoDir)
-        if ($cr.ExitCode -eq 0) { break }
-        if ($_cattempt -lt 3) {
-            $_cbk = @(2,5,10)[$_cattempt-1]
-            Write-Info "git clone attempt $_cattempt failed (exit $($cr.ExitCode)); retrying in ${_cbk}s (transient network?)..."
-            Start-Sleep -Seconds $_cbk
-        }
-    }
-    if ($cr.ExitCode -ne 0) {
-        Write-Err "git clone $RepoUrl -> $RepoDir failed after 3 attempts (exit $($cr.ExitCode))."
-        Write-Err "Stderr: $($cr.Stderr.Trim())"
-        Write-Err "Re-run manually to see git's diagnostic output:"
-        Write-Err "  git clone --branch $Branch --depth 1 $RepoUrl `"$RepoDir`""
-        exit 1
-    }
-    Write-Good "Fresh bootstrap clone at $RepoDir"
-}
+Initialize-MiosFieldSourceCheckout -Path $RepoDir -RepoUrl $RepoUrl -Ref $Branch
 
 # 6. Hand off to bootstrap.ps1 (canonical split-bootstrap entry).
 # Defaults to -BootstrapOnly: stops after dev VM + Windows install.

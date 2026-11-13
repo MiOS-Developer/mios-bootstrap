@@ -4,7 +4,12 @@ param([switch]$PlantDefect, [switch]$WindowsAcl)
 if ($PlantDefect -and $WindowsAcl) { throw 'Run source plants and Windows ACL fixtures separately.' }
 $ErrorActionPreference = 'Stop'
 $sourcePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Get-MiOS.ps1'
-$source = [IO.File]::ReadAllText($sourcePath)
+function ConvertTo-MiosFixtureSource {
+    param([Parameter(Mandatory)][string]$Text)
+    return $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+}
+# Git blobs use LF; Windows checkouts may use CRLF. Mutation anchors use the same canonical LF form.
+$source = ConvertTo-MiosFixtureSource ([IO.File]::ReadAllText($sourcePath))
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('mios-context-fixture-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $scratch | Out-Null
 $script:checks = 0
@@ -274,12 +279,22 @@ try {
     } else {
         $plants = @(
             @{ Name = 'shared package redirect reintroduced'; From = '$script:MiosMachineOrigin = $Context'; To = '$script:MiosMachineOrigin = $Context; Set-WingetStorageOnM'; Expected = 'actual ready machine dispatch performs zero profile or shared package redirects' },
-            @{ Name = 'pending exit removed'; From = "            exit 0`r`n        }`r`n        default { throw 'Machine preparation did not report ready"; To = "            # exit removed`r`n        }`r`n        default { throw 'Machine preparation did not report ready"; Expected = 'actual pending dispatch halts before downstream bootstrap' },
+            @{ Name = 'pending exit removed'; From = "            exit 0`n        }`n        default { throw 'Machine preparation did not report ready"; To = "            # exit removed`n        }`n        default { throw 'Machine preparation did not report ready"; Expected = 'actual pending dispatch halts before downstream bootstrap' },
             @{ Name = 'origin profile comparison removed'; From = 'if (-not $registered -or '; To = 'if ($false -and '; Expected = 'reject mismatched origin Profile' },
             @{ Name = 'origin config comparison removed'; From = 'if ([string]$Context.ConfigPath -ine '; To = 'if ($false -and '; Expected = 'reject mismatched origin ConfigPath' },
             @{ Name = 'credential guard removed'; From = 'if ((ConvertTo-MiosCredentialFreeToml ([string]$request.OperatorToml)) -cne [string]$request.OperatorToml)'; To = 'if ($false)'; Expected = 'reject credentials before machine dispatch' },
             @{ Name = 'resume uses admin'; From = '-UserId $Context.Sid -LogonType Interactive -RunLevel Limited'; To = '-UserId $env:USERNAME -LogonType Interactive -RunLevel Highest'; Expected = 'actual resume registration targets the operator with a limited interactive token' }
         )
+        # Exercise the actual canonicalizer against both transport/check-out forms before any mutation.
+        foreach ($variant in @($source, $source.Replace("`n", "`r`n"))) {
+            $canonical = ConvertTo-MiosFixtureSource $variant
+            foreach ($plant in $plants) {
+                if ($plant.From.Contains("`r") -or $plant.To.Contains("`r") -or -not $canonical.Contains($plant.From)) {
+                    throw ('Line-ending portability guard failed for defect anchor: ' + $plant.Name)
+                }
+            }
+        }
+        Write-Host 'OPERATOR_CONTEXT_SOURCE_NEWLINE_GUARD PASS'
         $caught = 0
         foreach ($plant in $plants) {
             if (-not $source.Contains($plant.From)) { throw ('Missing defect anchor: ' + $plant.Name) }

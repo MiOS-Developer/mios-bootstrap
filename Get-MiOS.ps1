@@ -1654,12 +1654,15 @@ function Invoke-MiosMachinePreparation {
     try {
         New-Item -ItemType File -Path $workerPath -ErrorAction Stop | Out-Null
         Set-MiosPrivateUserTomlAcl $workerPath
-        [IO.File]::WriteAllText($workerPath, (Get-MiosMachineWorkerScript $Script:MiosEntrySource), (New-Object Text.UTF8Encoding($true)))
+        $workerEncoding = New-Object Text.UTF8Encoding($true)
+        [byte[]]$workerBytes = $workerEncoding.GetPreamble() + $workerEncoding.GetBytes((Get-MiosMachineWorkerScript $Script:MiosEntrySource))
+        $workerSha = [Security.Cryptography.SHA256]::Create()
+        try { $digest = [BitConverter]::ToString($workerSha.ComputeHash($workerBytes)).Replace('-', '') } finally { $workerSha.Dispose() }
+        [IO.File]::WriteAllBytes($workerPath, $workerBytes)
         Initialize-MiosPipePeerApi
         $connected = $pipe.BeginWaitForConnection($null, $null)
         # UAC receives a verifier and a digest, never an unverified -File invocation.
         # Read once, hash those exact bytes, then parse those same bytes; later disk changes cannot affect this run.
-        $digest = (Get-FileHash -LiteralPath $workerPath -Algorithm SHA256 -ErrorAction Stop).Hash
         $quotedPath = $workerPath.Replace("'", "''")
         $launch = @"
 `$ErrorActionPreference = 'Stop'

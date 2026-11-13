@@ -110,7 +110,7 @@ function Run-Checks([string]$Text) {
     Check (@($workerFunctions | Where-Object { $_.Name -in @('Install-MiOSTerminalProfile', 'Install-MiOSPowerShellProfile', 'Complete-MiosMachinePreparation', 'Invoke-MiosMachinePreparation') }).Count -eq 0) 'the elevated worker excludes operator setup and generic dispatch'
     Check (-not $workerText.Contains('OPERATOR-PRIVATE-SENTINEL') -and -not $workerText.Contains('ADMIN-PRIVATE-SENTINEL')) 'generated worker source contains no profile credentials'
     Check ($Text.Contains('GetNamedPipeServerProcessId') -and $Text.Contains('GetNamedPipeClientProcessId') -and $Text.Contains('$peer -ne $worker.Id')) 'both pipe peer processes are checked'
-    Check ($Text.Contains('if (`$actual -cne ''$digest'') { throw') -and $Text.Contains('[scriptblock]::Create(`$source)')) 'UAC verifies the exact worker bytes before parsing them'
+    Check ($Text.Contains('if (`$actual -cne ''$digest'') { throw') -and $Text.Contains('[scriptblock]::Create(`$source)') -and $Text.Contains('$workerSha.ComputeHash($workerBytes)') -and -not $Text.Contains('Get-FileHash -LiteralPath $workerPath')) 'UAC verifies the exact worker bytes before parsing them'
     $commands = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] }, $true))
     $completionCalls = @($commands | Where-Object { $_.GetCommandName() -eq 'Complete-MiosMachinePreparation' })
     $handoff = @($commands | Where-Object { $_.CommandElements[0].Extent.Text -eq '$entry' })

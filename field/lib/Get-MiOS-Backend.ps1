@@ -104,21 +104,73 @@ Disable-ConsoleQuickEdit
 # mios-bootstrap repo isn't cloned yet -- the Default bootstrap clones it, but these actions run
 # FIRST (this router precedes the bootstrap). Fetch it here (git if present, else a GitHub zip)
 # so a factory Windows can go straight from the web one-liner to a build/flash with no manual clone.
+function Get-MiosFieldSourceParent {
+    param([Parameter(Mandatory)][string]$Destination)
+    $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $full = [IO.Path]::GetFullPath($Destination)
+    $target = $full.TrimEnd($separators)
+    if ($target -eq [IO.Path]::GetPathRoot($full).TrimEnd($separators)) { throw 'A Field source target must be a new directory below an existing parent.' }
+    $parent = [IO.Directory]::GetParent($target)
+    if (-not $parent) { throw 'The Field source target has no publication parent.' }
+    # Walk lexical ancestors: a junction/symlink may redirect a sibling onto another volume or tree.
+    $ancestor = $parent
+    while ($ancestor) {
+        $item = Get-Item -LiteralPath $ancestor.FullName -Force -ErrorAction Stop
+        if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'Field source publication refuses a reparse point or non-directory in its parent chain.'
+        }
+        $ancestor = $ancestor.Parent
+    }
+    return $parent.FullName
+}
+
+function Protect-MiosFieldSourceStaging {
+    param([Parameter(Mandatory)][string]$Path)
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.SetOwner($sid)
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+    $acl.AddAccessRule($rule)
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+    $actual = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $owner = $actual.GetOwner([Security.Principal.SecurityIdentifier])
+    $rules = @($actual.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $control = [Security.AccessControl.FileSystemRights]::FullControl
+    if (-not $actual.AreAccessRulesProtected -or $owner.Value -ne $sid.Value -or $rules.Count -ne 1 -or
+        $rules[0].IdentityReference.Value -ne $sid.Value -or [string]$rules[0].AccessControlType -ne 'Allow' -or
+        ($rules[0].FileSystemRights -band $control) -ne $control -or $rules[0].InheritanceFlags -ne $inheritance -or
+        [string]$rules[0].PropagationFlags -ne 'None') {
+        throw 'Field source staging did not read back a private owner-only ACL; acquisition stopped.'
+    }
+}
+
+function Remove-MiosFieldPrivateSourceStaging {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ExpectedParent)
+    try {
+        if ([IO.Path]::GetFileName($Path) -notmatch '^\.mios-field-source-[a-f0-9]{32}$' -or
+            (Get-MiosFieldSourceParent -Destination $Path) -cne $ExpectedParent) { throw 'Staging ownership path changed.' }
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Staging became a link.' }
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+    } catch {
+        Write-Host '  [!] Private Field staging was retained because safe cleanup could not be established.' -ForegroundColor Yellow
+    }
+}
+
 function New-MiosFieldPrivateSourceStaging {
-    $path = Join-Path ([IO.Path]::GetTempPath()) ('mios-field-source-' + [guid]::NewGuid().ToString('N'))
+    param([Parameter(Mandatory)][string]$Destination)
+    $parent = Get-MiosFieldSourceParent -Destination $Destination
+    # A sibling shares the publication volume even when TEMP is redirected to another disk.
+    $path = Join-Path $parent ('.mios-field-source-' + [guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $path -ErrorAction Stop
     try {
-        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-        $acl = New-Object Security.AccessControl.DirectorySecurity
-        $acl.SetAccessRuleProtection($true, $false)
-        $acl.SetOwner($sid)
-        $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-        $acl.AddAccessRule($rule)
-        Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction Stop
+        Protect-MiosFieldSourceStaging -Path $path
         return $path
     } catch {
-        # This directory was created by this invocation and has never held operator data.
-        Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+        # Only the invocation's private sibling is eligible for cleanup; changed ancestry is preserved.
+        Remove-MiosFieldPrivateSourceStaging -Path $path -ExpectedParent $parent
         throw
     }
 }
@@ -180,10 +232,18 @@ function Expand-MiosFieldSourceArchive {
 
 function Ensure-MiosBootstrapRepo {
     param([string]$Root = 'C:\mios-bootstrap')
-    if (Test-Path -LiteralPath (Join-Path $Root 'field\autounattend\Build-MiOSXboxISO.ps1')) { return $Root }
-    if ((Test-Path -LiteralPath $Root) -and
-        (-not (Test-Path -LiteralPath $Root -PathType Container) -or @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction Stop).Count)) {
-        throw 'The Field source directory contains an incomplete or existing tree; it was preserved. Select a separate complete checkout.'
+    $Root = [IO.Path]::GetFullPath($Root)
+    $destinationParent = Get-MiosFieldSourceParent -Destination $Root
+    $rootErrors = @()
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction SilentlyContinue -ErrorVariable rootErrors
+    if ($rootErrors.Count -and [string]$rootErrors[0].CategoryInfo.Category -ne 'ObjectNotFound') {
+        throw 'The Field source target cannot be inspected safely; acquisition stopped.'
+    }
+    if ($rootItem) {
+        if ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'An existing Field source target link is preserved; choose a separate source directory.' }
+        if (Test-Path -LiteralPath (Join-Path $Root 'field\autounattend\Build-MiOSXboxISO.ps1') -PathType Leaf) { return $Root }
+        # An empty directory may be populated concurrently. Never remove it to permit publication.
+        throw 'The Field source directory contains an incomplete or existing tree, including an empty target; it was preserved. Select a separate complete checkout.'
     }
     Write-Host '  [*] Fetching a new bootstrap checkout for this action...' -ForegroundColor Cyan
     if (Get-Command git -ErrorAction SilentlyContinue) {
@@ -193,7 +253,7 @@ function Ensure-MiosBootstrapRepo {
     if (Test-Path -LiteralPath $Root) {
         throw 'The Field clone did not complete; its target was preserved. Review it or choose a new source path before retrying.'
     }
-    $staging = New-MiosFieldPrivateSourceStaging
+    $staging = New-MiosFieldPrivateSourceStaging -Destination $Root
     try {
         $archive = Join-Path $staging 'source.zip'
         $expanded = Join-Path $staging 'expanded'
@@ -205,11 +265,12 @@ function Ensure-MiosBootstrapRepo {
             -not (Test-Path -LiteralPath (Join-Path $roots[0].FullName 'field\autounattend\Build-MiOSXboxISO.ps1') -PathType Leaf)) {
             throw 'The Field source archive does not contain a complete bootstrap checkout.'
         }
-        # Directory.Move refuses an existing destination, including a checkout created during download.
+        if ((Get-MiosFieldSourceParent -Destination $Root) -cne $destinationParent) { throw 'The Field source publication parent changed; acquisition stopped.' }
+        # The sibling rename is on one volume and refuses a destination created during download.
         [IO.Directory]::Move($roots[0].FullName, [IO.Path]::GetFullPath($Root))
     } finally {
-        # Only private staging created by this invocation is removed; source targets are never deleted.
-        Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+        # Only private staging with unchanged safe ancestry is removed; source targets are never deleted.
+        Remove-MiosFieldPrivateSourceStaging -Path $staging -ExpectedParent $destinationParent
     }
     return $Root
 }

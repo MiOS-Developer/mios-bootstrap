@@ -65,7 +65,57 @@ function Write-Archive([string]$Name, [string]$EntryName, [int]$UnixType = 0) {
     } finally { $archive.Dispose(); $stream.Dispose() }
     return $path
 }
-function Invoke-ArchiveFixtures([string]$EnsureSource) {
+function Invoke-StagingFixtures([string]$StagingSource) {
+    $caseRoot = Join-Path $scratch ('staging-' + [guid]::NewGuid().ToString('N'))
+    $parent = Join-Path $caseRoot 'destination-parent'
+    $temporary = Join-Path $caseRoot 'redirected-temp'
+    $null = New-Item -ItemType Directory -Path $parent -Force
+    $null = New-Item -ItemType Directory -Path $temporary
+    & {
+        param($Program, $ParentPath, $TemporaryPath)
+        . ([scriptblock]::Create($Program))
+        $script:stagingAclPath = ''; $script:stagingAclReject = $false
+        # Only the Windows ACL API is mocked; path selection and directory creation are real.
+        function Protect-MiosFieldSourceStaging {
+            param([string]$Path)
+            $script:stagingAclPath = $Path
+            if ($script:stagingAclReject) { throw 'Fixture ACL installation/readback refused.' }
+        }
+        $savedTemp = @{}
+        foreach ($name in @('TEMP', 'TMP', 'TMPDIR')) {
+            $savedTemp[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+            [Environment]::SetEnvironmentVariable($name, $TemporaryPath, 'Process')
+        }
+        $stage = ''
+        try {
+            $target = Join-Path $ParentPath 'checkout'
+            $stage = New-MiosFieldPrivateSourceStaging -Destination $target
+            Check ([IO.Directory]::GetParent($stage).FullName -ceq [IO.Path]::GetFullPath($ParentPath) -and
+                [IO.Path]::GetPathRoot($stage) -ceq [IO.Path]::GetPathRoot($target) -and
+                $script:stagingAclPath -ceq $stage -and (Test-Path -LiteralPath $stage -PathType Container)) 'private staging is created beside the destination despite redirected TEMP'
+            Remove-MiosFieldPrivateSourceStaging -Path $stage -ExpectedParent ([IO.Directory]::GetParent($stage).FullName)
+            $stage = ''
+            $script:stagingAclReject = $true
+            $message = ''
+            try { $null = New-MiosFieldPrivateSourceStaging -Destination $target } catch { $message = $_.Exception.Message }
+            Check ($message -match 'ACL installation/readback refused' -and
+                -not (Test-Path -LiteralPath $script:stagingAclPath) -and -not (Test-Path -LiteralPath $target)) 'failed private ACL installation stops acquisition without a fallback staging directory'
+        } finally {
+            if ($stage -and (Test-Path -LiteralPath $stage)) {
+                Remove-MiosFieldPrivateSourceStaging -Path $stage -ExpectedParent ([IO.Directory]::GetParent($stage).FullName)
+            }
+            foreach ($name in $savedTemp.Keys) { [Environment]::SetEnvironmentVariable($name, $savedTemp[$name], 'Process') }
+        }
+    } $StagingSource $parent $temporary
+    $link = Join-Path $caseRoot 'linked-parent'
+    $linkType = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'Junction' } else { 'SymbolicLink' }
+    $null = New-Item -ItemType $linkType -Path $link -Target $parent -ErrorAction Stop
+    $message = ''
+    try { $null = Get-MiosFieldSourceParent -Destination (Join-Path $link 'checkout') } catch { $message = $_.Exception.Message }
+    Check ($message -match 'reparse point' -and
+        ((Get-Item -LiteralPath $link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) 'a destination parent link is rejected and preserved'
+}
+function Invoke-ArchiveFixtures([string]$EnsureSource, [string]$StagingSource, [string]$ParentSource) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
     $archive = Write-Archive 'safe-source' 'repo/source.txt'
     $destination = Join-Path $scratch 'safe-extraction'
@@ -99,34 +149,70 @@ function Invoke-ArchiveFixtures([string]$EnsureSource) {
     try { Expand-MiosFieldSourceArchive -Archive $archive -Destination $destination } catch { $message = $_.Exception.Message }
     Check ($message -match 'expanded size limit' -and -not (Test-Path -LiteralPath $destination)) 'an oversized ZIP expansion is refused before extracting bytes'
     & {
-        param($Program, $Target)
+        param($Program, $StagingProgram, $ParentProgram, $Target)
         . ([scriptblock]::Create($Program))
-        $script:sourceNetworkCalls = 0
+        . ([scriptblock]::Create($StagingProgram))
+        . ([scriptblock]::Create(($ParentProgram -replace '^function\s+Get-MiosFieldSourceParent', 'function Get-FixtureSourceParent')))
+        $script:sourceNetworkCalls = 0; $script:publicationRace = $false; $script:rejectParentAfterDownload = $false; $script:downloadCompleted = $false
         function Get-Command { param($Name, $ErrorAction) return $null }
-        function New-MiosFieldPrivateSourceStaging {
-            $stage = Join-Path $scratch ('archive-stage-' + [guid]::NewGuid().ToString('N'))
-            $null = New-Item -ItemType Directory -Path $stage
-            return $stage
+        function Protect-MiosFieldSourceStaging {
+            param([string]$Path)
+            $script:publicationStaging = $Path
+        }
+        function Get-MiosFieldSourceParent {
+            param([string]$Destination)
+            if ($script:rejectParentAfterDownload -and $script:downloadCompleted) { throw 'Fixture publication parent became a reparse point.' }
+            return Get-FixtureSourceParent -Destination $Destination
         }
         function Invoke-WebRequest {
             param($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec, $ErrorAction)
             $script:sourceNetworkCalls++
-            # Simulate another local worker creating the destination during download.
-            $null = New-Item -ItemType Directory -Path $Target
-            [IO.File]::WriteAllText((Join-Path $Target 'operator.txt'), 'concurrent operator content')
-            $entry = Write-Archive 'publish-race' 'repo/field/autounattend/Build-MiOSXboxISO.ps1'
+            if ($script:publicationRace) {
+                # Simulate another local worker creating the destination during download.
+                $null = New-Item -ItemType Directory -Path $Target
+                [IO.File]::WriteAllText((Join-Path $Target 'operator.txt'), 'concurrent operator content')
+            }
+            $entry = Write-Archive ('publish-' + [guid]::NewGuid().ToString('N')) 'repo/field/autounattend/Build-MiOSXboxISO.ps1'
             Copy-Item -LiteralPath $entry -Destination $OutFile
+            $script:downloadCompleted = $true
         }
+        $complete = $Target + '-complete'
+        $result = Ensure-MiosBootstrapRepo -Root $complete
+        Check ($result -ceq [IO.Path]::GetFullPath($complete) -and
+            [IO.File]::ReadAllText((Join-Path $complete 'field/autounattend/Build-MiOSXboxISO.ps1')) -eq 'fixture source' -and
+            [IO.Directory]::GetParent($script:publicationStaging).FullName -ceq [IO.Directory]::GetParent($complete).FullName -and
+            -not (Test-Path -LiteralPath $script:publicationStaging)) 'an absent target publishes successfully from private sibling staging and removes only that staging'
+        $script:publicationRace = $true
         $message = ''
         try { $null = Ensure-MiosBootstrapRepo -Root $Target } catch { $message = $_.Exception.Message }
-        Check ($message -ne '' -and $script:sourceNetworkCalls -eq 1 -and
+        Check ($message -ne '' -and $script:sourceNetworkCalls -eq 2 -and
             [IO.File]::ReadAllText((Join-Path $Target 'operator.txt')) -eq 'concurrent operator content' -and
             -not (Test-Path -LiteralPath (Join-Path $Target 'field'))) 'archive publication refuses a concurrent target without merging source over it'
         $message = ''
         try { $null = Ensure-MiosBootstrapRepo -Root $Target } catch { $message = $_.Exception.Message }
-        Check ($message -match 'incomplete or existing tree' -and $script:sourceNetworkCalls -eq 1 -and
+        Check ($message -match 'incomplete or existing tree' -and $script:sourceNetworkCalls -eq 2 -and
             [IO.File]::ReadAllText((Join-Path $Target 'operator.txt')) -eq 'concurrent operator content') 'an existing partial archive target is refused before any network request'
-    } $EnsureSource (Join-Path $scratch 'publish-target')
+        $empty = $Target + '-empty'; $null = New-Item -ItemType Directory -Path $empty
+        $message = ''
+        try { $null = Ensure-MiosBootstrapRepo -Root $empty } catch { $message = $_.Exception.Message }
+        Check ($message -match 'including an empty target' -and $script:sourceNetworkCalls -eq 2 -and
+            (Test-Path -LiteralPath $empty -PathType Container)) 'an existing empty target is preserved and explicitly refused before acquisition'
+        $link = $Target + '-link'
+        $linkType = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'Junction' } else { 'SymbolicLink' }
+        $null = New-Item -ItemType $linkType -Path $link -Target $complete -ErrorAction Stop
+        $message = ''
+        try { $null = Ensure-MiosBootstrapRepo -Root $link } catch { $message = $_.Exception.Message }
+        Check ($message -match 'target link is preserved' -and $script:sourceNetworkCalls -eq 2 -and
+            ((Get-Item -LiteralPath $link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) 'a final target link is preserved even when its destination contains a complete checkout'
+        $script:publicationRace = $false; $script:downloadCompleted = $false; $script:rejectParentAfterDownload = $true
+        $unsafe = $Target + '-changed-parent'
+        $message = ''
+        try { $null = Ensure-MiosBootstrapRepo -Root $unsafe } catch { $message = $_.Exception.Message }
+        Check ($message -match 'parent became a reparse point' -and -not (Test-Path -LiteralPath $unsafe) -and
+            (Test-Path -LiteralPath $script:publicationStaging)) 'publication rechecks parent safety after download and retains staging when cleanup is unsafe'
+        $script:rejectParentAfterDownload = $false
+        Remove-MiosFieldPrivateSourceStaging -Path $script:publicationStaging -ExpectedParent ([IO.Directory]::GetParent($script:publicationStaging).FullName)
+    } $EnsureSource $StagingSource $ParentSource (Join-Path $scratch 'publish-target')
 }
 
 try {
@@ -147,7 +233,8 @@ try {
         "`n`$script:FieldTopLevelExecuted = `$true; throw 'CANONICAL_TOP_LEVEL_EXECUTED'`n")
     [IO.File]::WriteAllText($canonicalPath, $canonicalText)
     foreach ($name in @('Get-MiosFieldCanonicalPath', 'Get-MiosFieldCanonicalFunctions', 'Update-MiosFieldCheckout',
-        'Get-MiosFieldCheckoutProfileBlock', 'Initialize-MiosFieldSourceCheckout', 'Invoke-GitProc', 'Expand-MiosFieldSourceArchive')) {
+        'Get-MiosFieldCheckoutProfileBlock', 'Initialize-MiosFieldSourceCheckout', 'Invoke-GitProc', 'Expand-MiosFieldSourceArchive',
+        'Get-MiosFieldSourceParent', 'Remove-MiosFieldPrivateSourceStaging')) {
         . ([scriptblock]::Create((Definition $fieldAst $name).Extent.Text))
     }
     # Reuse the existing real Git acceptance fixture without running its installer/profile suite.
@@ -196,7 +283,9 @@ function Update-MiosWindowsBuildCheckout {
 "@
     Invoke-LosslessRefreshFixture $initializerAdapter
     Invoke-CloneFailureFixture $init.Extent.Text
-    Invoke-ArchiveFixtures $ensureSource
+    $stagingSource = (Definition $fieldAst 'New-MiosFieldPrivateSourceStaging').Extent.Text
+    Invoke-StagingFixtures $stagingSource
+    Invoke-ArchiveFixtures $ensureSource $stagingSource (Definition $fieldAst 'Get-MiosFieldSourceParent').Extent.Text
     Check (-not $script:FieldTopLevelExecuted) 'source refresh imports no installer top-level statements'
     $baseline = $script:checks
     Write-Host "FIELD_SOURCE_SYNC_ASSERTIONS $baseline"
@@ -212,7 +301,13 @@ function Update-MiosWindowsBuildCheckout {
             if (-not $message -or $message -notmatch [regex]::Escape($plant.Expected)) { throw ('Plant did not reach its intended real Git control: ' + $plant.Name) }
             $caught++
         }
-        Write-Host "FIELD_SOURCE_SYNC_PLANTS PASS ($caught/$($plants.Count))"
+        $message = ''
+        $unsafeStaging = $stagingSource.Replace('Join-Path $parent (', 'Join-Path ([IO.Path]::GetTempPath()) (')
+        if ($unsafeStaging -ceq $stagingSource) { throw 'Missing staging location mutation anchor.' }
+        try { Invoke-StagingFixtures $unsafeStaging } catch { $message = $_.Exception.Message }
+        if ($message -notmatch 'private staging is created beside the destination') { throw 'The staging fixture did not detect the former TEMP-based staging location.' }
+        $caught++
+        Write-Host "FIELD_SOURCE_SYNC_PLANTS PASS ($caught/$($plants.Count + 1))"
     } else { Write-Host 'RESULT: PASS (Field source sync; isolated real Git and archive fixtures)' }
 } finally {
     foreach ($name in $environment.Keys) { [Environment]::SetEnvironmentVariable($name, $environment[$name], 'Process') }

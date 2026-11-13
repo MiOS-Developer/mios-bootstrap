@@ -8,8 +8,8 @@
     Designed for: irm https://raw.githubusercontent.com/mios-dev/mios-bootstrap/main/Get-MiOS.ps1 | iex
 
     Thin entrypoint that:
-      1. Elevates to Administrator (re-launches a NEW window so the
-         operator sees a clean, properly-sized terminal).
+      1. Keeps operator setup and MiOS-DEV in the original user token;
+         elevates only fixed machine preparation through UAC.
       2. Resizes the host window to ~100x40 so the build dashboard
          frame (80 cols + breathing room) fits without wrapping.
       3. Verifies Git + Podman are present.
@@ -34,7 +34,8 @@
     Branch to clone (default: main).
 
 .PARAMETER RepoDir
-    Bootstrap checkout. Existing local changes are preserved. Clean checkouts
+    Bootstrap checkout (CurrentUser: Local AppData/MiOS/repo/mios-bootstrap;
+    Administrator: system-drive mios-bootstrap). Existing local changes are preserved. Clean checkouts
     update to the selected branch; installation never deletes the checkout.
 
 .PARAMETER FullBuild
@@ -55,11 +56,22 @@ param(
     [string]$Action = 'Default',
     [string]$RepoUrl   = "https://github.com/mios-dev/mios-bootstrap.git",
     [string]$Branch    = "main",
-    [string]$RepoDir   = "${env:SystemDrive}\mios-bootstrap",
+    [string]$RepoDir   = "",
     [switch]$FullBuild,
     [switch]$Unattended,
     [string]$Workflow  = ""
 )
+
+function New-MiosGetChildArguments {
+    param([string]$EntryPath, [string]$Action, [string]$RepoUrl, [string]$Branch, [string]$RepoDir, [string]$Workflow,
+          [switch]$FullBuild, [switch]$Unattended)
+    $arguments = @('-NoProfile', '-File', $EntryPath, '-Action', $Action, '-RepoUrl', $RepoUrl, '-Branch', $Branch)
+    if (-not [string]::IsNullOrWhiteSpace($RepoDir)) { $arguments += @('-RepoDir', $RepoDir) }
+    if ($Workflow) { $arguments += @('-Workflow', $Workflow) }
+    if ($FullBuild) { $arguments += '-FullBuild' }
+    if ($Unattended) { $arguments += '-Unattended' }
+    return $arguments
+}
 
 $ErrorActionPreference = "Stop"
 $Script:MiosEntrySource = if ($PSCommandPath) { [IO.File]::ReadAllText($PSCommandPath) } else { $MyInvocation.MyCommand.Definition }
@@ -83,11 +95,8 @@ if (-not $PSCommandPath -and -not $env:MIOS_GETMIOS_FILE_RELAUNCHED) {
         [IO.File]::WriteAllText($entryPath, [string]$entryResponse.Content, (New-Object System.Text.UTF8Encoding($true)))
         $engine = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
         if (-not (Test-Path -LiteralPath $engine -PathType Leaf)) { $engine = 'powershell.exe' }
-        $childArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $entryPath,
-            '-Action', $Action, '-RepoUrl', $RepoUrl, '-Branch', $Branch, '-RepoDir', $RepoDir)
-        if ($Workflow) { $childArgs += @('-Workflow', $Workflow) }
-        if ($FullBuild) { $childArgs += '-FullBuild' }
-        if ($Unattended) { $childArgs += '-Unattended' }
+        $childArgs = New-MiosGetChildArguments -EntryPath $entryPath -Action $Action -RepoUrl $RepoUrl -Branch $Branch `
+            -RepoDir $RepoDir -Workflow $Workflow -FullBuild:$FullBuild -Unattended:$Unattended
 
         $oldRelaunchFlag = $env:MIOS_GETMIOS_FILE_RELAUNCHED
         $env:MIOS_GETMIOS_FILE_RELAUNCHED = '1'
@@ -769,6 +778,58 @@ function Write-MiosHostToml {
     } finally {
         if (Test-Path -LiteralPath $pending) { Remove-Item -LiteralPath $pending -Force -ErrorAction Stop }
     }
+}
+
+function Assert-MiosMachineWriteBoundary {
+    param([Parameter(Mandatory)][string]$Path)
+    Assert-MiosNoReparsePath $Path
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $trusted = @('S-1-5-18', 'S-1-5-32-544')
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($owner -notin $trusted) { throw 'An existing machine TOML path has an untrusted owner.' }
+    $write = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete -bor
+        [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [Security.AccessControl.FileSystemRights]::TakeOwnership
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne 'Allow' -or ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
+        if (($rule.FileSystemRights -band $write) -and $rule.IdentityReference.Value -notin $trusted) {
+            throw 'An existing machine TOML path allows an untrusted account to modify or replace it.'
+        }
+    }
+}
+
+function Initialize-MiosVendorTierDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+    $mios = Split-Path -Parent ([IO.Path]::GetFullPath($Path)); $share = Split-Path -Parent $mios; $usr = Split-Path -Parent $share
+    if ((Split-Path -Leaf $Path) -ine 'mios.toml' -or (Split-Path -Leaf $mios) -ine 'mios' -or
+        (Split-Path -Leaf $share) -ine 'share' -or (Split-Path -Leaf $usr) -ine 'usr') { throw 'A vendor TOML destination must be usr/share/mios/mios.toml.' }
+    Assert-MiosNoReparsePath $Path
+    foreach ($directory in @($usr, $share, $mios)) {
+        if (Test-Path -LiteralPath $directory) { Assert-MiosMachineWriteBoundary $directory }
+        else {
+            New-Item -ItemType Directory -Path $directory -ErrorAction Stop | Out-Null
+            Set-MiosHostTierAcl $directory
+            Assert-MiosMachineWriteBoundary $directory
+        }
+    }
+    if (Test-Path -LiteralPath $Path) { Assert-MiosMachineWriteBoundary $Path }
+}
+
+function Write-MiosVendorToml {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Text)
+    Initialize-MiosVendorTierDirectory $Path
+    $pending = Join-Path (Split-Path -Parent $Path) ('.vendor-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        New-Item -ItemType File -Path $pending -ErrorAction Stop | Out-Null
+        Set-MiosHostTierAcl -Path $pending -Private
+        [IO.File]::WriteAllText($pending, $Text, (New-Object Text.UTF8Encoding($false)))
+        Assert-MiosNoReparsePath $Path
+        if (Test-Path -LiteralPath $Path) {
+            Assert-MiosMachineWriteBoundary $Path
+            [IO.File]::Replace($pending, $Path, [Management.Automation.Language.NullString]::Value)
+        } else { [IO.File]::Move($pending, $Path) }
+        Set-MiosHostTierAcl $Path
+    } finally { if (Test-Path -LiteralPath $pending) { Remove-Item -LiteralPath $pending -Force -ErrorAction Stop } }
 }
 
 function Repair-MiosHostTierCredentials {
@@ -1518,17 +1579,21 @@ function Assert-MiosOriginContext {
     Assert-MiosNoReparsePath $Context.ConfigPath
 }
 
-function Initialize-MiosOperatorRuntimeDirectory {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Sid)
-    # These four application roots are the only writable machine paths granted to the operator.
-    $allowed = @('MiOS', 'mios-bootstrap', 'podman', 'winget') | ForEach-Object { Join-Path $env:SystemDrive $_ }
-    if ($Path -notin $allowed) { throw 'Unrecognized operator runtime directory.' }
-    Assert-MiosNoReparsePath $Path
-    if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null }
-    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
-    $operator = New-Object Security.Principal.SecurityIdentifier $Sid
-    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($operator, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
-    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+function Get-MiosWindowsInstallRoot {
+    param([bool]$Elevated = (Test-MiosElevated),
+          [string]$LocalAppData = ([Environment]::GetFolderPath('LocalApplicationData')),
+          [string]$SystemDrive = $env:SystemDrive)
+    if ($Elevated) { return Join-Path $SystemDrive 'MiOS' }
+    if (-not $LocalAppData) { throw 'The operator Local AppData folder is unavailable.' }
+    return Join-Path $LocalAppData 'MiOS'
+}
+
+function Get-MiosWindowsBootstrapRoot {
+    param([bool]$Elevated = (Test-MiosElevated),
+          [string]$LocalAppData = ([Environment]::GetFolderPath('LocalApplicationData')),
+          [string]$SystemDrive = $env:SystemDrive)
+    if ($Elevated) { return Join-Path $SystemDrive 'mios-bootstrap' }
+    return Join-Path (Get-MiosWindowsInstallRoot -Elevated $false -LocalAppData $LocalAppData -SystemDrive $SystemDrive) 'repo\mios-bootstrap'
 }
 
 function Initialize-MiosPipePeerApi {
@@ -1616,11 +1681,13 @@ function Get-MiosMachineWorkerScript {
     $names = @('Assert-MiosNoReparsePath', 'Get-MiosTomlAssignments', 'Split-MiosTomlKeyLine', 'Get-MiosTomlCredentialKeys',
         'ConvertTo-MiosCredentialFreeToml', 'Resolve-MiosTomlText', 'Resolve-MiosVendorTomlText', 'Get-MiosTomlValue',
         'Set-MiosHostTierAcl', 'Initialize-MiosHostTierDirectory', 'Write-MiosHostToml', 'Repair-MiosHostTierCredentials',
-        'Write-Info', 'Write-Good', 'Write-Err', 'Initialize-DataDisk', 'Set-PodmanMachineStorageOnM', 'Set-WingetStorageOnM',
+        'Assert-MiosMachineWriteBoundary', 'Initialize-MiosVendorTierDirectory', 'Write-MiosVendorToml',
+        'Write-Info', 'Write-Good', 'Write-Err', 'Initialize-DataDisk',
         'Test-MiosElevated', 'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Enable-MiOSWindowsFeatures',
         'Get-MiosTomlTableArray', 'ConvertTo-MiosWindowsPath', 'Test-MiosDefenderExclusionRefused', 'Get-MiosDefenderExclusionPlan',
         'Add-MiosDefenderExclusions', 'Test-MiosWslVmCreator', 'Register-MiosWslVmCreator', 'Set-MiosWslFirewallPolicy',
-        'Invoke-MiosPlatformGate', 'Assert-MiosOriginContext', 'Initialize-MiosOperatorRuntimeDirectory', 'Initialize-MiosPipePeerApi',
+        'Invoke-MiosPlatformGate', 'Assert-MiosOriginContext', 'Initialize-MiosPipePeerApi',
+        'Initialize-MiosMachineStorage', 'Publish-MiosMachineToml', 'Register-MiosBootstrapResume',
         'Read-MiosPipeLine', 'Invoke-MiosMachineWorker', 'Invoke-MiosMachinePreparationRequest', 'Invoke-MiosMachinePreparationCore')
     $functions = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $names }, $true))
     foreach ($name in $names) { if (@($functions | Where-Object Name -eq $name).Count -ne 1) { throw "Missing or duplicate machine helper: $name" } }
@@ -1719,6 +1786,9 @@ if ($_isAdmin) {
 # Keep this process and its real token: HKCU, known folders, Appx and WSL registrations
 # must continue to belong to the operator, including when UAC uses a different admin.
 $Script:MiosOriginContext = Get-MiosOriginUserContext
+if ([string]::IsNullOrWhiteSpace($RepoDir)) {
+    $RepoDir = Get-MiosWindowsBootstrapRoot -Elevated $_isAdmin -LocalAppData $Script:MiosOriginContext.LocalAppData
+}
 
 Invoke-MiOSAgreementGate | Out-Null
 
@@ -1964,9 +2034,7 @@ function Install-MiOSGeistFont {
         Write-Host "  [*] GeistMono.zip: $([math]::Round($zipSize/1MB,1)) MB, $extractedCount files extracted." -ForegroundColor DarkGray
 
         $_sysDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
-        $miosFontDir = if (Test-Path 'M:\MiOS\fonts') { 'M:\MiOS\fonts' }
-                       elseif (Test-Path "$_sysDrive\MiOS\fonts") { "$_sysDrive\MiOS\fonts" }
-                       else { Join-Path $_sysDrive 'MiOS\fonts' }
+        $miosFontDir = Join-Path (Get-MiosWindowsInstallRoot) 'fonts'
         if (-not (Test-Path $miosFontDir)) {
             New-Item -ItemType Directory -Path $miosFontDir -Force | Out-Null
         }
@@ -2028,9 +2096,7 @@ function Install-MiOSBibataCursor {
     $current = (Get-ItemProperty -Path $cursorsKey -ErrorAction SilentlyContinue).'(default)'
     if (-not $current) { $current = (Get-ItemProperty -Path $cursorsKey -Name '(default)' -ErrorAction SilentlyContinue).'(default)' }
     $_sysDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
-    $installRoot = if (Test-Path 'M:\MiOS\cursors\Bibata-Modern-Classic') { 'M:\MiOS\cursors\Bibata-Modern-Classic' }
-                   elseif (Test-Path "$_sysDrive\MiOS\cursors\Bibata-Modern-Classic") { "$_sysDrive\MiOS\cursors\Bibata-Modern-Classic" }
-                   else { Join-Path $_sysDrive 'MiOS\cursors\Bibata-Modern-Classic' }
+    $installRoot = Join-Path (Get-MiosWindowsInstallRoot) 'cursors/Bibata-Modern-Classic'
     if ($current -eq $schemeName -and (Test-Path -LiteralPath (Join-Path $installRoot 'Default.cur'))) {
         Write-Host "  [+] Bibata cursor already installed + active: $installRoot" -ForegroundColor DarkGray
         return $true
@@ -2261,9 +2327,7 @@ function Install-MiOSTerminalProfile {
         Write-Host "  [!] No pwsh 7 found; falling back to Windows PS 5.1 in MiOS profile." -ForegroundColor Yellow
     }
     $_sysDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
-    $miosProfilePath = if (Test-Path 'M:\MiOS\powershell\profile.ps1') { 'M:\MiOS\powershell\profile.ps1' }
-                      elseif (Test-Path "$_sysDrive\MiOS\powershell\profile.ps1") { "$_sysDrive\MiOS\powershell\profile.ps1" }
-                      else { Join-Path $_sysDrive 'MiOS\powershell\profile.ps1' }
+    $miosProfilePath = Join-Path (Get-MiosWindowsInstallRoot) 'powershell/profile.ps1'
     $profileCmdline = '"' + $defaultPwsh + '" -NoLogo -NoExit -NoProfile -Command "$env:MIOS_APP_CONTEXT=''1''; if (Test-Path ''' + $miosProfilePath + ''') { . ''' + $miosProfilePath + ''' }"'
 
     $_themeFontFace    = Get-MiosTomlValue -Section 'theme.font' -Key 'family'             -Default 'GeistMono Nerd Font Mono'
@@ -2523,9 +2587,7 @@ function Install-MiOSTerminalProfile {
 function Install-MiOSNativeApp {
     $sysLetter = if ($env:SystemDrive) { $env:SystemDrive.TrimEnd(':') } else { 'C' }
     $sysDrive  = "${sysLetter}:"
-    $miosRoot  = if (Test-Path 'M:\MiOS') { 'M:\MiOS' }
-                 elseif (Test-Path "$sysDrive\MiOS") { "$sysDrive\MiOS" }
-                 else { Join-Path $sysDrive 'MiOS' }
+    $miosRoot = Get-MiosWindowsInstallRoot
     $miosBin   = Join-Path $miosRoot 'bin'
     if (-not (Test-Path $miosBin)) { New-Item -ItemType Directory -Path $miosBin -Force | Out-Null }
 
@@ -2611,9 +2673,7 @@ if ([string]::IsNullOrWhiteSpace($Verb) -or $Profile -eq 'MiOS-DEV') {
     # profile body explicitly + running `mios <verb>` after.
     $sysLetter = if ($env:SystemDrive) { $env:SystemDrive.TrimEnd(':') } else { 'C' }
     $sysDrive  = "${sysLetter}:"
-    $miosProfile = if (Test-Path 'M:\MiOS\powershell\profile.ps1') { 'M:\MiOS\powershell\profile.ps1' }
-                   elseif (Test-Path "$sysDrive\MiOS\powershell\profile.ps1") { "$sysDrive\MiOS\powershell\profile.ps1" }
-                   else { Join-Path $sysDrive 'MiOS\powershell\profile.ps1' }
+    $miosProfile = Join-Path (Split-Path $PSScriptRoot -Parent) 'powershell/profile.ps1'
     $pwshExe = $null
     try {
         $pwshPkg = Get-Command pwsh.exe -ErrorAction SilentlyContinue
@@ -3344,9 +3404,7 @@ function Install-MiOSFastfetch {
 
     $sysLetter = if ($env:SystemDrive) { $env:SystemDrive.TrimEnd(':') } else { 'C' }
     $sysDrive  = "${sysLetter}:"
-    $miosRoot  = if (Test-Path 'M:\MiOS') { 'M:\MiOS' }
-                 elseif (Test-Path "$sysDrive\MiOS") { "$sysDrive\MiOS" }
-                 else { Join-Path $sysDrive 'MiOS' }
+    $miosRoot = Get-MiosWindowsInstallRoot
     $ffDir = Join-Path $miosRoot 'fastfetch'
     if (-not (Test-Path $ffDir)) { New-Item -ItemType Directory -Path $ffDir -Force | Out-Null }
     $logoPath   = Join-Path $ffDir 'mios.txt'
@@ -3398,9 +3456,7 @@ function Install-MiOSFastfetch {
 function Install-MiOSOhMyPoshTheme {
     $sysLetter = if ($env:SystemDrive) { $env:SystemDrive.TrimEnd(':') } else { 'C' }
     $sysDrive  = "${sysLetter}:"
-    $miosRoot  = if (Test-Path 'M:\MiOS') { 'M:\MiOS' }
-                 elseif (Test-Path "$sysDrive\MiOS") { "$sysDrive\MiOS" }
-                 else { Join-Path $sysDrive 'MiOS' }
+    $miosRoot = Get-MiosWindowsInstallRoot
     $themesDir = Join-Path $miosRoot 'themes'
     if (-not (Test-Path $themesDir)) { New-Item -ItemType Directory -Path $themesDir -Force | Out-Null }
     $ompPath = Join-Path $themesDir 'mios.omp.json'
@@ -3436,11 +3492,10 @@ function Install-MiOSTmuxProfile {
 function Install-MiOSPowerShellProfile {
     $sysLetter = if ($env:SystemDrive) { $env:SystemDrive.TrimEnd(':') } else { 'C' }
     $sysDrive  = "${sysLetter}:"
-    $miosPsRoot = if (Test-Path 'M:\MiOS\powershell') { 'M:\MiOS\powershell' }
-                  elseif (Test-Path "$sysDrive\MiOS\powershell") { "$sysDrive\MiOS\powershell" }
-                  else { Join-Path $sysDrive 'MiOS\powershell' }
+    $miosPsRoot = Join-Path (Get-MiosWindowsInstallRoot) 'powershell'
     if (-not (Test-Path $miosPsRoot)) { New-Item -ItemType Directory -Path $miosPsRoot -Force | Out-Null }
     $miosProfileScript = Join-Path $miosPsRoot 'profile.ps1'
+    $safeInstallRoot = (Get-MiosWindowsInstallRoot).Replace("'", "''")
 
     # Resolve $PROFILE.CurrentUserAllHosts even if outer script blocks
     # have torn down standard host context.
@@ -3600,9 +3655,7 @@ if (`$true) {
     } catch {}
 
     `$_sysDrive = if (`$env:SystemDrive) { `$env:SystemDrive } else { 'C:' }
-    `$miosArtifactRoot = if (Test-Path 'M:\MiOS') { 'M:\MiOS' }
-                         elseif (Test-Path (Join-Path `$_sysDrive 'MiOS')) { Join-Path `$_sysDrive 'MiOS' }
-                         else { Join-Path `$_sysDrive 'MiOS' }
+    `$miosArtifactRoot = '$safeInstallRoot'
     if (-not (Test-Path -LiteralPath `$miosArtifactRoot)) {
         try { New-Item -ItemType Directory -Path `$miosArtifactRoot -Force | Out-Null } catch {}
     }
@@ -4154,7 +4207,7 @@ $endMark
 
 try {
     `$_sysDrive = if (`$env:SystemDrive) { `$env:SystemDrive } else { 'C:' }
-    `$_diagDir = if (Test-Path 'M:\MiOS\diagnostics') { 'M:\MiOS\diagnostics' } else { Join-Path `$_sysDrive 'MiOS\diagnostics' }
+    `$_diagDir = Join-Path '$safeInstallRoot' 'diagnostics'
     if (-not (Test-Path -LiteralPath `$_diagDir)) { New-Item -ItemType Directory -Path `$_diagDir -Force | Out-Null }
     `$_diagFile = Join-Path `$_diagDir 'window-width.txt'
     `$_ww = try { [Console]::WindowWidth } catch { '?' }
@@ -4950,27 +5003,10 @@ function Invoke-MiosPlatformGate {
         default   { throw "Windows features are not ready ($($result.Status): $($result.Detail)); provisioning stopped before the WSL firewall policy and MiOS-DEV." }
     }
 }
-function Invoke-MiosMachinePreparationCore {
+function Initialize-MiosMachineStorage {
     param([Parameter(Mandatory)]$Context)
-    if (-not (Test-MiosElevated)) { throw 'Machine preparation requires an elevated token.' }
-    Assert-MiosOriginContext $Context
-    $script:MiosMachineOrigin = $Context
-    # Restrict/repair old readable credential copies before network fetching or any later provisioning can fail.
-    $_hostSecurityDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
-    $null = Repair-MiosHostTierCredentials -Paths @((Join-Path $_hostSecurityDrive 'etc\mios\mios.toml'), 'M:\etc\mios\mios.toml')
-
-
-    foreach ($relative in @('MiOS', 'mios-bootstrap', 'podman', 'winget')) {
-        Initialize-MiosOperatorRuntimeDirectory -Path (Join-Path $env:SystemDrive $relative) -Sid $Context.Sid
-    }
-    Add-MiosDefenderExclusions
-    $_msgStep0          = Get-MiosTomlValue -Section 'messages.steps' -Key 'step_0_provision'      -Default '[*] Step 0: Provisioning M:\ partition + storage junctions...'
-    $_msgStep0Failed    = Get-MiosTomlValue -Section 'messages.steps' -Key 'step_0_failed_template' -Default '[!] Initialize-DataDisk failed: {0}'
-    $_msgPodmanRedirect = Get-MiosTomlValue -Section 'messages.steps' -Key 'podman_storage_redirect' -Default 'Redirecting podman-machine storage to M:\\podman\\machine ...'
-    $_msgPodmanFailed   = Get-MiosTomlValue -Section 'messages.steps' -Key 'podman_storage_failed_template' -Default '[!] Set-PodmanMachineStorageOnM failed: {0}'
-    $_msgWingetRedirect = Get-MiosTomlValue -Section 'messages.steps' -Key 'winget_storage_redirect' -Default 'Redirecting winget package storage to M:\\winget\\* ...'
-    $_msgWingetFailed   = Get-MiosTomlValue -Section 'messages.steps' -Key 'winget_storage_failed_template' -Default '[!] Set-WingetStorageOnM failed: {0}'
-
+    $_msgStep0 = '[*] Preparing configured host storage...'
+    $_msgStep0Failed = '[!] Initialize-DataDisk failed: {0}'
     # Install-robustness (B2): hardware-virtualization preflight. WSL2 +
     # `podman machine init` cannot start without VT-x/AMD-V (SVM) enabled in BIOS/
     # UEFI. Fail fast before Initialize-DataDisk (reboot/disk changes).
@@ -5000,22 +5036,15 @@ function Invoke-MiosMachinePreparationCore {
         Write-Err "        manage-bde -protectors -disable C: -RebootCount 1)."
         try { Invoke-MiOSFullReap } catch {}
         exit 1
+    }
 }
-    try {
-        Write-Info $_msgPodmanRedirect
-        Set-PodmanMachineStorageOnM -UserProfile $Context.Profile -LocalAppData $Context.LocalAppData
-    } catch { Write-Host ('  ' + ($_msgPodmanFailed -f $_.Exception.Message)) -ForegroundColor Yellow }
 
-    # Bootstrap winget on hosts that don't have it before any winget-consuming
-    # step runs (Set-WingetStorageOnM, Enable-MiOSWindowsFeatures' WSL Store
-    # install, Ensure-PodmanDesktop, Windows Terminal install, etc.).
-    # Fresh Win11 has it preinstalled; Server / Win10 / debloated images may not.
-    # Appx/winget registration remains in the operator process.
+function Publish-MiosMachineToml {
+    param([Parameter(Mandatory)]$Context)
+    # Restrict/repair old readable credential copies before network fetching or any later provisioning can fail.
+    $_hostSecurityDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
+    $null = Repair-MiosHostTierCredentials -Paths @((Join-Path $_hostSecurityDrive 'etc\mios\mios.toml'), 'M:\etc\mios\mios.toml')
 
-    try {
-        Write-Info $_msgWingetRedirect
-        Set-WingetStorageOnM -LocalAppData $Context.LocalAppData
-    } catch { Write-Host ('  ' + ($_msgWingetFailed -f $_.Exception.Message)) -ForegroundColor Yellow }
 
     try {
         $_miosVendorToml = Resolve-MiosVendorTomlText
@@ -5024,17 +5053,8 @@ function Invoke-MiosMachinePreparationCore {
         $_sysDrive  = "${_sysLetter}:"
         if ($_miosVendorToml) {
             $_vendorDst = Join-Path $_sysDrive 'usr\share\mios\mios.toml'
-            $_vendorDir = Split-Path -Parent $_vendorDst
-            if (-not (Test-Path -LiteralPath $_vendorDir)) { New-Item -ItemType Directory -Path $_vendorDir -Force | Out-Null }
-            [IO.File]::WriteAllText($_vendorDst, $_miosVendorToml, (New-Object System.Text.UTF8Encoding($false)))
-            if (Test-Path 'M:\') {
-                try {
-                    $_mDst = 'M:\usr\share\mios\mios.toml'
-                    $_mDir = Split-Path -Parent $_mDst
-                    if (-not (Test-Path -LiteralPath $_mDir)) { New-Item -ItemType Directory -Path $_mDir -Force | Out-Null }
-                    [IO.File]::WriteAllText($_mDst, $_miosVendorToml, (New-Object System.Text.UTF8Encoding($false)))
-                } catch {}
-            }
+            Write-MiosVendorToml -Path $_vendorDst -Text $_miosVendorToml
+            if (Test-Path 'M:\') { Write-MiosVendorToml -Path 'M:\usr\share\mios\mios.toml' -Text $_miosVendorToml }
             if ($_miosHostToml) {
                 # The operator layer stays in the user tier (~\.config\mios); the host tier gets its credential-free projection.
                 Write-MiosHostToml -Path (Join-Path $_sysDrive 'etc\mios\mios.toml') -Text $_miosHostToml
@@ -5050,86 +5070,90 @@ function Invoke-MiosMachinePreparationCore {
         }
     } catch {
         throw 'Host TOML security/promotion failed; provisioning stopped. Check host-tier ACLs before retrying.'
-}
+    }
     $_checkDst = if (Test-Path (Join-Path $_sysDrive 'usr\share\mios\mios.toml')) { Join-Path $_sysDrive 'usr\share\mios\mios.toml' } else { 'M:\usr\share\mios\mios.toml' }
     if (-not (Test-Path -LiteralPath $_checkDst -PathType Leaf) -or
         [IO.File]::ReadAllText($_checkDst, (New-Object System.Text.UTF8Encoding($false))) -cne $_miosVendorToml) {
         throw "Full fetched system mios.toml was not staged exactly on $_checkDst; refusing to continue the installer."
+    }
+
 }
 
-    $_msgStep06 = Get-MiosTomlValue -Section 'messages.steps' -Key 'step_0_6_features' -Default '[*] Step 0.6: Enabling Windows features (WSL + VirtualMachinePlatform + Hyper-V)...'
-    Write-Host ''
-    Write-Host "  $_msgStep06" -ForegroundColor Cyan
-
-
-    # Throws on error/deferred; a pending restart halts below. Either way nothing reaches the WSL firewall policy or MiOS-DEV.
-    $_platform = Invoke-MiosPlatformGate
-    if ($_platform.Status -eq 'pending') {
-        try {
-            $_resumeUrl = [string](Get-MiosTomlValue -Section 'bootstrap' -Key 'oneliner_url' -Default 'https://raw.githubusercontent.com/mios-dev/mios-bootstrap/main/Get-MiOS.ps1')
-            if ($_resumeUrl -notmatch '^https://raw\.githubusercontent\.com/[A-Za-z0-9_./%-]+/Get-MiOS\.ps1$') { throw 'Invalid bootstrap resume URL.' }
-            $_ps        = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            $_resumeArg = "-NoProfile -Command `"irm '$_resumeUrl' | iex`""
-            $_runHiddenVbs = Join-Path $env:ProgramData 'MiOS\bin\run-hidden.vbs'
-            if (-not (Test-Path -LiteralPath $_runHiddenVbs)) { $_runHiddenVbs = Join-Path $env:ProgramData 'MiOS\run-hidden.vbs' }
-            if (-not (Test-Path -LiteralPath $_runHiddenVbs) -and $miosRoot) {
-                $_vbsCandidate = Join-Path $miosRoot 'usr\share\mios\windows\run-hidden.vbs'
-                if (Test-Path -LiteralPath $_vbsCandidate) { $_runHiddenVbs = $_vbsCandidate }
-            }
-            if (-not (Test-Path -LiteralPath $_runHiddenVbs)) {
-                $_vbsDir = Split-Path $_runHiddenVbs -Parent
-                if (-not (Test-Path -LiteralPath $_vbsDir)) { New-Item -ItemType Directory -Path $_vbsDir -Force | Out-Null }
-                @'
+function Register-MiosBootstrapResume {
+    param([Parameter(Mandatory)]$Context)
+    try {
+        $_resumeUrl = [string](Get-MiosTomlValue -Section 'bootstrap' -Key 'oneliner_url' -Default 'https://raw.githubusercontent.com/mios-dev/mios-bootstrap/main/Get-MiOS.ps1')
+        if ($_resumeUrl -notmatch '^https://raw\.githubusercontent\.com/[A-Za-z0-9_./%-]+/Get-MiOS\.ps1$') { throw 'Invalid bootstrap resume URL.' }
+        $_ps        = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $_resumeArg = "-NoProfile -Command `"irm '$_resumeUrl' | iex`""
+        $_resumeRoot = Join-Path $env:ProgramData 'MiOS'
+        $_vbsDir = Join-Path $_resumeRoot 'bootstrap'
+        foreach ($directory in @($_resumeRoot, $_vbsDir)) {
+            Assert-MiosNoReparsePath $directory
+            if (Test-Path -LiteralPath $directory) { Assert-MiosMachineWriteBoundary $directory }
+            else { New-Item -ItemType Directory -Path $directory -ErrorAction Stop | Out-Null; Set-MiosHostTierAcl $directory }
+        }
+        $_runHiddenVbs = Join-Path $_vbsDir 'run-hidden.vbs'
+        Assert-MiosNoReparsePath $_runHiddenVbs
+        if (Test-Path -LiteralPath $_runHiddenVbs) { Assert-MiosMachineWriteBoundary $_runHiddenVbs }
+        else {
+            New-Item -ItemType File -Path $_runHiddenVbs -ErrorAction Stop | Out-Null
+            Set-MiosHostTierAcl -Path $_runHiddenVbs -Private
+            @'
 ' MiOS Run-Hidden launcher: executes processes in hidden window mode without spawning console frames or Windows Terminal popups
 Option Explicit
 Dim WshShell, args, cmd, i, arg
 Set WshShell = CreateObject("WScript.Shell")
 Set args = WScript.Arguments
 If args.Count > 0 Then
-    cmd = ""
-    For i = 0 To args.Count - 1
-        arg = args(i)
-        If InStr(arg, " ") > 0 And Left(arg, 1) <> """" Then
-            arg = """" & arg & """"
-        End If
-        If cmd = "" Then
-            cmd = arg
-        Else
-            cmd = cmd & " " & arg
-        End If
-    Next
-    WshShell.Run cmd, 0, False
+cmd = ""
+For i = 0 To args.Count - 1
+    arg = args(i)
+    If InStr(arg, " ") > 0 And Left(arg, 1) <> """" Then
+        arg = """" & arg & """"
+    End If
+    If cmd = "" Then
+        cmd = arg
+    Else
+        cmd = cmd & " " & arg
+    End If
+Next
+WshShell.Run cmd, 0, False
 End If
 '@ | Set-Content -Path $_runHiddenVbs -Encoding ASCII -Force
-            }
-            $_wscript     = Join-Path $env:SystemRoot 'System32\wscript.exe'
-            $_serviceTool = Join-Path $env:ProgramData 'MiOS\bin\MiosServiceTool.exe'
-            if (Test-Path -LiteralPath $_runHiddenVbs) {
-                $_act  = New-ScheduledTaskAction -Execute $_wscript -Argument "//B //Nologo `"$_runHiddenVbs`" `"$_ps`" $_resumeArg"
-            } elseif (Test-Path -LiteralPath $_serviceTool) {
-                $_act  = New-ScheduledTaskAction -Execute $_serviceTool -Argument "-Run `"$_ps`" $_resumeArg"
-            } else {
-                throw "Neither run-hidden.vbs (wscript.exe) nor MiosServiceTool.exe is available to prevent console window flashing on auto-resume."
-            }
-            $_trg  = New-ScheduledTaskTrigger -AtLogOn -User $Context.Sid
-            $_prin = New-ScheduledTaskPrincipal -UserId $Context.Sid -LogonType Interactive -RunLevel Limited
-            $_set  = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-            Register-ScheduledTask -TaskName 'MiOS-Resume-Bootstrap' -Action $_act -Trigger $_trg -Principal $_prin -Settings $_set -Force | Out-Null
-            Write-Host '  [+] Auto-resume armed: MiOS continues automatically after you reboot and' -ForegroundColor Green
-            Write-Host '      sign back in -- no need to re-paste the one-liner.' -ForegroundColor Green
-        } catch {
-            Write-Host "  [!] Could not arm auto-resume ($($_.Exception.Message)); after reboot re-run" -ForegroundColor Yellow
-            Write-Host '      the irm|iex one-liner manually to continue.' -ForegroundColor Yellow
+            Set-MiosHostTierAcl $_runHiddenVbs
         }
-        Write-Host '  [*] Halting to await reboot (WSL/VirtualMachinePlatform just enabled).' -ForegroundColor Cyan
-        return $_platform
-}
-    # Features are active (first run had them, or this is the post-reboot resume): the auto-resume task fires exactly once.
-    if (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName 'MiOS-Resume-Bootstrap' -Confirm:$false -ErrorAction SilentlyContinue
+        $_wscript     = Join-Path $env:SystemRoot 'System32\wscript.exe'
+        $_act = New-ScheduledTaskAction -Execute $_wscript -Argument "//B //Nologo `"$_runHiddenVbs`" `"$_ps`" $_resumeArg"
+        $_trg  = New-ScheduledTaskTrigger -AtLogOn -User $Context.Sid
+        $_prin = New-ScheduledTaskPrincipal -UserId $Context.Sid -LogonType Interactive -RunLevel Limited
+        $_set  = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName 'MiOS-Resume-Bootstrap' -Action $_act -Trigger $_trg -Principal $_prin -Settings $_set -Force | Out-Null
+        Write-Host '  [+] Auto-resume armed: MiOS continues automatically after you reboot and' -ForegroundColor Green
+        Write-Host '      sign back in -- no need to re-paste the one-liner.' -ForegroundColor Green
+    } catch {
+        Write-Host "  [!] Could not arm auto-resume ($($_.Exception.Message)); after reboot re-run" -ForegroundColor Yellow
+        Write-Host '      the irm|iex one-liner manually to continue.' -ForegroundColor Yellow
+    }
 }
 
-    # This machine setting is independent of the operator's HKCU theme.
+function Invoke-MiosMachinePreparationCore {
+    param([Parameter(Mandatory)]$Context)
+    if (-not (Test-MiosElevated)) { throw 'Machine preparation requires an elevated token.' }
+    Assert-MiosOriginContext $Context
+    $script:MiosMachineOrigin = $Context
+    Publish-MiosMachineToml -Context $Context
+    Initialize-MiosMachineStorage -Context $Context
+    Add-MiosDefenderExclusions
+    # The readiness gate remains mandatory and outside a warning-only catch.
+    $_platform = Invoke-MiosPlatformGate
+    if ($_platform.Status -eq 'pending') {
+        Register-MiosBootstrapResume -Context $Context
+        return $_platform
+    }
+    if (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName 'MiOS-Resume-Bootstrap' -Confirm:$false -ErrorAction SilentlyContinue
+    }
     Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -Value 1 -Type DWord -Force -ErrorAction Stop
     return $_platform
 }
@@ -5189,7 +5213,6 @@ trap {
 # vendor defaults via -Default arg of Get-MiosTomlValue.
 
 if ($true) {
-    $isAdmin = $_isAdmin
     try {
         $personalize = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
         if (-not (Test-Path $personalize)) { New-Item -Path $personalize -Force | Out-Null }
@@ -5306,17 +5329,15 @@ Require-Cmd "git"    "Install Git from https://git-scm.com/download/win"
 Ensure-PodmanDesktop
 Write-Good "Prerequisites OK (git, podman)"
 
-# Initialize-DataDisk + Set-PodmanMachineStorageOnM + Set-WingetStorageOnM
-# are defined ABOVE (before Pass-1) so Step 0 can call them BEFORE Pass-1
-# stages files. Their original definitions moved up; this header retained
-# for orientation.
+# Machine preparation completed before user setup. Shared package/profile
+# storage redirectors are compatibility functions and are never invoked by this entrypoint.
 
 # Create the canonical Windows install root structure. Sub-repos are
 # nested directly at the root directory as sub git trees.
 $sysLetter = if ($env:SystemDrive) { $env:SystemDrive.TrimEnd(':') } else { 'C' }
 $sysDrive  = "${sysLetter}:"
-$miosRepoDir = Join-Path $sysDrive 'MiOS'
-$canonicalBootstrap = Join-Path $sysDrive 'mios-bootstrap'
+$miosRepoDir = Get-MiosWindowsInstallRoot
+$canonicalBootstrap = Get-MiosWindowsBootstrapRoot
 New-Item -ItemType Directory -Path $miosRepoDir -Force -ErrorAction SilentlyContinue | Out-Null
 
 if ((Test-Path $RepoDir) -and ($RepoDir -ne $canonicalBootstrap) -and ($RepoDir -ne 'M:\MiOS\repo\mios-bootstrap')) {

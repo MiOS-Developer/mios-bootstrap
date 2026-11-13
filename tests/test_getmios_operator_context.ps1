@@ -1,6 +1,7 @@
 ﻿# Source fixtures only. Never invoke Get-MiOS.ps1 top-level, UAC, pipes, WSL, disk or registry APIs.
 [CmdletBinding()]
-param([switch]$PlantDefect)
+param([switch]$PlantDefect, [switch]$WindowsAcl)
+if ($PlantDefect -and $WindowsAcl) { throw 'Run source plants and Windows ACL fixtures separately.' }
 $ErrorActionPreference = 'Stop'
 $sourcePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Get-MiOS.ps1'
 $source = [IO.File]::ReadAllText($sourcePath)
@@ -36,7 +37,8 @@ function Run-Checks([string]$Text) {
     $ast = Parse-Source $Text
     Import-Functions $ast @('Assert-MiosNoReparsePath', 'Assert-MiosOriginContext', 'Get-MiosTomlAssignments', 'Get-MiosTomlCredentialKeys',
         'ConvertTo-MiosCredentialFreeToml', 'Resolve-MiosTomlText', 'Resolve-MiosVendorTomlText', 'Initialize-MiosHostTierDirectory',
-        'Write-MiosHostToml', 'Invoke-MiosMachinePreparationRequest', 'Read-MiosPipeLine', 'Get-MiosMachineWorkerScript', 'Get-MiosWslConfigText')
+        'Write-MiosHostToml', 'Invoke-MiosMachinePreparationRequest', 'Read-MiosPipeLine', 'Get-MiosMachineWorkerScript', 'Get-MiosWslConfigText',
+        'New-MiosGetChildArguments', 'Get-MiosWindowsInstallRoot', 'Get-MiosWindowsBootstrapRoot')
     $operator = Join-Path $scratch 'operator'
     $admin = Join-Path $scratch 'different-admin'
     foreach ($profile in @($operator, $admin)) { New-Item -ItemType Directory -Path (Join-Path $profile '.config/mios') -Force | Out-Null; New-Item -ItemType Directory -Path (Join-Path $profile 'local') -Force | Out-Null }
@@ -110,7 +112,7 @@ function Run-Checks([string]$Text) {
         @('ConfigPath', $adminPath), @('ProcessId', 9999), @('SessionId', 23))) {
         $badOrigin = $origin | ConvertTo-Json | ConvertFrom-Json
         $badOrigin.($change[0]) = $change[1]
-        if ($change[0] -eq 'Profile') { $badOrigin.ConfigPath = $adminPath }
+        if ($change[0] -eq 'Profile') { $badOrigin.ConfigPath = $adminPath; $badOrigin.LocalAppData = Join-Path $admin 'local' }
         Must-Throw { Invoke-MiosMachinePreparationRequest -Request ([pscustomobject]@{ Origin = $badOrigin; OperatorToml = $projection; VendorToml = $vendor }) -OriginProcessId 4242 } ('reject mismatched origin ' + $change[0])
     }
     $badOrigin = $origin | ConvertTo-Json | ConvertFrom-Json
@@ -125,7 +127,7 @@ function Run-Checks([string]$Text) {
     $workerText = Get-MiosMachineWorkerScript $Text
     $workerAst = Parse-Source $workerText
     $workerFunctions = @($workerAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true))
-    Check (@($workerFunctions | Where-Object { $_.Name -in @('Install-MiOSTerminalProfile', 'Install-MiOSPowerShellProfile', 'Complete-MiosMachinePreparation', 'Invoke-MiosMachinePreparation') }).Count -eq 0) 'the elevated worker excludes operator setup and generic dispatch'
+    Check (@($workerFunctions | Where-Object { $_.Name -in @('Install-MiOSTerminalProfile', 'Install-MiOSPowerShellProfile', 'Complete-MiosMachinePreparation', 'Invoke-MiosMachinePreparation', 'Set-PodmanMachineStorageOnM', 'Set-WingetStorageOnM') }).Count -eq 0) 'the elevated worker excludes operator setup and generic dispatch'
     Check (-not $workerText.Contains('OPERATOR-PRIVATE-SENTINEL') -and -not $workerText.Contains('ADMIN-PRIVATE-SENTINEL')) 'generated worker source contains no profile credentials'
     Check ($Text.Contains('GetNamedPipeServerProcessId') -and $Text.Contains('GetNamedPipeClientProcessId') -and $Text.Contains('$peer -ne $worker.Id')) 'both pipe peer processes are checked'
     Check ($Text.Contains('if (`$actual -cne ''$digest'') { throw') -and $Text.Contains('[scriptblock]::Create(`$source)') -and $Text.Contains('$workerSha.ComputeHash($workerBytes)') -and -not $Text.Contains('Get-FileHash -LiteralPath $workerPath')) 'UAC verifies the exact worker bytes before parsing them'
@@ -153,13 +155,98 @@ function Run-Checks([string]$Text) {
     $resume = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -in @('$_trg', '$_prin') }, $true))
     foreach ($assignment in $resume) { . ([scriptblock]::Create($assignment.Extent.Text)) }
     Check ($script:resumeUser -eq $origin.Sid -and $script:resumePrincipal -eq ($origin.Sid + '|Interactive|Limited')) 'actual resume registration targets the operator with a limited interactive token'
+    # Execute the actual machine orchestration under ready/pending/error. Redirector calls are tripwires.
+    Import-Functions $ast @('Invoke-MiosMachinePreparationCore')
+    function global:Test-MiosElevated { return $true }
+    function global:Publish-MiosMachineToml { param($Context) }
+    function global:Initialize-MiosMachineStorage { param($Context) }
+    function global:Add-MiosDefenderExclusions {}
+    function global:Register-MiosBootstrapResume { param($Context) $script:pendingSid = $Context.Sid }
+    function global:Unregister-ScheduledTask { param($TaskName, $Confirm, $ErrorAction) }
+    function global:Set-ItemProperty { param($Path, $Name, $Value, $Type, [switch]$Force, $ErrorAction) }
+    function global:Set-Acl { throw 'Unexpected ACL mutation in source-only machine orchestration.' }
+    $script:legacyRedirectCalls = 0
+    function global:Set-PodmanMachineStorageOnM { $script:legacyRedirectCalls++; throw 'Legacy profile redirector invoked.' }
+    function global:Set-WingetStorageOnM { $script:legacyRedirectCalls++; throw 'Legacy shared package redirector invoked.' }
+    function global:Invoke-MiosPlatformGate {
+        if ($script:platformMode -eq 'error') { throw 'Fixture feature failure.' }
+        [pscustomobject]@{ Status = $script:platformMode }
+    }
+    foreach ($mode in @('ready', 'pending', 'error')) {
+        $script:platformMode = $mode
+        $result = $null; $failed = $false
+        try { $result = Invoke-MiosMachinePreparationCore -Context $origin } catch { $failed = $true }
+        Check ($script:legacyRedirectCalls -eq 0) ('actual ' + $mode + ' machine dispatch performs zero profile or shared package redirects')
+        Check (($mode -eq 'error' -and $failed) -or ($mode -ne 'error' -and -not $failed -and $result.Status -eq $mode)) ('actual machine orchestration preserves ' + $mode + ' readiness')
+    }
+    $defaultResolution = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.IfStatementAst] -and
+        $n.Clauses[0].Item1.Extent.Text -eq '[string]::IsNullOrWhiteSpace($RepoDir)' }, $true))
+    foreach ($elevated in @($false, $true)) {
+        $args = @(New-MiosGetChildArguments -EntryPath 'entry.ps1' -Action Default -RepoUrl 'fixture' -Branch main -RepoDir '' -FullBuild)
+        Check ($args -notcontains '-RepoDir' -and $args -notcontains '-ExecutionPolicy' -and $args -contains '-FullBuild') 'actual child arguments retain an absent checkout and inherit execution policy'
+        $_isAdmin = $elevated; $RepoDir = ''; $Script:MiosOriginContext = $origin
+        $env:SystemDrive = Join-Path $scratch 'system'
+        foreach ($resolution in $defaultResolution) { . ([scriptblock]::Create($resolution.Extent.Text)) }
+        $expectedRoot = if ($elevated) { Join-Path $env:SystemDrive 'mios-bootstrap' } else { Join-Path $origin.LocalAppData 'MiOS/repo/mios-bootstrap' }
+        Check ($RepoDir -eq $expectedRoot) 'actual default checkout resolution matches the token scope'
+        $runtime = Get-MiosWindowsInstallRoot -Elevated $elevated -LocalAppData $origin.LocalAppData
+        $expectedRuntime = if ($elevated) { Join-Path $env:SystemDrive 'MiOS' } else { Join-Path $origin.LocalAppData 'MiOS' }
+        Check ($runtime -eq $expectedRuntime) 'runtime root matches the existing CurrentUser or AllUsers build layout'
+        $RepoDir = Join-Path $scratch 'explicit-checkout'
+        foreach ($resolution in $defaultResolution) { . ([scriptblock]::Create($resolution.Extent.Text)) }
+        $args = @(New-MiosGetChildArguments -EntryPath 'entry.ps1' -Action Default -RepoUrl 'fixture' -Branch main -RepoDir $RepoDir)
+        $index = [Array]::IndexOf($args, '-RepoDir')
+        Check ($index -ge 0 -and $args[$index + 1] -eq (Join-Path $scratch 'explicit-checkout')) 'actual child arguments and resolution preserve an explicit checkout'
+    }
     # No mutation below can execute an actual Windows action.
 }
+function Invoke-WindowsBoundaryFixture {
+    if ($env:OS -ne 'Windows_NT') { throw '-WindowsAcl requires Windows.' }
+    if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw '-WindowsAcl requires an elevated scratch-only fixture process.' }
+    $ast = Parse-Source $source
+    Import-Functions $ast @('Assert-MiosNoReparsePath', 'Set-MiosHostTierAcl', 'Assert-MiosMachineWriteBoundary', 'Initialize-MiosVendorTierDirectory', 'Write-MiosVendorToml')
+    $machine = Join-Path $scratch 'windows-machine'
+    $vendorPath = Join-Path $machine 'usr/share/mios/mios.toml'
+    New-Item -ItemType Directory -Path $machine -Force | Out-Null
+    $vendorText = "[meta]`nname = 'FULL-VENDOR-SENTINEL'`n[identity]`ndefault_password = ''`n"
+    Write-MiosVendorToml -Path $vendorPath -Text $vendorText
+    Check ([IO.File]::ReadAllText($vendorPath) -ceq $vendorText) 'Windows vendor staging retains full source bytes'
+    $vendorDirectory = Split-Path -Parent $vendorPath
+    $savedAcl = Get-Acl -LiteralPath $vendorDirectory
+    $unsafeAcl = Get-Acl -LiteralPath $vendorDirectory
+    $untrusted = New-Object Security.Principal.SecurityIdentifier 'S-1-5-21-1-2-3-1999'
+    $unsafeAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($untrusted, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    Microsoft.PowerShell.Security\Set-Acl -LiteralPath $vendorDirectory -AclObject $unsafeAcl
+    Must-Throw { Write-MiosVendorToml -Path $vendorPath -Text 'REJECTED' } 'Windows vendor staging rejects a writable child boundary'
+    Check ([IO.File]::ReadAllText($vendorPath) -ceq $vendorText) 'Windows rejected vendor write preserves existing bytes'
+    Microsoft.PowerShell.Security\Set-Acl -LiteralPath $vendorDirectory -AclObject $savedAcl
+    $packages = Join-Path $machine 'winget/MachinePackages'
+    New-Item -ItemType Directory -Path $packages -Force | Out-Null
+    Set-MiosHostTierAcl $packages
+    $before = (Get-Acl -LiteralPath $packages).Sddl
+    $script:platformMode = 'ready'
+    $null = Invoke-MiosMachinePreparationCore -Context $Script:MiosOriginContext
+    Check ((Get-Acl -LiteralPath $packages).Sddl -ceq $before) 'actual machine dispatch preserves protected MachinePackages child ACLs'
+    $unrelated = Join-Path $scratch 'windows-unrelated'
+    $attackRoot = Join-Path $scratch 'windows-junction-attack'
+    New-Item -ItemType Directory -Path $unrelated -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $attackRoot 'usr/share') -Force | Out-Null
+    $sentinel = Join-Path $unrelated 'mios.toml'
+    [IO.File]::WriteAllText($sentinel, 'UNRELATED-SENTINEL')
+    New-Item -ItemType Junction -Path (Join-Path $attackRoot 'usr/share/mios') -Target $unrelated | Out-Null
+    Must-Throw { Write-MiosVendorToml -Path (Join-Path $attackRoot 'usr/share/mios/mios.toml') -Text 'REJECTED' } 'Windows vendor staging rejects a junction before any write'
+    Check ([IO.File]::ReadAllText($sentinel) -ceq 'UNRELATED-SENTINEL') 'Windows junction target sentinel remains untouched'
+    if ($script:failures.Count) { throw ('Windows boundary fixture failed: ' + ($script:failures -join '; ')) }
+    Write-Host 'WINDOWS_OPERATOR_BOUNDARY_FIXTURE PASS'
+}
+
 $oldProfile = $env:USERPROFILE
+$oldSystemDrive = $env:SystemDrive
 try {
     Run-Checks $source
     if ($script:failures.Count) { throw ('Baseline failed: ' + ($script:failures -join '; ')) }
     if (-not $PlantDefect) {
+        if ($WindowsAcl) { Invoke-WindowsBoundaryFixture }
         Write-Host "OPERATOR_CONTEXT_SOURCE_ASSERTIONS $script:checks"
         Write-Host 'RESULT: PASS (operator context source fixtures; Windows APIs mocked)'
     } else {
@@ -182,5 +269,6 @@ try {
     }
 } finally {
     $env:USERPROFILE = $oldProfile
+    $env:SystemDrive = $oldSystemDrive
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 }

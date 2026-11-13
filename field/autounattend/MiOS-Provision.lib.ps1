@@ -1,6 +1,6 @@
 # AI-hint: Shared MiOS install-time provisioning library (SSOT reader + hostname/account/branding/theme/layout/preferences emitters) dot-sourced by BOTH the MiOS-XBOX.iso path (ConvertTo-MiOSPreset.ps1 -> autounattend reg) AND the irm|iex / existing-Windows path (Invoke-MiOSProvision.ps1 -> live apply). One source => the two install paths stay in feature parity.
 # AI-related: mios-bootstrap, Get-MiOS.ps1, ConvertTo-MiOSPreset.ps1, Invoke-MiOSProvision.ps1, New-MiOSAutounattend.ps1
-# AI-functions: Read-MiosToml, Get-Toml, Get-MiOSHostname, Get-MiOSAccounts, ConvertTo-PwPair, ConvertTo-AccentDword, New-MiOSGlobalPrefCommands, New-MiOSBrandingCommands, New-MiOSLinuxLayoutCommands, New-MiOSProvisionCommands, Invoke-MiOSHostCommands
+# AI-functions: Read-MiosToml, ConvertFrom-MiosTomlFile, Merge-MiosTomlLayer, Resolve-MiOSCredentials, Write-MiOSPrivateText, Install-MiOSLivingWallpaperAssets, Get-Toml, Get-MiOSHostname, Get-MiOSAccounts, ConvertTo-PwPair, ConvertTo-AccentDword, New-MiOSGlobalPrefCommands, New-MiOSBrandingCommands, New-MiOSLinuxLayoutCommands, New-MiOSProvisionCommands, Invoke-MiOSHostCommands
 #Requires -Version 5.1
 # =============================================================================
 # MiOS-Provision.lib.ps1 -- UNIFIED provisioning core.
@@ -31,38 +31,313 @@ function Get-MiOSVirtFeatureMatch {
       'Windows.HyperV.OptionalFeature')
 }
 
-function Read-MiosToml {
-    param([string]$Path)
-    $r = @{ scalars = @{}; accounts = @(); prefs = @{} }
-    if (-not (Test-Path -LiteralPath $Path)) { return $r }
-    $section = ''; $cur = $null
-    foreach ($raw in [IO.File]::ReadAllLines($Path)) {
+# A case-sensitive compatibility view for render-only PowerShell consumers. Image
+# builds use the canonical MiOS resolver; its private win-json projection wins.
+function New-MiosTomlView {
+    @{ scalars = [Collections.Hashtable]::new([StringComparer]::Ordinal); accounts = @(); prefs = @{}; has_accounts = $false }
+}
+function ConvertFrom-MiosTomlValue {
+    param([string]$Text, [string]$Key)
+    $v = $Text.Trim()
+    if ($v.StartsWith('"') -or $v.StartsWith("'")) {
+        $quote = $v[0]; $out = [Text.StringBuilder]::new(); $closed = $false
+        for ($i = 1; $i -lt $v.Length; $i++) {
+            $ch = $v[$i]
+            if ($ch -eq $quote) {
+                $tail = $v.Substring($i + 1).Trim()
+                if ($tail -and -not $tail.StartsWith('#')) { throw "MiOS SSOT: invalid TOML string at '$Key'" }
+                $closed = $true; break
+            }
+            if ($quote -eq '"' -and $ch -eq '\') {
+                $i++; if ($i -ge $v.Length) { throw "MiOS SSOT: invalid TOML escape at '$Key'" }
+                switch -CaseSensitive ($v[$i]) {
+                    'b' { [void]$out.Append([char]8) }
+                    't' { [void]$out.Append([char]9) }
+                    'n' { [void]$out.Append([char]10) }
+                    'f' { [void]$out.Append([char]12) }
+                    'r' { [void]$out.Append([char]13) }
+                    '"' { [void]$out.Append('"') }
+                    '\' { [void]$out.Append('\') }
+                    { $_ -ceq 'u' -or $_ -ceq 'U' } {
+                        $count = if ($v[$i] -ceq 'u') { 4 } else { 8 }
+                        if ($i + $count -ge $v.Length) { throw "MiOS SSOT: invalid TOML Unicode escape at '$Key'" }
+                        $digits = $v.Substring($i + 1, $count)
+                        if ($digits -notmatch '^[0-9a-fA-F]+$') { throw "MiOS SSOT: invalid TOML Unicode escape at '$Key'" }
+                        try { [void]$out.Append([char]::ConvertFromUtf32([Convert]::ToInt32($digits, 16))) }
+                        catch { throw "MiOS SSOT: invalid TOML Unicode escape at '$Key'" }
+                        $i += $count
+                    }
+                    default { throw "MiOS SSOT: unsupported TOML escape at '$Key'" }
+                }
+            } else { [void]$out.Append($ch) }
+        }
+        if (-not $closed) { throw "MiOS SSOT: unterminated TOML string at '$Key'" }
+        return $out.ToString()
+    }
+    return ($v -replace '\s*#.*$', '').Trim()
+}
+function ConvertFrom-MiosTomlFile {
+    param([string]$Path, [switch]$ProjectedCredentials)
+    $r = New-MiosTomlView
+    if ($Path -and -not [IO.Path]::IsPathRooted($Path)) { $Path = Join-Path (Get-Location).ProviderPath $Path }
+    if (-not $Path -or -not [IO.File]::Exists($Path)) { return $r }
+    $section = ''; $cur = $null; $multiDelimiter = $null; $multiKey = ''; $multiDiscard = $false; $multiText = [Text.StringBuilder]::new()
+    foreach ($raw in [IO.File]::ReadAllLines([IO.Path]::GetFullPath($Path), [Text.UTF8Encoding]::new($false, $true))) {
+        if ($multiDelimiter) {
+            $end = $raw.IndexOf($multiDelimiter, [StringComparison]::Ordinal)
+            if ($end -lt 0) { [void]$multiText.AppendLine($raw); continue }
+            [void]$multiText.Append($raw.Substring(0, $end))
+            $tail = $raw.Substring($end + 3).Trim()
+            if ($tail -and -not $tail.StartsWith('#')) { throw "MiOS SSOT: invalid multiline TOML string at '$multiKey'" }
+            if (-not $multiDiscard) { $r.scalars[$multiKey] = $multiText.ToString() }; $multiDelimiter = $null; [void]$multiText.Clear(); continue
+        }
         $line = $raw.Trim()
-        # Skip blank + full-line comments. Strip only a WHITESPACE-preceded trailing
-        # comment -- a bare `#.*$` strip would eat a hex value like accent="#1A407F".
         if (-not $line -or $line.StartsWith('#')) { continue }
-        $line = ($line -replace '\s+#.*$', '').Trim()
-        if (-not $line) { continue }
-        if ($line -eq '[[autounattend.accounts]]') {
-            if ($cur) { $r.accounts += ,$cur }
-            $cur = @{}; $section = 'account'; continue
+        if ($line -cmatch '^\[\[autounattend\.accounts\]\]\s*(?:#.*)?$') {
+            if ($null -ne $cur) { $r.accounts += ,$cur }
+            $cur = [Collections.Hashtable]::new([StringComparer]::Ordinal); $section = 'account'; $r.has_accounts = $true; continue
         }
-        if ($line -match '^\[(?<s>[^\]]+)\]$') {
-            if ($cur) { $r.accounts += ,$cur; $cur = $null }
-            $section = $Matches['s']; continue
+        if ($line -match '^\[(?<s>[^\]]+)\]\s*(?:#.*)?$') {
+            if ($null -ne $cur) { $r.accounts += ,$cur; $cur = $null }
+            $section = $Matches['s'].Trim(); continue
         }
-        if ($line -match '^(?<k>[A-Za-z0-9_\-\.]+)\s*=\s*(?<v>.+)$') {
-            # Unescape TOML basic-string backslashes ("C:\\x" -> "C:\x") so SSOT paths
-            # match the single-backslash in-code defaults.
-            $k = $Matches['k'].Trim(); $v = ($Matches['v'].Trim().Trim('"', "'")) -replace '\\\\', '\'
-            if ($section -eq 'account' -and $cur -ne $null) { $cur[$k] = $v }
-            else { $r.scalars["$section.$k"] = $v }   # incl. autounattend.preferences.* (read via Get-Toml/scalars)
+        if ($line -match '^(?<k>[A-Za-z0-9_.-]+)\s*=\s*(?<v>.*)$') {
+            $key = $Matches['k']; $text = $Matches['v']; $full = "$section.$key"
+            $trimmed = $text.Trim(); $triple = $null
+            if ($trimmed.StartsWith(('"' * 3))) { $triple = '"' * 3 }
+            elseif ($trimmed.StartsWith(([string][char]39 * 3))) { $triple = [string][char]39 * 3 }
+            if ($triple) {
+                $discardCredential = $section -ceq 'account' -or $full -cmatch '^(identity\.(username|default_password)|autounattend\.(autologon_user|service\.svc_(user|password))|field\.sysrescue\.(username|password))$'
+                if ($discardCredential -and -not $ProjectedCredentials) { throw "MiOS SSOT: credential key '$full' uses multiline TOML; use private -ResolvedJson" }
+                $body = $trimmed.Substring(3); $end = $body.IndexOf($triple, [StringComparison]::Ordinal)
+                if ($end -ge 0) {
+                    $tail = $body.Substring($end + 3).Trim()
+                    if ($tail -and -not $tail.StartsWith('#')) { throw "MiOS SSOT: invalid multiline TOML string at '$full'" }
+                    if (-not $discardCredential) { $r.scalars[$full] = $body.Substring(0, $end) }
+                } else {
+                    $multiDelimiter = $triple; $multiKey = $full; $multiDiscard = $discardCredential
+                    if ($body) { [void]$multiText.AppendLine($body) }
+                }
+                continue
+            }
+            if ($section -ceq 'autounattend' -and $key -ceq 'accounts') {
+                if (($text -replace '\s*#.*$', '').Trim() -ne '[]') {
+                    if ($ProjectedCredentials) { continue }
+                    throw "MiOS SSOT: unsupported 'autounattend.accounts' syntax; use private -ResolvedJson"
+                }
+                $r.accounts = @(); $r.has_accounts = $true; continue
+            }
+            $value = ConvertFrom-MiosTomlValue -Text $text -Key $full
+            if ($section -ceq 'account' -and $null -ne $cur) { $cur[$key] = $value }
+            else { $r.scalars[$full] = $value }
         }
     }
-    if ($cur) { $r.accounts += ,$cur }
+    if ($multiDelimiter) { throw "MiOS SSOT: unterminated multiline TOML string at '$multiKey'" }
+    if ($null -ne $cur) { $r.accounts += ,$cur }
     return $r
 }
-function Get-Toml { param($T,[string]$Key,[string]$Def='') if ($T.scalars.ContainsKey($Key) -and $T.scalars[$Key]) { $T.scalars[$Key] } else { $Def } }
+function Merge-MiosTomlLayer {
+    param($Dst, $Src)
+    foreach ($k in $Src.scalars.Keys) { $Dst.scalars[$k] = $Src.scalars[$k] }
+    if ($Src.has_accounts) { $Dst.accounts = @($Src.accounts); $Dst.has_accounts = $true }
+}
+function Assert-MiOSPrivateFile {
+    param([string]$Path, [switch]$AllowPublicTemplate)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'MiOS SSOT: private projection must be a regular non-link file' }
+    if ($env:OS -eq 'Windows_NT') {
+        $current = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $allowed = @($current, 'S-1-5-18', 'S-1-5-32-544')
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if ($AllowPublicTemplate) { return }
+        foreach ($rule in $acl.Access) {
+            if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+            try { $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
+            catch { throw 'MiOS SSOT: private projection ACL cannot be verified' }
+            if ($sid -notin $allowed) { throw 'MiOS SSOT: private projection has a public ACL' }
+        }
+    } else {
+        $metadata = & '/usr/bin/stat' '--format=%f:%u' '--' $Path 2>$null
+        if ($LASTEXITCODE -ne 0 -or $metadata -notmatch '^(?<mode>[0-9a-fA-F]+):(?<uid>[0-9]+)$') { throw 'MiOS SSOT: private projection metadata cannot be verified' }
+        $mode = [Convert]::ToInt32($Matches['mode'], 16); $owner = $Matches['uid']; $caller = & '/usr/bin/id' '-u' 2>$null
+        if ($LASTEXITCODE -ne 0 -or $owner -cne [string]$caller -or ($mode -band 61440) -ne 32768 -or (-not $AllowPublicTemplate -and (($mode -band 63) -ne 0 -or ($mode -band 256) -eq 0))) { throw 'MiOS SSOT: private projection must be a caller-owned regular file without group or other access' }
+    }
+}
+function Set-MiOSPrivateStream {
+    param([IO.FileStream]$Stream)
+    if ($env:OS -eq 'Windows_NT') {
+        $acl = [Security.AccessControl.FileSecurity]::new(); $acl.SetAccessRuleProtection($true, $false)
+        $current = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        foreach ($sid in @($current, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'), [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))) {
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
+        }
+        if ($stream.PSObject.Methods.Name -contains 'SetAccessControl') { $stream.SetAccessControl($acl) }
+        else { [IO.FileSystemAclExtensions]::SetAccessControl($stream, $acl) }
+    } else { [IO.File]::SetUnixFileMode($stream.SafeFileHandle, [IO.UnixFileMode]384) }
+}
+function Write-MiOSPrivateText {
+    param([string]$Path, [AllowEmptyString()][string]$Text, $Encoding = ([Text.UTF8Encoding]::new($false)), [string]$PublicTemplateSha256)
+    if ($Encoding -is [string]) {
+        if ($Encoding -in @('UTF8','UTF-8')) { $Encoding = [Text.UTF8Encoding]::new($false) }
+        elseif ($Encoding -eq 'ASCII') { $Encoding = [Text.Encoding]::ASCII }
+        elseif ($Encoding -in @('Unicode','UTF-16LE')) { $Encoding = [Text.Encoding]::Unicode }
+        else { throw 'MiOS SSOT: unsupported private output encoding' }
+    }
+    if ($Encoding -isnot [Text.Encoding]) { throw 'MiOS SSOT: invalid private output encoding' }
+    $Encoding = $Encoding.Clone(); $Encoding.EncoderFallback = [Text.EncoderFallback]::ExceptionFallback
+    $target = [IO.Path]::GetFullPath($Path); $dir = [IO.Path]::GetDirectoryName($target)
+    if (-not [IO.Directory]::Exists($dir)) { throw 'MiOS SSOT: private output directory is absent' }
+    $tmp = [IO.Path]::Combine($dir, '.mios-private-' + [Guid]::NewGuid().ToString('N'))
+    $stream = $null
+    try {
+        $stream = [IO.FileStream]::new($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        Set-MiOSPrivateStream -Stream $stream
+        $bytes = $Encoding.GetBytes($Text); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true); $stream.Dispose(); $stream = $null
+        if ([IO.File]::Exists($target) -or [IO.Directory]::Exists($target)) {
+            $alreadyPrivate = $false
+            try { Assert-MiOSPrivateFile -Path $target; $alreadyPrivate = $true }
+            catch { if (-not $PublicTemplateSha256) { throw } }
+            if (-not $alreadyPrivate -and $PublicTemplateSha256) {
+                if ($PublicTemplateSha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'MiOS SSOT: invalid public template seal' }
+                Assert-MiOSPrivateFile -Path $target -AllowPublicTemplate
+                $item = Get-Item -LiteralPath $target -Force -ErrorAction Stop
+                if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'MiOS SSOT: public template must be a regular non-link file' }
+                $old = [IO.FileStream]::new($target, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                try {
+                    $hash = [Security.Cryptography.SHA256]::Create()
+                    try { $actual = ([BitConverter]::ToString($hash.ComputeHash($old))).Replace('-', '').ToLowerInvariant() }
+                    finally { $hash.Dispose() }
+                    if ($actual -cne $PublicTemplateSha256) { throw 'MiOS SSOT: existing file does not match the credential-free template seal' }
+                    Set-MiOSPrivateStream -Stream $old
+                } finally { $old.Dispose() }
+            }
+            Assert-MiOSPrivateFile -Path $target
+            [IO.File]::Replace($tmp, $target, $null)
+        } else {
+            # Move refuses an existing destination, including a dangling link.
+            [IO.File]::Move($tmp, $target)
+        }
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
+    }
+}
+function Import-MiOSResolvedCredentials {
+    param($Toml, [string]$Path)
+    Assert-MiOSPrivateFile -Path $Path
+    if ((Get-Item -LiteralPath $Path).Length -gt 8388608) { throw 'MiOS SSOT: private credential projection is oversized' }
+    try { $doc = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'MiOS SSOT: invalid private credential projection' }
+    if (@($doc.PSObject.Properties.Name).Count -ne 4 -or @($doc.PSObject.Properties.Name | Where-Object { $_ -cnotin @('schema','scalars','accounts','has_accounts') }).Count -ne 0 -or $doc.schema -cne 'mios-resolved-credentials/1' -or $doc.scalars -isnot [pscustomobject] -or $doc.accounts -isnot [Array] -or $doc.has_accounts -isnot [bool] -or $doc.has_accounts -ne ($doc.accounts.Count -gt 0)) { throw 'MiOS SSOT: invalid private credential projection schema' }
+    $projection = New-MiosTomlView
+    foreach ($p in $doc.scalars.PSObject.Properties) {
+        if ($p.Name -cnotmatch '^(identity\.|autounattend\.|field\.sysrescue\.|auth\.password_hash$)' -or $p.Value -isnot [string]) { throw 'MiOS SSOT: invalid private credential scalar' }
+        $projection.scalars[$p.Name] = $p.Value
+    }
+    $accounts = @()
+    foreach ($item in @($doc.accounts)) {
+        if ($null -eq $item -or $item -is [string]) { throw 'MiOS SSOT: invalid private credential account' }
+        $a = [Collections.Hashtable]::new([StringComparer]::Ordinal)
+        foreach ($p in $item.PSObject.Properties) {
+            if ($p.Name -cnotin @('name','display_name','group','password') -or $p.Value -isnot [string]) { throw 'MiOS SSOT: invalid private credential account field' }
+            $a[$p.Name] = $p.Value
+        }
+        $accounts += ,$a
+    }
+    if ($doc.has_accounts -or $accounts.Count -ne 0) { $projection.accounts = $accounts; $projection.has_accounts = $true }
+    else { $projection.accounts = @(); $projection.has_accounts = $false }
+    [void](Resolve-MiOSCredentials -Toml $projection)
+    # The canonical projection owns these complete planes, including key absence.
+    foreach ($key in @($Toml.scalars.Keys)) { if ($key -cmatch '^(identity\.|autounattend\.|field\.sysrescue\.|auth\.password_hash$)') { [void]$Toml.scalars.Remove($key) } }
+    Merge-MiosTomlLayer -Dst $Toml -Src $projection
+    if (-not $projection.has_accounts) { $Toml.accounts = @(); $Toml.has_accounts = $false }
+}
+function Read-MiosToml {
+    param([string]$Path, [switch]$SingleFile, [string]$ResolvedJson)
+    if ($SingleFile) { return (ConvertFrom-MiosTomlFile -Path $Path) }
+    if (-not $ResolvedJson) { $ResolvedJson = $env:MIOS_RESOLVED_JSON }
+    if (-not $Path) { $Path = $env:MIOS_VENDOR_TOML }
+    if (-not $Path) { $Path = $env:MIOS_TOML }
+    $r = New-MiosTomlView; $layers = [Collections.Generic.List[string]]::new()
+    $base = $env:MIOS_BOOTSTRAP_BASE_TOML
+    if (-not $base) { $base = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\mios.toml')) }
+    if ($base -ne '-' -and $base -ne $Path) { $layers.Add($base) }
+    $vendorD = $env:MIOS_VENDOR_TOML_D
+    if (-not $vendorD -and $Path) {
+        $vendorParent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))
+        if ([IO.Path]::GetFileName([IO.Path]::GetDirectoryName($vendorParent)) -eq 'share') { $vendorD = Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($vendorParent))) 'lib/mios/mios.d' }
+        else { $vendorD = Join-Path $vendorParent 'mios.d' }
+    }
+    $hostPath = $env:MIOS_HOST_TOML
+    if (-not $hostPath) { $hostPath = if ($env:OS -eq 'Windows_NT') { Join-Path ($env:SystemDrive + '\') 'etc/mios/mios.toml' } else { '/etc/mios/mios.toml' } }
+    $hostD = $env:MIOS_HOST_TOML_D; if (-not $hostD) { $hostD = Join-Path ([IO.Path]::GetDirectoryName($hostPath)) 'mios.d' }
+    $userPath = $env:MIOS_USER_TOML
+    if (-not $userPath) {
+        $config = $env:XDG_CONFIG_HOME; if (-not $config) { $config = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.config' }
+        $userPath = Join-Path $config 'mios/mios.toml'
+    }
+    $userD = $env:MIOS_USER_TOML_D; if (-not $userD) { $userD = Join-Path ([IO.Path]::GetDirectoryName($userPath)) 'mios.d' }
+    foreach ($tier in @(@($Path,$vendorD), @($hostPath,$hostD), @($userPath,$userD))) {
+        if ($tier[0]) { $layers.Add($tier[0]) }
+        if ($tier[1] -and [IO.Directory]::Exists($tier[1])) {
+            $files = [string[]]@([IO.Directory]::GetFiles($tier[1], '*.toml')); [Array]::Sort($files, [StringComparer]::Ordinal)
+            foreach ($f in $files) { $layers.Add($f) }
+        }
+    }
+    foreach ($layer in $layers) { Merge-MiosTomlLayer -Dst $r -Src (ConvertFrom-MiosTomlFile -Path $layer -ProjectedCredentials:([bool]$ResolvedJson)) }
+    if (-not $ResolvedJson) { $ResolvedJson = $env:MIOS_RESOLVED_JSON }
+    if ($ResolvedJson) { Import-MiOSResolvedCredentials -Toml $r -Path $ResolvedJson }
+    return $r
+}
+function Get-Toml {
+    param($T, [string]$Key, [string]$Def = '')
+    if ($T.scalars.ContainsKey($Key) -and $null -ne $T.scalars[$Key] -and [string]$T.scalars[$Key] -ne '') { return [string]$T.scalars[$Key] }
+    return $Def
+}
+function Test-MiOSTruthy {
+    param([string]$Value, [bool]$Default)
+    if ($Value -eq '') { return $Default }
+    return $Value.Trim().ToLowerInvariant() -in @('true','1','yes','on')
+}
+function Resolve-MiOSCredentials {
+    param($Toml)
+    $username = (Get-Toml $Toml 'identity.username').Trim(); $password = Get-Toml $Toml 'identity.default_password'
+    if (-not $username) { throw "MiOS SSOT: required credential key 'identity.username' is missing or empty" }
+    if (-not $password) { throw "MiOS SSOT: required credential key 'identity.default_password' is missing or empty" }
+    $fullname = Get-Toml $Toml 'identity.fullname' $username; $accounts = @(); $source = @($Toml.accounts)
+    if ($source.Count -eq 0) { $source = @(@{ name=$username; display_name=$fullname; group='Administrators'; password='' }) }
+    for ($i = 0; $i -lt $source.Count; $i++) {
+        $a = $source[$i]; $name = ([string]$a.name).Trim()
+        if (-not $name) { throw "MiOS SSOT: required credential key 'autounattend.accounts[$i].name' is missing or empty" }
+        $pw = [string]$a.password; if (-not $pw) { $pw = $password }
+        $display = [string]$a.display_name; if (-not $display) { $display = $name }
+        $group = [string]$a.group; if (-not $group) { $group = 'Users' }
+        $accounts += @{ name=$name; display_name=$display; group=$group; password=$pw }
+    }
+    $enabled = Test-MiOSTruthy (Get-Toml $Toml 'autounattend.service.enable') $true
+    $svcUser = ''; $svcPassword = ''
+    if ($enabled) {
+        $svcUser = (Get-Toml $Toml 'autounattend.service.svc_user').Trim()
+        if (-not $svcUser) { throw "MiOS SSOT: required credential key 'autounattend.service.svc_user' is missing or empty" }
+        $svcPassword = Get-Toml $Toml 'autounattend.service.svc_password' $password
+    }
+    $alEnabled = Test-MiOSTruthy (Get-Toml $Toml 'autounattend.autologon_enable') $true
+    $alUser = (Get-Toml $Toml 'autounattend.autologon_user' $username).Trim()
+    if ($alEnabled -and $svcUser -and $alUser.Equals($svcUser, [StringComparison]::OrdinalIgnoreCase)) { throw 'MiOS SSOT: autounattend.autologon_user is the service account; AutoLogon must use a desktop account' }
+    $alPassword = ''
+    foreach ($a in $accounts) { if ($a.name.Equals($alUser, [StringComparison]::OrdinalIgnoreCase)) { $alPassword = $a.password; break } }
+    if ($alEnabled -and -not $alPassword) { throw "MiOS SSOT: autounattend.autologon_user has no SSOT password" }
+    $persistent = Test-MiOSTruthy (Get-Toml $Toml 'autounattend.autologon_persistent') $true
+    $count = 9999999
+    if (-not $persistent) {
+        $rawCount = Get-Toml $Toml 'autounattend.autologon_count'
+        if ($rawCount -notmatch '^[0-9]+$' -or -not [int]::TryParse($rawCount, [ref]$count) -or $count -lt 1) { throw "MiOS SSOT: autounattend.autologon_count must be a positive integer" }
+    }
+    foreach ($v in @($username,$password,$svcUser,$svcPassword,$alUser,$alPassword) + @($accounts | ForEach-Object { $_.name; $_.password })) {
+        if ($v -match '[\x00-\x1f\x7f]') { throw 'MiOS SSOT: credential contains control characters' }
+    }
+    return @{ username=$username; fullname=$fullname; default_password=$password; accounts=$accounts; service=@{ enable=$enabled; user=$svcUser; password=$svcPassword }; autologon=@{ enable=$alEnabled; user=$alUser; password=$alPassword; persistent=$persistent; count=$count } }
+}
 
 function Apply-MiosEdition {
     param($T, [string]$Edition)
@@ -136,18 +411,7 @@ function Get-MiOSHostname {
 
 function Get-MiOSAccounts {
     param($Toml)
-    $accts = @($Toml.accounts)
-    if ($accts.Count -eq 0) {
-        $u = Get-Toml $Toml 'identity.username' 'mios'
-        $accts = @(@{ name=$u; display_name=(Get-Toml $Toml 'identity.fullname' 'MiOS User'); group='Administrators'; password=$u })
-    }
-    foreach ($a in $accts) {
-        if (-not $a.name)         { $a.name = 'mios' }
-        if (-not $a.password)     { $a.password = $a.name }   # never a blank admin
-        if (-not $a.group)        { $a.group = 'Users' }
-        if (-not $a.display_name) { $a.display_name = $a.name }
-    }
-    return ,$accts
+    return ,@((Resolve-MiOSCredentials -Toml $Toml).accounts)
 }
 function ConvertTo-PwPair {
     param([string]$Pw, [switch]$Obfuscate)
@@ -163,44 +427,62 @@ function ConvertTo-AccentDword {
     return ('0xFF{0}{1}{2}' -f $h.Substring(4,2), $h.Substring(2,2), $h.Substring(0,2)).ToUpper()
 }
 
+function Get-MiOSSpecValue {
+    param($Toml, [string]$Key)
+    if (-not $Toml.scalars.ContainsKey($Key) -or [string]$Toml.scalars[$Key] -eq '') { throw "MiOS SSOT: spec key '$Key' is missing" }
+    return [string]$Toml.scalars[$Key]
+}
+function Get-MiOSSpecDword {
+    param($Toml, [string]$Key)
+    $value = Get-MiOSSpecValue $Toml $Key
+    if ($value -notmatch '^[0-9]+$') { throw "MiOS SSOT: spec key '$Key' must be an unsigned integer" }
+    return $value
+}
+function Get-MiOSSpecStringArray {
+    param($Toml, [string]$Key)
+    $value = Get-MiOSSpecValue $Toml $Key
+    try { $items = ConvertFrom-Json -InputObject $value -ErrorAction Stop }
+    catch { throw "MiOS SSOT: spec key '$Key' must be a string array" }
+    foreach ($item in @($items)) { if ($item -isnot [string]) { throw "MiOS SSOT: spec key '$Key' must be a string array" } }
+    return ,@($items)
+}
 function New-MiOSGlobalPrefCommands {
-    # MiOS FUNCTIONAL preferences applied GLOBALLY: Default hive + first HKCU.
+    # Registry strings only: no registry, filesystem or process mutations while rendering.
     param($Toml)
+    $advanced = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
     $d = [ordered]@{
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|HideFileExt|REG_DWORD'  = (Get-Toml $Toml 'autounattend.preferences.hide_file_ext' '0')
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|Hidden|REG_DWORD'       = (Get-Toml $Toml 'autounattend.preferences.show_hidden' '1')
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|TaskbarAl|REG_DWORD'    = (Get-Toml $Toml 'autounattend.preferences.taskbar_align' '0')
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|HideIcons|REG_DWORD'    = (Get-Toml $Toml 'autounattend.preferences.hide_desktop_icons' '1')
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|TaskbarDa|REG_DWORD'    = '0'
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|TaskbarMn|REG_DWORD'    = '0'
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|ShowTaskViewButton|REG_DWORD' = '1'
-        'Software\Microsoft\Windows\CurrentVersion\Search|SearchboxTaskbarMode|REG_DWORD'    = (Get-Toml $Toml 'autounattend.preferences.searchbox_mode' '1')
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel|{645FF040-5081-101B-9F08-00AA002F954E}|REG_DWORD' = '1'
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel|{20D04FE0-3AEA-1069-A2D8-08002B30309D}|REG_DWORD' = '1'
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel|{59031a47-3f72-44a7-89c5-5595fe6b30ee}|REG_DWORD' = '1'
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel|{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}|REG_DWORD' = '1'
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel|{5399E694-EFE5-4B4C-B358-2A29D3157B06}|REG_DWORD' = '1'
-        'Software\Microsoft\Windows\CurrentVersion\Start|Start_ShowSettings|REG_DWORD'       = '1'
-        'Software\Microsoft\Windows\CurrentVersion\Start|Start_ShowFileExplorer|REG_DWORD'   = '1'
-        'Software\Microsoft\Windows\CurrentVersion\Start|Start_ShowNetwork|REG_DWORD'        = '1'
-        'Software\Microsoft\Windows\CurrentVersion\Start|Start_ShowUserFiles|REG_DWORD'      = '1'
-        'Software\Microsoft\Windows\CurrentVersion\Start|Start_ShowDownloads|REG_DWORD'      = '1'
-        'Software\Microsoft\Windows\CurrentVersion\Start|Start_ShowDocuments|REG_DWORD'      = '1'
+        "$advanced|HideFileExt|REG_DWORD" = (Get-MiOSSpecDword $Toml 'windows.xbox.preferences.hide_file_extensions')
+        "$advanced|TaskbarAl|REG_DWORD" = (Get-MiOSSpecDword $Toml 'windows.xbox.preferences.taskbar_align')
+        "$advanced|HideIcons|REG_DWORD" = (Get-MiOSSpecDword $Toml 'windows.xbox.preferences.desktop_icons_hidden')
+        "$advanced|TaskbarDa|REG_DWORD" = (Get-MiOSSpecDword $Toml 'windows.xbox.preferences.taskbar_widgets')
+        "$advanced|TaskbarMn|REG_DWORD" = (Get-MiOSSpecDword $Toml 'windows.xbox.preferences.taskbar_chat')
+        "$advanced|ShowTaskViewButton|REG_DWORD" = (Get-MiOSSpecDword $Toml 'windows.xbox.preferences.task_view_button')
+        "$advanced|TaskbarEndTask|REG_DWORD" = (Get-MiOSSpecDword $Toml 'windows.xbox.preferences.taskbar_end_task')
+        'Software\Microsoft\TabletTip\1.7|TipbandDesiredVisibility|REG_DWORD' = (Get-MiOSSpecDword $Toml 'windows.xbox.preferences.touch_keyboard_button')
+        'Software\Microsoft\Windows\CurrentVersion\Search|SearchboxTaskbarMode|REG_DWORD' = (Get-MiOSSpecDword $Toml 'windows.xbox.preferences.search_box_mode')
+        'Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel|{645FF040-5081-101B-9F08-00AA002F954E}|REG_DWORD' = (Get-MiOSSpecDword $Toml 'windows.xbox.preferences.recycle_bin_hidden')
     }
-    $cmds = New-Object System.Collections.Generic.List[string]
+    $cmds = [Collections.Generic.List[string]]::new()
     foreach ($k in $d.Keys) { $p = $k -split '\|'; $cmds.Add(('reg add "HKCU\{0}" /v {1} /t {2} /d {3} /f' -f $p[0],$p[1],$p[2],$d[$k])) }
     $cmds.Add('reg load "HKU\MiOSDefault" "C:\Users\Default\NTUSER.DAT"')
     foreach ($k in $d.Keys) { $p = $k -split '\|'; $cmds.Add(('reg add "HKU\MiOSDefault\{0}" /v {1} /t {2} /d {3} /f' -f $p[0],$p[1],$p[2],$d[$k])) }
     $cmds.Add('reg unload "HKU\MiOSDefault"')
-    $cmds.Add('reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband" /v Favorites /t REG_BINARY /d "" /f')
-    $cmds.Add('reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\Start" /v ConfigureStartPins /t REG_SZ /d "{\"pinnedList\":[]}" /f')
-    # No desktop icons (SSOT [autounattend.preferences].remove_edge_shortcut, default
-    # true): stop Edge (re)creating its desktop shortcut + remove any existing one.
-    # DisableEdgeDesktopShortcutCreation + the EdgeUpdate policies block FUTURE
-    # creation; the del clears the .lnk Edge's installer drops on Public\Desktop.
-    if ((Get-Toml $Toml 'autounattend.preferences.remove_edge_shortcut' 'true') -match '^(?i:true|1|yes)$') {
+    $hive = Get-MiOSSpecValue $Toml 'windows.xbox.start.folder_policy_hive'
+    if ($hive -cne 'SOFTWARE') { throw 'MiOS SSOT: windows.xbox.start.folder_policy_hive must name SOFTWARE' }
+    $folderKey = Get-MiOSSpecValue $Toml 'windows.xbox.start.folder_policy_key'
+    $prefix = Get-MiOSSpecValue $Toml 'windows.xbox.start.folder_policy_prefix'
+    $folders = Get-MiOSSpecStringArray $Toml 'windows.xbox.start.folders'
+    $universe = Get-MiOSSpecStringArray $Toml 'windows.xbox.start.folders_universe'
+    foreach ($folder in $folders) { if ($folder -cnotin $universe) { throw 'MiOS SSOT: selected Start folder is outside folders_universe' } }
+    foreach ($folder in $universe) {
+        if ($folder -notmatch '^[A-Za-z0-9]+$') { throw 'MiOS SSOT: invalid Start folder policy name' }
+        $enabled = if ($folder -cin $folders) { 1 } else { 0 }
+        $cmds.Add(('reg add "HKLM\{0}\{1}" /v {2}{3} /t REG_DWORD /d {4} /f' -f $hive,$folderKey,$prefix,$folder,$enabled))
+    }
+    $edge = Get-MiOSSpecDword $Toml 'windows.xbox.preferences.edge_desktop_shortcut'
+    $cmds.Add(('reg add "HKLM\SOFTWARE\Policies\Microsoft\EdgeUpdate" /v CreateDesktopShortcutDefault /t REG_DWORD /d {0} /f' -f $edge))
+    if ($edge -eq '0') {
         $cmds.Add('reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" /v DisableEdgeDesktopShortcutCreation /t REG_DWORD /d 1 /f')
-        $cmds.Add('reg add "HKLM\SOFTWARE\Policies\Microsoft\EdgeUpdate" /v CreateDesktopShortcutDefault /t REG_DWORD /d 0 /f')
         $cmds.Add('reg add "HKLM\SOFTWARE\Policies\Microsoft\EdgeUpdate" /v RemoveDesktopShortcutDefault /t REG_DWORD /d 1 /f')
         $cmds.Add('del /f /q "C:\Users\Public\Desktop\Microsoft Edge.lnk" 2>nul')
     }
@@ -313,10 +595,9 @@ function New-MiOSHostServiceCommands {
     $cmds = New-Object System.Collections.Generic.List[string]
     if ((Get-Toml $Toml 'autounattend.service.enable' 'true') -notmatch '^(?i:true|1|yes)$') { return $cmds }
 
-    $svcUser  = Get-Toml $Toml 'autounattend.service.svc_user' 'mios-sudo'
-    # Service-account password: SSOT service key, else the global default_password.
-    # An answer-file credential is a first-boot temporary cred (rotate on first run).
-    $svcPass  = Get-Toml $Toml 'autounattend.service.svc_password' (Get-Toml $Toml 'identity.default_password' 'user')
+    $credential = Resolve-MiOSCredentials -Toml $Toml
+    $svcUser = $credential.service.user
+    $svcPass = $credential.service.password
     $script   = Get-Toml $Toml 'autounattend.service.host_script' 'C:\ProgramData\MiOS\MiOS-Host.ps1'
 
     # 1) WSL2 platform feature (the only OC strictly required for the MiOS brain).
@@ -412,6 +693,67 @@ function New-MiOSHostServiceCommands {
     return $cmds
 }
 
+function Install-MiOSLivingWallpaperAssets {
+    # Explicit elevated Windows apply only. Renderers never call this function.
+    param($Toml)
+    if ($env:OS -ne 'Windows_NT') { throw 'MiOS wallpaper asset installation requires Windows' }
+    if ((Get-Toml $Toml 'branding.windows.enable' 'true') -notmatch '^(?i:true|1|yes)$' -or (Get-Toml $Toml 'branding.living_wallpaper' 'true') -notmatch '^(?i:true|1|yes)$' -or (Get-Toml $Toml 'branding.living_wallpaper_mode' 'shader') -ne 'shader') { return }
+    $dir = "C:\Windows\Web\MiOS"
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    
+    $htmlB64 = Get-MiOSLivingWallpaperHtmlB64
+    [IO.File]::WriteAllBytes("$dir\living-wallpaper.html", [System.Convert]::FromBase64String($htmlB64))
+    
+    $csB64 = Get-MiOSLivingWallpaperCsB64
+    [IO.File]::WriteAllBytes("$dir\MiOS-Wallpaper.cs", [System.Convert]::FromBase64String($csB64))
+
+    $svcCsB64 = Get-MiOSLivingWallpaperServiceCsB64
+    [IO.File]::WriteAllBytes("$dir\MiOS-Wallpaper-Service.cs", [System.Convert]::FromBase64String($svcCsB64))
+    
+    # Download WebView2 DLLs if not present
+    if (-not (Test-Path "$dir\Microsoft.Web.WebView2.Core.dll") -or -not (Test-Path "$dir\Microsoft.Web.WebView2.WinForms.dll")) {
+        try {
+            $version = "1.0.4022.49"
+            $url = "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/$version/microsoft.web.webview2.$version.nupkg"
+            $zipFile = Join-Path $env:TEMP "webview2_$version.zip"
+            $extractDir = Join-Path $env:TEMP "webview2_extracted_$version"
+            
+            Invoke-WebRequest -Uri $url -OutFile $zipFile -UseBasicParsing -ErrorAction Stop
+            
+            if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force | Out-Null }
+            Expand-Archive -Path $zipFile -DestinationPath $extractDir -Force
+            
+            Copy-Item "$extractDir\lib\net462\Microsoft.Web.WebView2.Core.dll" $dir -Force
+            Copy-Item "$extractDir\lib\net462\Microsoft.Web.WebView2.WinForms.dll" $dir -Force
+            Copy-Item "$extractDir\runtimes\win-x64\native\WebView2Loader.dll" $dir -Force
+            
+            Remove-Item $zipFile -Force -ErrorAction SilentlyContinue | Out-Null
+            Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+        } catch {}
+    }
+
+    foreach ($csc in @("C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe", "C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe")) {
+        if (Test-Path $csc) {
+            & $csc /nologo /target:winexe /optimize+ /platform:x64 /lib:$dir /r:Microsoft.Web.WebView2.Core.dll /r:Microsoft.Web.WebView2.WinForms.dll /out:$dir\MiOS-Wallpaper.exe $dir\MiOS-Wallpaper.cs | Out-Null
+            & $csc /nologo /target:exe /optimize+ /platform:x64 /out:$dir\MiOS-Wallpaper-Service.exe /r:System.ServiceProcess.dll $dir\MiOS-Wallpaper-Service.cs | Out-Null
+            break
+        }
+    }
+
+    # Eliminate static Windows desktop/wallpaper images globally (zero static background)
+    $img0 = "C:\Windows\Web\Wallpaper\Windows\img0.jpg"
+    try {
+        if (Test-Path $img0) { Remove-Item $img0 -Force -Recurse -ErrorAction SilentlyContinue }
+        $4kDir = "C:\Windows\Web\4K\Wallpaper\Windows"
+        if (Test-Path $4kDir) {
+            Get-ChildItem -Path $4kDir -Filter "img0_*.jpg" -File -ErrorAction SilentlyContinue | ForEach-Object {
+                Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {}
+    
+}
+
 function New-MiOSBrandingCommands {
     # FULL MiOS visual identity applied GLOBALLY (HKLM + Default hive + first
     # HKCU), ALL from SSOT ([branding], [colors].accent, [theme]).
@@ -461,60 +803,8 @@ function New-MiOSBrandingCommands {
     $success = (Get-Toml $Toml 'colors.success' '#3E7765').Replace('#', '')
 
     if ($livingWallpaper -match '^(true|1|yes)$' -and $livingWallpaperMode -eq 'shader') {
-        $dir = "C:\Windows\Web\MiOS"
-        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        
-        $htmlB64 = Get-MiOSLivingWallpaperHtmlB64
-        [IO.File]::WriteAllBytes("$dir\living-wallpaper.html", [System.Convert]::FromBase64String($htmlB64))
-        
-        $csB64 = Get-MiOSLivingWallpaperCsB64
-        [IO.File]::WriteAllBytes("$dir\MiOS-Wallpaper.cs", [System.Convert]::FromBase64String($csB64))
-
-        $svcCsB64 = Get-MiOSLivingWallpaperServiceCsB64
-        [IO.File]::WriteAllBytes("$dir\MiOS-Wallpaper-Service.cs", [System.Convert]::FromBase64String($svcCsB64))
-        
-        # Download WebView2 DLLs if not present
-        if (-not (Test-Path "$dir\Microsoft.Web.WebView2.Core.dll") -or -not (Test-Path "$dir\Microsoft.Web.WebView2.WinForms.dll")) {
-            try {
-                $version = "1.0.4022.49"
-                $url = "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/$version/microsoft.web.webview2.$version.nupkg"
-                $zipFile = Join-Path $env:TEMP "webview2_$version.zip"
-                $extractDir = Join-Path $env:TEMP "webview2_extracted_$version"
-                
-                Invoke-WebRequest -Uri $url -OutFile $zipFile -UseBasicParsing -ErrorAction Stop
-                
-                if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force | Out-Null }
-                Expand-Archive -Path $zipFile -DestinationPath $extractDir -Force
-                
-                Copy-Item "$extractDir\lib\net462\Microsoft.Web.WebView2.Core.dll" $dir -Force
-                Copy-Item "$extractDir\lib\net462\Microsoft.Web.WebView2.WinForms.dll" $dir -Force
-                Copy-Item "$extractDir\runtimes\win-x64\native\WebView2Loader.dll" $dir -Force
-                
-                Remove-Item $zipFile -Force -ErrorAction SilentlyContinue | Out-Null
-                Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
-            } catch {}
-        }
-
-        foreach ($csc in @("C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe", "C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe")) {
-            if (Test-Path $csc) {
-                & $csc /nologo /target:winexe /optimize+ /platform:x64 /lib:$dir /r:Microsoft.Web.WebView2.Core.dll /r:Microsoft.Web.WebView2.WinForms.dll /out:$dir\MiOS-Wallpaper.exe $dir\MiOS-Wallpaper.cs | Out-Null
-                & $csc /nologo /target:exe /optimize+ /platform:x64 /out:$dir\MiOS-Wallpaper-Service.exe /r:System.ServiceProcess.dll $dir\MiOS-Wallpaper-Service.cs | Out-Null
-                break
-            }
-        }
-
-        # Eliminate static Windows desktop/wallpaper images globally (zero static background)
-        $img0 = "C:\Windows\Web\Wallpaper\Windows\img0.jpg"
-        try {
-            if (Test-Path $img0) { Remove-Item $img0 -Force -Recurse -ErrorAction SilentlyContinue }
-            $4kDir = "C:\Windows\Web\4K\Wallpaper\Windows"
-            if (Test-Path $4kDir) {
-                Get-ChildItem -Path $4kDir -Filter "img0_*.jpg" -File -ErrorAction SilentlyContinue | ForEach-Object {
-                    Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-                }
-            }
-        } catch {}
-        
+        # Assets are staged by the supported image builder or explicitly installed
+        # by Install-MiOSLivingWallpaperAssets in the elevated live apply entry.
         $ansiDefaults = @('282262','DC271B','3E7765','F35C15','1A407F','734F39','B7C9D7','E7DFD3','948E8E','FF6B5C','5FAA8E','FF8540','3D6BA8','9D7660','E0E0E0','FFFFFF')
         $aParams = @()
         for ($i = 0; $i -lt 16; $i++) {

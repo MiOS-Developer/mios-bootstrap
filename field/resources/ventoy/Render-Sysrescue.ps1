@@ -146,12 +146,17 @@ foreach ($name in @('sysrescue_grub.cfg', 'sysrescue_syslinux.cfg', 'mios-kickst
         $renderedUser = $userLine.Value.Replace('__mios_ks_user__', [string]$credentials.username).Replace(' --lock', ' --iscrypted --password=' + $hash)
         $text = $text.Replace($userLine.Value, $renderedUser)
     } else {
-        if (-not $text.Contains('__MIOS_SR_ROOTPASS__') -or -not $text.Contains('__MIOS_SR_USERPASS__')) {
-            throw 'MiOS rescue credential placeholders are missing; no files were changed.'
+        $requiredPlaceholders = @('__MIOS_SR_ROOTPASS__')
+        if ($name -eq 'sysrescue_grub.cfg') { $requiredPlaceholders += '__MIOS_SR_WIPEPASS__' }
+        foreach ($placeholder in $requiredPlaceholders) {
+            if (-not $text.Contains($placeholder)) {
+                throw 'MiOS rescue credential placeholders are missing; no files were changed.'
+            }
         }
         if (-not $rootLogin) { $text = $text -replace 'rootpass=__MIOS_SR_ROOTPASS__\s*', '' }
-        $text = $text.Replace('__MIOS_SR_ROOTPASS__', $password).Replace('__MIOS_SR_USERPASS__', $password)
-        $text = $text.Replace('__MIOS_SR_WIPEPASS__', $wipe).Replace('by-label/MiOS-Field', 'by-label/' + $label)
+        $text = $text.Replace('__MIOS_SR_ROOTPASS__', $password)
+        if ($name -eq 'sysrescue_grub.cfg') { $text = $text.Replace('__MIOS_SR_WIPEPASS__', $wipe) }
+        $text = $text.Replace('by-label/MiOS-Field', 'by-label/' + $label)
         if (-not $nofirewall) { $text = $text.Replace(' nofirewall', '') }
     }
     if ($text -match '__MIOS_SR_|__mios_ks_user__') { throw 'An unresolved rescue placeholder remains; no files were changed.' }

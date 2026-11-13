@@ -11,6 +11,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('mios-build-user-config-' + [guid]::NewGuid().ToString('N'))
 $originalProfile = $env:USERPROFILE
+$originalSystemDrive = $env:SystemDrive
 $script:failed = 0
 $helperNames = @('Assert-MiosNoReparsePath', 'Set-MiosPrivateUserTomlAcl', 'Import-MiosUserToml',
                  'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder')
@@ -47,6 +48,29 @@ function Get-HereString([object]$Ast, [string]$VariableName) {
     })
     if ($strings.Count -ne 1) { throw "Expected exactly one generated $VariableName template." }
     return $strings[0].Extent.Text
+}
+
+function Test-UnsafeGeneratedGitCommand([object]$Command) {
+    if ($Command.GetCommandName() -ne 'git') { return $false }
+    $arguments = @($Command.CommandElements | Select-Object -Skip 1 | ForEach-Object { $_.Extent.Text.Trim("'", '"') })
+    return [bool](@($arguments | Where-Object { $_ -eq '--depth' -or $_.StartsWith('--depth=') }).Count -or
+        ($arguments -contains 'reset' -and $arguments -contains '--hard') -or
+        $arguments -contains 'clean' -or $arguments -contains 'stash')
+}
+
+function Test-GitCommandControls {
+    foreach ($control in @(
+        @{ Code = 'git merge --ff-only --no-autostash --no-overwrite-ignore FETCH_HEAD'; Unsafe = $false },
+        @{ Code = 'git fetch origin main'; Unsafe = $false },
+        @{ Code = 'git fetch --depth=1 origin main'; Unsafe = $true },
+        @{ Code = 'git reset --hard FETCH_HEAD'; Unsafe = $true },
+        @{ Code = 'git clean -fd'; Unsafe = $true },
+        @{ Code = 'git stash push'; Unsafe = $true }
+    )) {
+        $ast = Read-GeneratedAst $control.Code
+        $command = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)
+        Check ((Test-UnsafeGeneratedGitCommand $command) -eq $control.Unsafe) "git argument control: $($control.Code)"
+    }
 }
 
 function Get-GeneratedEntrypoints {
@@ -116,7 +140,7 @@ function Get-GeneratedEntrypoints {
         }, $true))
         Check (@($calls | Where-Object { $_.GetCommandName() -eq 'Update-MiosWindowsBuildCheckout' }).Count -gt 0) "$($surface.Name) invokes the canonical refresh"
         Check (-not @($calls | Where-Object {
-            $_.GetCommandName() -eq 'git' -and $_.Extent.Text -match '(--depth(?:=|\s)|reset\s+--hard|clean\s+-|stash\s+)'
+            Test-UnsafeGeneratedGitCommand $_
         }).Count) "$($surface.Name) contains no shallow fetch, force reset, clean, or stash"
     }
     $inline = @($pullAst.FindAll({ param($node)
@@ -185,6 +209,8 @@ function Get-GeneratedEntrypoints {
 function Invoke-PromotionFixture([string]$Name, [string]$Program, [string]$Failure = '') {
     $script:caseRoot = Join-Path $scratch ([guid]::NewGuid().ToString('N'))
     $env:USERPROFILE = $script:caseRoot
+    # Generated Windows paths stay inside this fixture on every Native platform.
+    $env:SystemDrive = $script:caseRoot
     $downloads = Join-Path $script:caseRoot 'Downloads'
     $private = Join-Path $script:caseRoot '.config\mios\mios.toml'
     $null = New-Item -ItemType Directory -Path $downloads -Force
@@ -202,7 +228,7 @@ function Invoke-PromotionFixture([string]$Name, [string]$Program, [string]$Failu
     [IO.File]::SetLastWriteTimeUtc($archived, [datetime]::UtcNow)
     $script:events = New-Object System.Collections.Generic.List[string]
     $script:failure = $Failure; $script:reached = $false; $script:synced = ''
-    $script:unexpected = $false
+    $script:unexpected = $false; $script:rejectedStage = ''
     function Test-Path {
         param([string]$LiteralPath, [string]$Path, [string]$PathType)
         $candidate = if ($LiteralPath) { $LiteralPath } else { $Path }
@@ -211,13 +237,13 @@ function Invoke-PromotionFixture([string]$Name, [string]$Program, [string]$Failu
     }
     function Resolve-MiosDevDistro {
         $script:events.Add('resolve')
-        if ($script:failure -eq 'resolve') { throw 'fixture resolver refused' }
+        if ($script:failure -eq 'resolve') { $script:rejectedStage = 'resolve'; throw 'fixture resolver refused' }
         return 'fixture-DEV'
     }
     function Import-MiosUserToml {
         param([string]$SourcePath, [string]$DestinationPath)
         $script:events.Add('import')
-        if ($script:failure -eq 'import') { throw 'fixture private import refused' }
+        if ($script:failure -eq 'import') { $script:rejectedStage = 'import'; throw 'fixture private import refused' }
         if (-not $DestinationPath) { $DestinationPath = Join-Path $env:USERPROFILE '.config\mios\mios.toml' }
         if ($DestinationPath -ne $private) { throw 'fixture refused a public destination' }
         $null = New-Item -ItemType Directory -Path (Split-Path -Parent $DestinationPath) -Force
@@ -227,7 +253,7 @@ function Invoke-PromotionFixture([string]$Name, [string]$Program, [string]$Failu
     function Sync-MiosUserTomlToBuilder {
         param([string]$Path, [string]$Distro, [string]$User)
         $script:events.Add('sync')
-        if ($script:failure -eq 'sync') { throw 'fixture private handoff refused' }
+        if ($script:failure -eq 'sync') { $script:rejectedStage = 'sync'; throw 'fixture private handoff refused' }
         if ($Path -ne $private -or $Distro -ne 'fixture-DEV' -or $User -ne 'mios') { throw 'fixture refused an unexpected handoff' }
         $script:synced = [IO.File]::ReadAllText($Path, (New-Object System.Text.UTF8Encoding($false)))
     }
@@ -243,14 +269,19 @@ function Invoke-PromotionFixture([string]$Name, [string]$Program, [string]$Failu
     function git { $script:unexpected = $true; throw 'fixture refused git' }
     function wsl.exe { $script:unexpected = $true; throw 'fixture refused WSL' }
     function podman { $script:unexpected = $true; throw 'fixture refused Podman' }
-    $threw = $false; $output = ''
+    $threw = $false; $output = ''; $fixtureError = ''
     try { $output = (& ([scriptblock]::Create($Program + "`n`$script:reached = `$true")) 6>&1 | Out-String) }
-    catch { $threw = $true; $output += $_.Exception.Message }
+    catch {
+        $threw = $true; $output += $_.Exception.Message
+        $fixtureError = $_.Exception.GetType().FullName + ': ' + $_.Exception.Message.Replace($secret, '[fixture secret redacted]')
+    }
     $label = "$Name $Failure".Trim()
     Check (-not $script:unexpected) "$label invokes no host command"
     Check (-not $output.Contains($secret)) "$label never logs a credential value"
     Check ([IO.File]::Exists($old) -and [IO.File]::Exists($archived)) "$label leaves older and previously imported downloads intact"
+    if ($threw -and -not $Failure) { Write-Host ('  FIXTURE_ERROR ' + $label + ': ' + $fixtureError) }
     if ($Failure) {
+        Check ($script:rejectedStage -eq $Failure) "$label reaches the intended failure control"
         Check ($threw -and -not $script:reached) "$label stops before overlay/build work"
         Check ([IO.File]::Exists($new)) "$label retains the last saved download"
         Check (-not $script:events.Contains('archive')) "$label never archives after a failed private write"
@@ -266,7 +297,7 @@ function Invoke-PromotionFixture([string]$Name, [string]$Program, [string]$Failu
 
 
 function Invoke-LosslessRefreshFixture([string]$Source, [switch]$NativeShell) {
-    $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop
+    $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
     $fixtureGit = $gitCommand.Source
     $fixtureRoot = Join-Path $scratch ('git-' + [guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $fixtureRoot -Force
@@ -288,7 +319,7 @@ function Invoke-LosslessRefreshFixture([string]$Source, [switch]$NativeShell) {
         return $result
     }
     if ($NativeShell) {
-        $shellCommand = Get-Command sh -CommandType Application -ErrorAction Stop
+        $shellCommand = Get-Command sh -CommandType Application -ErrorAction Stop | Select-Object -First 1
         if ($shellCommand.Name -notmatch '^sh(?:\.exe)?$') { throw 'A local POSIX sh executable is required; no WSL launcher may substitute.' }
         . ([scriptblock]::Create($script:nativeArgumentSource))
         function Update-MiosWindowsBuildCheckout {
@@ -382,6 +413,7 @@ function Invoke-LosslessRefreshFixture([string]$Source, [switch]$NativeShell) {
 
 try {
     $null = New-Item -ItemType Directory -Path $scratch -Force
+    Test-GitCommandControls
     $entries = @(Get-GeneratedEntrypoints)
     if ($entries.Count -ne 2) { throw 'Expected both generated entrypoints.' }
     foreach ($entry in $entries) {
@@ -446,5 +478,6 @@ function Update-MiosWindowsBuildCheckout {
     exit 0
 } finally {
     $env:USERPROFILE = $originalProfile
+    $env:SystemDrive = $originalSystemDrive
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 }

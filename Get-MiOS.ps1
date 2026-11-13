@@ -494,6 +494,143 @@ function Resolve-MiosVendorTomlText {
     }
 }
 
+# -- Host-tier credential guard (mios-boot-win-03) ------------------------------------------------------------
+# The operator's user layer (mios.html -> ~\.config\mios\mios.toml) carries the D0 credential. The HOST tier
+# (C:\etc\mios, M:\etc\mios) is read by every host consumer and must never hold it: only a credential-free
+# projection goes there, written by SYSTEM/Administrators (Users read). Credential keys are recognised by
+# name, the surface the mios_credentials resolver reads (default_password, *_password, password_hash,
+# wipe_passphrase, *_token, *_secret, api/private keys); values are never printed, only key names.
+$Script:MiosCredentialKeyRe = '(?i)(^|[._-])(password|passwd|passphrase|secret|token|otp|api_key|private_key)(_hash)?$'
+$Script:MiosCredentialInlineRe = '(?i)(^|[\s{,._-])(password|passwd|passphrase|secret|token|otp|api_key|private_key)(_hash)?\s*='
+
+function Split-MiosTomlKeyLine {
+    # 'key = value' -> @(key, value); a table header, comment or blank -> $null
+    param([string]$Line)
+    $t = $Line.TrimStart()
+    if (-not $t -or $t.StartsWith('#') -or $t.StartsWith('[')) { return $null }
+    $m = [regex]::Match($t, '^(?<key>("[^"]*"|''[^'']*''|[A-Za-z0-9_.\- ]+?))\s*=\s*(?<val>.*)$')
+    if (-not $m.Success) { return $null }
+    return , @($m.Groups['key'].Value.Trim().Trim('"', "'"), $m.Groups['val'].Value)
+}
+
+function Get-MiosTomlCredentialKeys {
+    # Section-qualified names of every credential key with a non-empty value. Never returns a value.
+    param([AllowEmptyString()][string]$Text)
+    $found = New-Object System.Collections.Generic.List[string]
+    $section = ''
+    foreach ($line in ($Text -split "`r?`n")) {
+        $h = [regex]::Match($line, '^\s*\[\[?\s*(?<s>[^\]]+?)\s*\]\]?\s*(#.*)?$')
+        if ($h.Success) { $section = $h.Groups['s'].Value; continue }
+        $kv = Split-MiosTomlKeyLine $line
+        if (-not $kv) { continue }
+        $name = if ($section) { "$section.$($kv[0])" } else { $kv[0] }
+        $val = ($kv[1] -replace '\s+#.*$', '').Trim()
+        if ($kv[0] -match $Script:MiosCredentialKeyRe -and $val -notmatch '^(""|''''|\[\s*\]|\{\s*\})$') { $found.Add($name) }
+        elseif ($val.StartsWith('{') -and $val -match $Script:MiosCredentialInlineRe) { $found.Add("$name{...}") }
+        elseif ($val.StartsWith('[') -and $val -match $Script:MiosCredentialInlineRe) { $found.Add("$name[...]") }
+    }
+    return $found.ToArray()   # callers wrap in @(): an empty list is then @(), never one empty element
+}
+
+function ConvertTo-MiosCredentialFreeToml {
+    # The operator layer without any credential line: a credential key's whole value (multi-line string or array
+    # included) and any inline table/array line naming a credential key are dropped; everything else is kept.
+    param([AllowEmptyString()][string]$Text)
+    $out = New-Object System.Collections.Generic.List[string]
+    $skipUntil = $null
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($skipUntil) {
+            if ($line.Contains($skipUntil)) { $skipUntil = $null }
+            continue
+        }
+        $kv = Split-MiosTomlKeyLine $line
+        if ($kv) {
+            $val = $kv[1].Trim()
+            $isCred = $kv[0] -match $Script:MiosCredentialKeyRe
+            $inline = ($val.StartsWith('{') -or $val.StartsWith('[')) -and $val -match $Script:MiosCredentialInlineRe
+            if ($isCred -or $inline) {
+                foreach ($q in '"""', "'''") {
+                    if ($val.StartsWith($q) -and ([regex]::Matches($val, [regex]::Escape($q))).Count -lt 2) { $skipUntil = $q }
+                }
+                if (-not $skipUntil -and $val.StartsWith('[') -and -not $val.Contains(']')) { $skipUntil = ']' }
+                continue
+            }
+        }
+        $out.Add($line)
+    }
+    return ($out -join "`r`n")
+}
+
+function Set-MiosHostTierAcl {
+    # Host tier file: SYSTEM + Administrators write, Users read (it is credential-free by construction).
+    param([Parameter(Mandatory)][string]$Path)
+    $acl = New-Object System.Security.AccessControl.FileSecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($g in @(@('S-1-5-18', 'FullControl'), @('S-1-5-32-544', 'FullControl'), @('S-1-5-32-545', 'ReadAndExecute'))) {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier $g[0]
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $g[1], 'Allow')))
+    }
+    $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'))
+    [IO.File]::SetAccessControl($Path, $acl)
+}
+
+function Write-MiosHostToml {
+    # The ONLY writer of an operator layer into a host-tier path: projection, proven credential-free, then ACL'd.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $proj = ConvertTo-MiosCredentialFreeToml $Text
+    $left = @(Get-MiosTomlCredentialKeys $proj)
+    if ($left.Count) { throw "credential-free projection for $Path still names credential keys ($($left -join ', ')); not written" }
+    $dir = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    [IO.File]::WriteAllText($Path, $proj, (New-Object System.Text.UTF8Encoding($false)))
+    try { Set-MiosHostTierAcl $Path } catch { Write-Host "  [!] host-tier ACL on $Path not set: $($_.Exception.Message)" -ForegroundColor Yellow }
+    $dropped = @(Get-MiosTomlCredentialKeys $Text)
+    if ($dropped.Count) { Write-Host "  [+] $Path written without credential keys: $($dropped -join ', ')" -ForegroundColor DarkGray }
+}
+
+function Repair-MiosHostTierCredentials {
+    # Earlier bootstrap versions copied the operator layer verbatim into the host tier: rewrite any such copy as the
+    # credential-free projection. Reports key names only. Returns the paths it repaired.
+    param([string[]]$Paths = @())
+    $fixed = @()
+    foreach ($p in $Paths) {
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
+        $raw = [IO.File]::ReadAllText($p)
+        $keys = @(Get-MiosTomlCredentialKeys $raw)
+        if (-not $keys.Count) { continue }
+        Write-Host "  [!] host-tier $p held credential keys ($($keys -join ', ')): rewriting it credential-free" -ForegroundColor Yellow
+        Write-MiosHostToml -Path $p -Text $raw
+        $fixed += $p
+    }
+    return $fixed
+}
+
+function Get-MiosTomlTableArray {
+    # [[Name]] array-of-tables from the layered TOML text as hashtables (single-line scalar values only), first
+    # layer that declares any wins. Used for SSOT lists that must carry a reason per entry.
+    param([Parameter(Mandatory)][string]$Name)
+    foreach ($txt in @((Resolve-MiosTomlText), (Resolve-MiosVendorTomlText))) {
+        if (-not $txt) { continue }
+        $rx = '(?ms)^\[\[' + [regex]::Escape($Name) + '\]\][ \t]*\r?\n(?<body>.*?)(?=^\[|\z)'
+        $ms = [regex]::Matches($txt, $rx)
+        if (-not $ms.Count) { continue }
+        $rows = @()
+        foreach ($m in $ms) {
+            $row = @{}
+            foreach ($line in ($m.Groups['body'].Value -split "`r?`n")) {
+                $kv = Split-MiosTomlKeyLine $line
+                if (-not $kv) { continue }
+                $v = ($kv[1] -replace '\s+#.*$', '').Trim()
+                if ($v.Length -ge 2 -and (($v[0] -eq '"' -and $v[-1] -eq '"') -or ($v[0] -eq "'" -and $v[-1] -eq "'"))) { $v = $v.Substring(1, $v.Length - 2) }
+                $row[$kv[0]] = $v
+            }
+            $rows += , $row
+        }
+        return $rows   # one hashtable per entry; callers wrap in @()
+    }
+    return @()
+}
+
 function Get-MiosTomlValue {
     param(
         [Parameter(Mandatory)] [string]$Section,   # e.g. "terminal" or "bootstrap.host_storage"
@@ -3091,13 +3228,30 @@ function mios-build {
             `$tomlSrc = Get-ChildItem -LiteralPath `$dlDir -Filter 'mios*.toml' -File -ErrorAction SilentlyContinue |
                 Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
             if (`$tomlSrc) {
-                `$tomlDst = if (Test-Path 'M:\etc\mios') { 'M:\etc\mios\mios.toml' } else { Join-Path `$_sysDrive 'etc\mios\mios.toml' }
+                # mios-boot-win-03: the saved configurator file carries the D0 credential, so it is the USER tier:
+                # ~\.config\mios\mios.toml here, and ~/.config/mios/mios.toml (0600, written from stdin, never a
+                # command line) for the builder distro's mios user. It is never copied into C:\etc\mios or M:\etc\mios.
+                `$tomlDst = Join-Path `$env:USERPROFILE '.config\mios\mios.toml'
                 `$tomlPar = Split-Path -Parent `$tomlDst
                 if (-not (Test-Path -LiteralPath `$tomlPar)) {
                     New-Item -ItemType Directory -Path `$tomlPar -Force | Out-Null
                 }
                 Copy-Item -LiteralPath `$tomlSrc.FullName -Destination `$tomlDst -Force
-                Write-Host ('         [+] '+`$tomlSrc.Name+' -> '+`$tomlDst) -ForegroundColor Green
+                Write-Host ('         [+] '+`$tomlSrc.Name+' -> '+`$tomlDst+' (user tier)') -ForegroundColor Green
+                `$_devDistro = `$null
+                try {
+                    `$_wsl = (& wsl.exe -l -q 2>`$null) -split "`r?`n" | ForEach-Object { (`$_ -replace [char]0,'').Trim() } | Where-Object { `$_ }
+                    foreach (`$_cand in @('podman-MiOS-DEV','MiOS-DEV','podman-MiOS-BUILDER','MiOS-BUILDER')) { if (`$_wsl -contains `$_cand) { `$_devDistro = `$_cand; break } }
+                } catch {}
+                if (`$_devDistro) {
+                    `$_put = 'umask 077 && mkdir -p "`$HOME/.config/mios" && cat > "`$HOME/.config/mios/mios.toml.new" && chmod 600 "`$HOME/.config/mios/mios.toml.new" && mv -f "`$HOME/.config/mios/mios.toml.new" "`$HOME/.config/mios/mios.toml"'
+                    `$_enc = `$OutputEncoding; `$OutputEncoding = New-Object System.Text.UTF8Encoding(`$false)   # 5.1 pipes ASCII to natives
+                    try { Get-Content -LiteralPath `$tomlDst -Raw -Encoding UTF8 | & wsl.exe -d `$_devDistro --user mios -- sh -c `$_put } finally { `$OutputEncoding = `$_enc }
+                    if (`$LASTEXITCODE -eq 0) { Write-Host ('         [+] user layer -> '+`$_devDistro+':~mios/.config/mios/mios.toml (0600)') -ForegroundColor Green }
+                    else { Write-Host ('         [!] user layer not written into '+`$_devDistro+' (exit '+`$LASTEXITCODE+')') -ForegroundColor Yellow }
+                } else {
+                    Write-Host '         [-] no MiOS-DEV distro yet: the user layer stays in the Windows user tier' -ForegroundColor DarkGray
+                }
                 `$archive = Join-Path `$dlDir (`$tomlSrc.BaseName+'.imported-'+`$stamp+'.toml')
                 Move-Item -LiteralPath `$tomlSrc.FullName -Destination `$archive -Force
             } else {
@@ -4122,35 +4276,62 @@ if ($env:MIOS_GETMIOS_FUNCTIONS_ONLY) {
     return
 }
 
+# mios-boot-win-04: Defender exclusions exist only where the SSOT declares them, narrowly and with a reason:
+#   [[security.defender_exclusions.path]]     path = '...'  reason = '...'
+#   [[security.defender_exclusions.process]]  path = '...'  reason = '...'
+# No code default. Refused even when declared: a drive root, %TEMP%/%TMP% (machine or user) and anything under
+# them, a user profile root and the AppData roots -- places any local user or download can write to.
+function Test-MiosDefenderExclusionRefused {
+    # $null when the path may be excluded, else the reason it is refused.
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return 'empty path' }
+    $p = ([Environment]::ExpandEnvironmentVariables($Path.Trim())).TrimEnd('\')
+    if ($p -match '^[A-Za-z]:$') { return 'a whole drive' }
+    if ($p -match '[*?]') { return 'a wildcard' }
+    $wide = @($env:TEMP, $env:TMP, [Environment]::GetEnvironmentVariable('TEMP', 'Machine'), [Environment]::GetEnvironmentVariable('TMP', 'Machine'),
+              (Join-Path $env:SystemRoot 'Temp'))
+    foreach ($w in $wide) {
+        if (-not $w) { continue }
+        $w = ([Environment]::ExpandEnvironmentVariables($w)).TrimEnd('\')
+        if ($p -ieq $w -or $p.StartsWith($w + '\', [StringComparison]::OrdinalIgnoreCase)) { return "a temp directory ($w)" }
+    }
+    foreach ($r in @($env:USERPROFILE, $env:LOCALAPPDATA, $env:APPDATA, (Split-Path -Parent $env:USERPROFILE))) {
+        if ($r -and $p -ieq $r.TrimEnd('\')) { return "a profile or AppData root ($r)" }
+    }
+    return $null
+}
+
+function Get-MiosDefenderExclusionPlan {
+    # @{ paths = @(...); processes = @(...); refused = @('kind path: why') } from the SSOT tables above.
+    $plan = @{ paths = @(); processes = @(); refused = @() }
+    foreach ($kind in 'path', 'process') {
+        foreach ($row in @(Get-MiosTomlTableArray "security.defender_exclusions.$kind")) {
+            $path = [string]$row['path']; $why = [string]$row['reason']
+            if ([string]::IsNullOrWhiteSpace($why)) { $plan.refused += "$kind ${path}: no reason declared"; continue }
+            $bad = Test-MiosDefenderExclusionRefused $path
+            if ($bad) { $plan.refused += "$kind ${path}: $bad"; continue }
+            if ($kind -eq 'path') { $plan.paths += [Environment]::ExpandEnvironmentVariables($path) } else { $plan.processes += [Environment]::ExpandEnvironmentVariables($path) }
+        }
+    }
+    return $plan
+}
+
 function Add-MiosDefenderExclusions {
     if (-not (Get-Command Add-MpPreference -ErrorAction SilentlyContinue)) { return }
-    $_sysDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
-    $_defaultPaths = @(
-        (Join-Path $_sysDrive 'MiOS'),
-        (Join-Path $_sysDrive 'MiOS\bin'),
-        (Join-Path $_sysDrive 'usr'),
-        (Join-Path $_sysDrive 'etc\mios'),
-        'M:\',
-        'M:\MiOS',
-        (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet'),
-        $env:TEMP
-    )
-    $_defaultProcs = @(
-        (Join-Path $_sysDrive 'MiOS\bin\mios-launch.exe'),
-        (Join-Path $_sysDrive 'MiOS\bin\fastfetch.exe'),
-        (Join-Path $_sysDrive 'MiOS\bin\btop.exe'),
-        'M:\MiOS\bin\mios-launch.exe'
-    )
-    $excPaths = @(Get-MiosTomlValue -Section 'security.defender_exclusions' -Key 'paths'     -Default $_defaultPaths)
-    $excProcs = @(Get-MiosTomlValue -Section 'security.defender_exclusions' -Key 'processes' -Default $_defaultProcs)
-    foreach ($p in $excPaths) {
-        if ([string]::IsNullOrWhiteSpace($p)) { continue }
-        try { Add-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue } catch {}
-    }
-    foreach ($p in $excProcs) {
-        if ([string]::IsNullOrWhiteSpace($p)) { continue }
-        try { Add-MpPreference -ExclusionProcess $p -ErrorAction SilentlyContinue } catch {}
-    }
+    # Earlier versions excluded the whole temp directory and the whole M: drive by default: remove exactly those.
+    try {
+        $cur = @((Get-MpPreference -ErrorAction Stop).ExclusionPath)
+        foreach ($legacy in @($env:TEMP, 'M:\', 'M:')) {
+            if ($legacy -and ($cur -contains $legacy)) {
+                Remove-MpPreference -ExclusionPath $legacy -ErrorAction Stop
+                Write-Host "  [+] removed the broad Defender exclusion an earlier bootstrap added: $legacy" -ForegroundColor Green
+            }
+        }
+    } catch { Write-Host "  [!] could not review existing Defender exclusions: $($_.Exception.Message)" -ForegroundColor Yellow }
+    $plan = Get-MiosDefenderExclusionPlan
+    foreach ($r in $plan.refused) { Write-Host "  [!] Defender exclusion refused ($r)" -ForegroundColor Yellow }
+    foreach ($p in $plan.paths) { Add-MpPreference -ExclusionPath $p -ErrorAction Stop; Write-Host "  [+] Defender exclusion (SSOT): $p" -ForegroundColor DarkGray }
+    foreach ($p in $plan.processes) { Add-MpPreference -ExclusionProcess $p -ErrorAction Stop; Write-Host "  [+] Defender process exclusion (SSOT): $p" -ForegroundColor DarkGray }
 }
 try { Add-MiosDefenderExclusions } catch { Write-Host "  [!] Defender exclusion add failed (non-fatal, AMSI may still block): $($_.Exception.Message)" -ForegroundColor Yellow }
 
@@ -4310,20 +4491,17 @@ try {
                 [IO.File]::WriteAllText($_mDst, $_miosVendorToml, (New-Object System.Text.UTF8Encoding($false)))
             } catch {}
         }
+        # mios-boot-win-03: a credential-bearing copy an earlier bootstrap left in the host tier is rewritten first
+        $_hostTier = @((Join-Path $_sysDrive 'etc\mios\mios.toml'), 'M:\etc\mios\mios.toml')
+        try { $null = Repair-MiosHostTierCredentials -Paths $_hostTier } catch { Write-Host "  [!] host-tier credential repair failed: $($_.Exception.Message)" -ForegroundColor Yellow }
         if ($_miosHostToml) {
-            $_hostDst = Join-Path $_sysDrive 'etc\mios\mios.toml'
-            $_hostDir = Split-Path -Parent $_hostDst
-            if (-not (Test-Path -LiteralPath $_hostDir)) { New-Item -ItemType Directory -Path $_hostDir -Force | Out-Null }
-            [IO.File]::WriteAllText($_hostDst, $_miosHostToml, (New-Object System.Text.UTF8Encoding($false)))
+            # The operator layer stays in the user tier (~\.config\mios); the host tier gets its credential-free projection.
+            Write-MiosHostToml -Path (Join-Path $_sysDrive 'etc\mios\mios.toml') -Text $_miosHostToml
             if (Test-Path 'M:\') {
-                try {
-                    $_mHostDst = 'M:\etc\mios\mios.toml'
-                    $_mHostDir = Split-Path -Parent $_mHostDst
-                    if (-not (Test-Path -LiteralPath $_mHostDir)) { New-Item -ItemType Directory -Path $_mHostDir -Force | Out-Null }
-                    [IO.File]::WriteAllText($_mHostDst, $_miosHostToml, (New-Object System.Text.UTF8Encoding($false)))
-                } catch {}
+                try { Write-MiosHostToml -Path 'M:\etc\mios\mios.toml' -Text $_miosHostToml }
+                catch { Write-Host "  [!] M:\etc\mios projection not written: $($_.Exception.Message)" -ForegroundColor Yellow }
             }
-            Write-Host "  [+] Full vendor mios.toml -> $_sysDrive\usr\share\mios; operator profile -> $_sysDrive\etc\mios" -ForegroundColor DarkGray
+            Write-Host "  [+] Full vendor mios.toml -> $_sysDrive\usr\share\mios; operator profile (credential-free) -> $_sysDrive\etc\mios" -ForegroundColor DarkGray
         } else {
             Write-Host "  [+] Full vendor mios.toml -> $_sysDrive\usr\share\mios (no host override found)" -ForegroundColor DarkGray
         }
@@ -4347,14 +4525,27 @@ try { Ensure-MiOSWinget | Out-Null } catch { Write-Host "  [!] Ensure-MiOSWinget
 try {
     $_hvWslGuid = '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}'
     if (Get-Command Set-NetFirewallHyperVVMSetting -ErrorAction SilentlyContinue) {
+        # mios-boot-win-04: inbound to the WSL VM stays blocked by default (Windows' own default; this also undoes the
+        # DefaultInboundAction Allow earlier versions set). Inbound opens only through SSOT-declared rules with a reason:
+        #   [[wsl2.inbound]]  name = '...'  protocol = 'TCP'  local_port = '...'  remote_address = '...'  reason = '...'
         Set-NetFirewallHyperVVMSetting -Name $_hvWslGuid `
             -Enabled True `
-            -DefaultInboundAction Allow `
+            -DefaultInboundAction Block `
             -DefaultOutboundAction Allow `
             -LoopbackEnabled True `
             -AllowHostPolicyMerge True `
             -ErrorAction Stop
-        Write-Host '  [+] Hyper-V Firewall: WSL VM creator set to Allow + LoopbackEnabled.' -ForegroundColor Green
+        Write-Host '  [+] Hyper-V Firewall: WSL VM inbound Block by default, loopback enabled.' -ForegroundColor Green
+        foreach ($_rule in @(Get-MiosTomlTableArray 'wsl2.inbound')) {
+            $_need = @('name', 'protocol', 'local_port', 'remote_address', 'reason') | Where-Object { [string]::IsNullOrWhiteSpace([string]$_rule[$_]) }
+            if ($_need) { Write-Host "  [!] [[wsl2.inbound]] '$($_rule['name'])' refused: missing $($_need -join ', ')" -ForegroundColor Yellow; continue }
+            if ([string]$_rule['remote_address'] -match '^(?i)(any|\*|0\.0\.0\.0/0|::/0)$') { Write-Host "  [!] [[wsl2.inbound]] '$($_rule['name'])' refused: remote_address must be scoped" -ForegroundColor Yellow; continue }
+            $_rn = 'MiOS-WSL-' + ([string]$_rule['name'] -replace '[^A-Za-z0-9-]', '-')
+            Remove-NetFirewallHyperVRule -Name $_rn -ErrorAction SilentlyContinue
+            New-NetFirewallHyperVRule -Name $_rn -DisplayName $_rn -VMCreatorId $_hvWslGuid -Direction Inbound -Action Allow `
+                -Protocol ([string]$_rule['protocol']) -LocalPorts ([string]$_rule['local_port']) -RemoteAddresses ([string]$_rule['remote_address']) -ErrorAction Stop | Out-Null
+            Write-Host "  [+] WSL inbound rule (SSOT): $_rn $($_rule['protocol'])/$($_rule['local_port']) from $($_rule['remote_address'])" -ForegroundColor DarkGray
+        }
     } else {
         Write-Host '  [!] Set-NetFirewallHyperVVMSetting cmdlet missing -- Windows < 11 22H2? Hyper-V firewall step skipped.' -ForegroundColor Yellow
     }

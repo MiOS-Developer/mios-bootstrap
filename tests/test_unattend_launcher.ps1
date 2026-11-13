@@ -1,5 +1,8 @@
 # Native PowerShell fixtures for bounded answer-file launchers. Only synthetic
 # scripts run, in scratch directories; no Windows provisioning entry runs.
+# Synthetic children replace only three exact OS/filesystem calls. The real
+# Windows folder lookup, reparse metadata, owner/DACL and cache retention remain
+# separate Windows acceptance; no product environment override is introduced.
 # Windows Setup's retention of custom XML is a separate installation acceptance.
 # Native: pwsh -NoProfile -File tests/test_unattend_launcher.ps1 -VendorToml <MiOS>/usr/share/mios/mios.toml
 #Requires -Version 5.1
@@ -20,12 +23,18 @@ $scratch = Join-Path ([IO.Path]::GetTempPath()) ('mios-unattend-fixture-' + [Gui
 $null = [IO.Directory]::CreateDirectory((Join-Path $scratch 'Panther'))
 $answer = Join-Path (Join-Path $scratch 'Panther') 'unattend.xml'
 $resultFile = Join-Path $scratch 'result.txt'
-$utf8 = [Text.UTF8Encoding]::new($false, $true)
 $unicode = [Text.UnicodeEncoding]::new($false, $false, $true)
 $script:assertions = 0
 $secret = 'fixture-private-password-' + [Guid]::NewGuid().ToString('N')
-$oldWindir = $env:WINDIR; $oldResult = $env:MIOS_UNATTEND_FIXTURE_RESULT
-$env:WINDIR = $scratch; $env:MIOS_UNATTEND_FIXTURE_RESULT = $resultFile
+$fixtureEnvironment = @('MIOS_UNATTEND_FIXTURE_RESULT','MIOS_UNATTEND_FIXTURE_ANSWER','MIOS_UNATTEND_FIXTURE_WINDOWS','MIOS_UNATTEND_FIXTURE_REPARSE','MIOS_UNATTEND_FIXTURE_TRACE','MIOS_UNATTEND_FIXTURE_OPEN')
+$savedEnvironment = @{}
+foreach ($name in $fixtureEnvironment) { $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+$env:MIOS_UNATTEND_FIXTURE_RESULT = $resultFile
+$env:MIOS_UNATTEND_FIXTURE_ANSWER = $answer
+$env:MIOS_UNATTEND_FIXTURE_WINDOWS = 'C:\Windows'
+$env:MIOS_UNATTEND_FIXTURE_REPARSE = ''
+$env:MIOS_UNATTEND_FIXTURE_TRACE = Join-Path $scratch 'attributes.txt'
+$env:MIOS_UNATTEND_FIXTURE_OPEN = Join-Path $scratch 'cache-opened.txt'
 $CANONICAL_BOOTSTRAP = 'https://example.invalid/fixture.ps1'
 $BootstrapUrl = ''; $ObfuscatePasswords = $true; $FullDiskWindows = $true
 
@@ -41,11 +50,25 @@ function Set-FixtureAnswer([string]$PayloadName, [string]$Base64, [string]$Extra
     Write-MiOSPrivateText -Path $answer -Text $xml
 }
 function Invoke-FixtureLauncher($Payload) {
-    $match = [regex]::Match($Payload.CommandLine, '^powershell\.exe -NoProfile -NonInteractive -Command "(?<body>[^"]+)"$')
-    Assert-True $match.Success 'launcher has the fixed local, noninteractive command form without execution-policy overrides'
+    $match = [regex]::Match($Payload.CommandLine, '^powershell\.exe -nop -c "(?<body>[^"]+)"$')
+    Assert-True $match.Success 'launcher has the fixed command form without execution-policy overrides'
+    $body = $match.Groups['body'].Value
+    $boundaries = @('[Environment]::GetFolderPath(36)', '[IO.File]::GetAttributes($p)', '[Xml.XmlReader]::Create($p,')
+    foreach ($boundary in $boundaries) {
+        Assert-True (([regex]::Matches($body, [regex]::Escape($boundary))).Count -eq 1) 'each synthetic filesystem boundary has one exact source call'
+    }
+    Assert-True (-not $body.Contains('$env:WINDIR')) 'product launcher never sources its Windows directory from mutable environment'
+    # Explicit child-copy mocks, leaving path validation/order, XML, digest,
+    # Unicode, invocation and failure handling as the actual product source.
+    foreach ($trace in @($env:MIOS_UNATTEND_FIXTURE_TRACE, $env:MIOS_UNATTEND_FIXTURE_OPEN)) { if ([IO.File]::Exists($trace)) { [IO.File]::Delete($trace) } }
+    $body = $body.Replace($boundaries[0], '$env:MIOS_UNATTEND_FIXTURE_WINDOWS')
+    $body = $body.Replace($boundaries[1], '(Get-MiOSFixtureAttributes $p)')
+    $body = $body.Replace($boundaries[2], '[Xml.XmlReader]::Create($(& { [IO.File]::WriteAllText($env:MIOS_UNATTEND_FIXTURE_OPEN, ''opened''); $env:MIOS_UNATTEND_FIXTURE_ANSWER }),')
+    $prelude = 'function Get-MiOSFixtureAttributes { param([string]$Path) [IO.File]::AppendAllText($env:MIOS_UNATTEND_FIXTURE_TRACE,$Path+[char]10); if($Path -ceq $env:MIOS_UNATTEND_FIXTURE_REPARSE){return [IO.FileAttributes]1024};return [IO.FileAttributes]16 }; '
+
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = (Get-Process -Id $PID).Path
-    $start.Arguments = $Payload.CommandLine.Substring('powershell.exe '.Length)
+    $start.Arguments = '-nop -c "' + $prelude + $body + '"'
     Assert-True (($start.FileName.Length + 3 + $start.Arguments.Length) -lt 32767) 'fixture child command fits CreateProcess including quoted executable and NUL'
     $start.UseShellExecute = $false; $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
@@ -64,7 +87,7 @@ function Assert-Refused($Payload, [string]$Label) {
     $run = Invoke-FixtureLauncher $Payload
     Assert-True ($run.ExitCode -ne 0) $Label
     Assert-True (-not [IO.File]::Exists($resultFile)) 'refusal occurs before any payload statement'
-    Assert-True ($run.Error.Contains('MiOS unattended payload failed.')) 'failure reports a fixed diagnostic'
+    Assert-True ($run.Error.Contains('MiOS payload failed.')) 'failure reports a fixed diagnostic'
 }
 try {
     # A single script far beyond the original command-line limit; retain mixed
@@ -111,6 +134,22 @@ try {
     Assert-Refused $namespacePayload 'missing extension namespace refuses'
     Write-MiOSPrivateText -Path $answer -Text ($xmlPrefix + $extension + $extension + '</unattend>')
     Assert-Refused $namespacePayload 'duplicate extension containers refuse before payload invocation'
+    # The actual guard must refuse before any attribute/open boundary is called.
+    Set-FixtureAnswer FirstLogonScript $namespacePayload.Base64
+    $env:MIOS_UNATTEND_FIXTURE_WINDOWS = '\\example.invalid\Windows'
+    Assert-Refused $namespacePayload 'UNC known-folder value refuses before filesystem access'
+    Assert-True (-not [IO.File]::Exists($env:MIOS_UNATTEND_FIXTURE_TRACE)) 'UNC refusal performs no attribute lookup'
+    Assert-True (-not [IO.File]::Exists($env:MIOS_UNATTEND_FIXTURE_OPEN)) 'UNC refusal never opens the cache'
+    $env:MIOS_UNATTEND_FIXTURE_WINDOWS = 'C:\Windows'
+    $expectedPaths = @('C:\', 'C:\\Windows', 'C:\\Windows\Panther', 'C:\\Windows\Panther\unattend.xml')
+    for ($i = 0; $i -lt $expectedPaths.Count; $i++) {
+        $env:MIOS_UNATTEND_FIXTURE_REPARSE = $expectedPaths[$i]
+        Assert-Refused $namespacePayload 'reparse component refuses before cache open'
+        $trace = [IO.File]::ReadAllText($env:MIOS_UNATTEND_FIXTURE_TRACE)
+        Assert-True ($trace -ceq (($expectedPaths[0..$i] -join ([string][char]10)) + [char]10)) 'attribute guards walk root-first and stop before traversing a reparse component'
+        Assert-True (-not [IO.File]::Exists($env:MIOS_UNATTEND_FIXTURE_OPEN)) 'reparse refusal never opens the cache'
+    }
+    $env:MIOS_UNATTEND_FIXTURE_REPARSE = ''
     $throwing = New-MiOSUnattendPayload -Name FirstLogonScript -Script ('throw ''' + $secret + '''')
     Set-FixtureAnswer FirstLogonScript $throwing.Base64
     Assert-Refused $throwing 'terminating script failure returns nonzero without logging its credential-bearing exception'
@@ -121,9 +160,9 @@ try {
     $invalidBytes = [byte[]]@(0, 216)
     $invalid = New-MiOSUnattendPayload -Name FirstLogonScript -Script 'exit 0'
     $hash = [Security.Cryptography.SHA256]::Create()
-    try { $invalidDigest = ([BitConverter]::ToString($hash.ComputeHash($invalidBytes))).Replace('-', '') }
+    try { $invalidDigest = [Convert]::ToBase64String($hash.ComputeHash($invalidBytes)) }
     finally { $hash.Dispose() }
-    $invalid.CommandLine = [regex]::Replace($invalid.CommandLine, '[A-F0-9]{64}', $invalidDigest)
+    $invalid.CommandLine = [regex]::Replace($invalid.CommandLine, '[A-Za-z0-9+/]{43}=', $invalidDigest)
     Set-FixtureAnswer FirstLogonScript ([Convert]::ToBase64String($invalidBytes))
     Assert-Refused $invalid 'strict runtime UTF-16 decoding refuses malformed payload bytes'
     $exiting = New-MiOSUnattendPayload -Name FirstLogonScript -Script 'exit 23'
@@ -180,6 +219,6 @@ try {
     }
     Write-Host "UNATTEND_LAUNCHER_REGRESSIONS PASS ($script:assertions assertions)"
 } finally {
-    $env:WINDIR = $oldWindir; $env:MIOS_UNATTEND_FIXTURE_RESULT = $oldResult
+    foreach ($name in $fixtureEnvironment) { [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process') }
     if ([IO.Directory]::Exists($scratch)) { [IO.Directory]::Delete($scratch, $true) }
 }

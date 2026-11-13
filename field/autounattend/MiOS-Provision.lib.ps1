@@ -79,9 +79,10 @@ function ConvertFrom-MiosTomlValue {
 function ConvertFrom-MiosTomlFile {
     param([string]$Path)
     $r = New-MiosTomlView
+    if ($Path -and -not [IO.Path]::IsPathRooted($Path)) { $Path = Join-Path (Get-Location).ProviderPath $Path }
     if (-not $Path -or -not [IO.File]::Exists($Path)) { return $r }
     $section = ''; $cur = $null; $multiDelimiter = $null; $multiKey = ''; $multiText = [Text.StringBuilder]::new()
-    foreach ($raw in [IO.File]::ReadAllLines([IO.Path]::GetFullPath($Path))) {
+    foreach ($raw in [IO.File]::ReadAllLines([IO.Path]::GetFullPath($Path), [Text.UTF8Encoding]::new($false, $true))) {
         if ($multiDelimiter) {
             $end = $raw.IndexOf($multiDelimiter, [StringComparison]::Ordinal)
             if ($end -lt 0) { [void]$multiText.AppendLine($raw); continue }
@@ -179,6 +180,7 @@ function Write-MiOSPrivateText {
         else { throw 'MiOS SSOT: unsupported private output encoding' }
     }
     if ($Encoding -isnot [Text.Encoding]) { throw 'MiOS SSOT: invalid private output encoding' }
+    $Encoding = $Encoding.Clone(); $Encoding.EncoderFallback = [Text.EncoderFallback]::ExceptionFallback
     $target = [IO.Path]::GetFullPath($Path); $dir = [IO.Path]::GetDirectoryName($target)
     if (-not [IO.Directory]::Exists($dir)) { throw 'MiOS SSOT: private output directory is absent' }
     $tmp = [IO.Path]::Combine($dir, '.mios-private-' + [Guid]::NewGuid().ToString('N'))
@@ -217,7 +219,7 @@ function Import-MiOSResolvedCredentials {
     param($Toml, [string]$Path)
     Assert-MiOSPrivateFile -Path $Path
     if ((Get-Item -LiteralPath $Path).Length -gt 8388608) { throw 'MiOS SSOT: private credential projection is oversized' }
-    try { $doc = [IO.File]::ReadAllText($Path) | ConvertFrom-Json -ErrorAction Stop }
+    try { $doc = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json -ErrorAction Stop }
     catch { throw 'MiOS SSOT: invalid private credential projection' }
     if (@($doc.PSObject.Properties.Name).Count -ne 4 -or @($doc.PSObject.Properties.Name | Where-Object { $_ -cnotin @('schema','scalars','accounts','has_accounts') }).Count -ne 0 -or $doc.schema -cne 'mios-resolved-credentials/1' -or $doc.scalars -isnot [pscustomobject] -or $doc.accounts -isnot [Array] -or $doc.has_accounts -isnot [bool] -or $doc.has_accounts -ne ($doc.accounts.Count -gt 0)) { throw 'MiOS SSOT: invalid private credential projection schema' }
     $projection = New-MiosTomlView

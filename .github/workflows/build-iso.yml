@@ -41,16 +41,78 @@ jobs:
           $ErrorActionPreference = 'Stop'
           . ./field/autounattend/MiOS-Provision.lib.ps1
           $fixtureDir = Join-Path $env:RUNNER_TEMP ('mios-unattend-' + [Guid]::NewGuid().ToString('N'))
+          function Invoke-MiosCiGit {
+              param([string]$Repository, [string[]]$Arguments)
+              $output = & git -c credential.helper= -c core.hooksPath=NUL -c core.fsmonitor=false -c maintenance.auto=false -c gc.auto=0 -C $Repository @Arguments
+              if ($LASTEXITCODE -ne 0) { throw 'Canonical vendor Git data operation failed.' }
+              return $output
+          }
+          function Export-MiosCiVendorBlob {
+              param([string]$Repository, [string]$Blob, [string]$Destination)
+              $start = [Diagnostics.ProcessStartInfo]::new()
+              $start.FileName = (Get-Command git -CommandType Application -ErrorAction Stop).Source
+              $start.UseShellExecute = $false
+              $start.RedirectStandardOutput = $true
+              $start.RedirectStandardError = $true
+              foreach ($argument in @('-c', 'credential.helper=', '-c', 'core.hooksPath=NUL', '-C', $Repository, 'cat-file', 'blob', $Blob)) { $start.ArgumentList.Add($argument) }
+              $process = [Diagnostics.Process]::Start($start)
+              try {
+                  $errors = $process.StandardError.ReadToEndAsync()
+                  $stream = [IO.FileStream]::new($Destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                  try { $process.StandardOutput.BaseStream.CopyTo($stream) } finally { $stream.Dispose() }
+                  $process.WaitForExit()
+                  $null = $errors.GetAwaiter().GetResult()
+                  if ($process.ExitCode -ne 0) { throw 'Canonical vendor blob read failed.' }
+              } finally { $process.Dispose() }
+          }
           $layerNames = @('MIOS_BOOTSTRAP_BASE_TOML', 'MIOS_VENDOR_TOML_D', 'MIOS_HOST_TOML', 'MIOS_HOST_TOML_D', 'MIOS_USER_TOML', 'MIOS_USER_TOML_D', 'MIOS_RESOLVED_JSON')
           $savedLayers = @{}
           foreach ($name in $layerNames) { $savedLayers[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+          $savedGitPrompt = $env:GIT_TERMINAL_PROMPT
           try {
               $null = New-Item -ItemType Directory -Path $fixtureDir -ErrorAction Stop
               # Isolate CI from host/user configuration; vendor defaults stay unchanged.
               foreach ($name in $layerNames) { [Environment]::SetEnvironmentVariable($name, (Join-Path $fixtureDir ($name + '.absent')), 'Process') }
               $env:MIOS_BOOTSTRAP_BASE_TOML = '-'
               $env:MIOS_RESOLVED_JSON = $null
-              $vendorPath = (Resolve-Path ./mios.toml).Path
+              $env:GIT_TERMINAL_PROMPT = '0'
+              if ($env:MIOS_CI_VENDOR_TOML) {
+                  # The isolated Native trial already pins this read-only member by Git blob and SHA-256.
+                  if ($env:GITHUB_ACTIONS -ceq 'true') { throw 'Hosted CI resolves its own canonical vendor commit.' }
+                  $expected = [IO.Path]::GetFullPath((Join-Path $PWD 'usr/share/mios/mios.toml'))
+                  $vendorPath = [IO.Path]::GetFullPath($env:MIOS_CI_VENDOR_TOML)
+                  $comparison = if ([IO.Path]::DirectorySeparatorChar -eq '\') { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+                  if (-not [string]::Equals($vendorPath, $expected, $comparison) -or -not (Test-Path -LiteralPath $vendorPath -PathType Leaf)) { throw 'The isolated CI vendor must be the pinned canonical source member.' }
+                  $sourceKind = 'pinned-native-member'
+              } else {
+                  # This repository's mios.toml is an installer layer. Fetch only data from the canonical source.
+                  $selection = Read-MiosToml -Path (Resolve-Path ./mios.toml).Path -SingleFile
+                  $repository = [string](Get-Toml $selection 'bootstrap.mios_repo' '')
+                  $reference = [string](Get-Toml $selection 'bootstrap.mios_ref' '')
+                  if ($repository -cnotmatch '\Ahttps://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git\z' -or $reference -notmatch '\A[A-Za-z0-9_][A-Za-z0-9_./-]*\z' -or $reference.Contains('..')) { throw 'Invalid canonical vendor repository or reference.' }
+                  $dataRepository = Join-Path $fixtureDir 'canonical-data'
+                  $null = New-Item -ItemType Directory -Path $dataRepository -ErrorAction Stop
+                  $null = Invoke-MiosCiGit $dataRepository @('init', '--quiet')
+                  $null = Invoke-MiosCiGit $dataRepository @('remote', 'add', 'origin', $repository)
+                  $null = Invoke-MiosCiGit $dataRepository @('fetch', '--quiet', '--no-tags', '--depth=1', '--filter=blob:none', '--', 'origin', $reference)
+                  $vendorCommit = [string](Invoke-MiosCiGit $dataRepository @('rev-parse', '--verify', 'FETCH_HEAD^{commit}'))
+                  if ($vendorCommit -cnotmatch '\A[0-9a-f]{40}\z') { throw 'Canonical vendor did not resolve to a concrete commit.' }
+                  $blob = [string](Invoke-MiosCiGit $dataRepository @('rev-parse', '--verify', ('{0}:usr/share/mios/mios.toml' -f $vendorCommit)))
+                  if ($blob -cnotmatch '\A[0-9a-f]{40}\z') { throw 'Canonical vendor did not resolve to a Git blob.' }
+                  $vendorPath = Join-Path $fixtureDir 'canonical-mios.toml'
+                  Export-MiosCiVendorBlob $dataRepository $blob $vendorPath
+                  $bytes = [IO.File]::ReadAllBytes($vendorPath)
+                  $header = [Text.Encoding]::ASCII.GetBytes(('blob ' + $bytes.Length + [char]0))
+                  $digest = [Security.Cryptography.SHA1]::Create()
+                  try { $actualBlob = [BitConverter]::ToString($digest.ComputeHash([byte[]]($header + $bytes))).Replace('-', '').ToLowerInvariant() } finally { $digest.Dispose() }
+                  if ($actualBlob -cne $blob) { throw 'Canonical vendor bytes differ from the resolved Git blob.' }
+                  $provenance = @{ commit = $vendorCommit; blob = $blob; bytes = $bytes.Length; sha256 = (Get-FileHash -LiteralPath $vendorPath -Algorithm SHA256).Hash.ToLowerInvariant() }
+                  $provenance | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $fixtureDir 'canonical-source.json') -Encoding utf8
+                  $sourceKind = 'resolved-git-blob'
+              }
+              $vendorItem = Get-Item -LiteralPath $vendorPath -Force -ErrorAction Stop
+              if ($vendorItem.PSIsContainer -or ($vendorItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $vendorItem.Length -lt 1 -or $vendorItem.Length -gt 8388608) { throw 'Canonical vendor must be a bounded regular source file.' }
+              Write-Host ('Canonical MiOS vendor: {0}; SHA256 {1}' -f $sourceKind, (Get-FileHash -LiteralPath $vendorPath -Algorithm SHA256).Hash.ToLowerInvariant())
               $toml = Read-MiosToml -Path $vendorPath -SingleFile
               $random = [byte[]]::new(32)
               $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -79,6 +141,7 @@ jobs:
               Write-Host 'Private autounattend XML fixture is well-formed.'
           } finally {
               foreach ($name in $layerNames) { [Environment]::SetEnvironmentVariable($name, $savedLayers[$name], 'Process') }
+              [Environment]::SetEnvironmentVariable('GIT_TERMINAL_PROMPT', $savedGitPrompt, 'Process')
               if (Test-Path -LiteralPath $fixtureDir) { Remove-Item -LiteralPath $fixtureDir -Recurse -Force -ErrorAction Stop }
               $fixturePassword = $null
               $projection = $null

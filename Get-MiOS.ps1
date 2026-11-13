@@ -4191,6 +4191,18 @@ function Ensure-Winget {
     return $false
 }
 
+function Get-MiosFeatureState([string[]]$Info) {
+    # dism /get-featureinfo: 'Enable Pending' = enabled earlier, but the restart that activates it has not happened
+    if (@($Info) -match '^\s*State\s*:\s*Enabled\s*$') { return 'enabled' }
+    if (@($Info) -match '^\s*State\s*:\s*Enable Pending\s*$') { return 'pending' }
+    return 'disabled'
+}
+
+function Get-MiosDismEnableOutcome([int]$ExitCode) {
+    # dism /enable-feature /norestart: 0 = enabled; 3010 (ERROR_SUCCESS_REBOOT_REQUIRED) = enabled, active after a restart
+    switch ($ExitCode) { 0 { return 'enabled' } 3010 { return 'restart' } default { return 'unavailable' } }
+}
+
 function Enable-MiOSWindowsFeatures {
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
@@ -4206,16 +4218,19 @@ function Enable-MiOSWindowsFeatures {
     $rebootPending = $false
     foreach ($name in $features.Keys) {
         $label = $features[$name]
-        $isEnabled = $false
+        $state = 'unknown'
         try {
             $info = & dism.exe /online /get-featureinfo /featurename:$name 2>$null
-            if ($LASTEXITCODE -eq 0 -and ($info -match 'State\s*:\s*Enabled')) {
-                $isEnabled = $true
-            }
+            if ($LASTEXITCODE -eq 0) { $state = Get-MiosFeatureState $info }
         } catch {}
 
-        if ($isEnabled) {
+        if ($state -eq 'enabled') {
             Write-Host "  [+] $label already enabled." -ForegroundColor DarkGray
+            continue
+        }
+        if ($state -eq 'pending') {
+            Write-Host "  [+] $label enabled; a restart is still pending." -ForegroundColor Yellow
+            $rebootPending = $true
             continue
         }
 
@@ -4231,8 +4246,12 @@ function Enable-MiOSWindowsFeatures {
         Write-Host "  [*] Enabling $label..." -ForegroundColor Cyan
         try {
             $r = & dism.exe /online /enable-feature /featurename:$name /all /norestart
-            if ($LASTEXITCODE -eq 0) {
+            $outcome = Get-MiosDismEnableOutcome $LASTEXITCODE
+            if ($outcome -eq 'enabled') {
                 Write-Host "  [+] $label enabled." -ForegroundColor Green
+            } elseif ($outcome -eq 'restart') {
+                Write-Host "  [+] $label enabled; Windows needs a restart to activate it." -ForegroundColor Green
+                $rebootPending = $true
             } else {
                 Write-Host "  [-] $label not available on this Windows edition -- skipping." -ForegroundColor DarkGray
             }
@@ -4794,8 +4813,14 @@ function Add-MiosDefenderExclusions {
 
 function Set-MiosWslFirewallPolicy {
     $creator = '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}'
-    Set-NetFirewallHyperVVMSetting -Name $creator -Enabled True -DefaultInboundAction Block `
-        -DefaultOutboundAction Allow -LoopbackEnabled True -AllowHostPolicyMerge True -ErrorAction Stop
+    $policy = @{ Enabled = 'True'; DefaultInboundAction = 'Block'; DefaultOutboundAction = 'Allow'; LoopbackEnabled = 'True'; AllowHostPolicyMerge = 'True' }
+    try {
+        Set-NetFirewallHyperVVMSetting -Name $creator @policy -ErrorAction Stop
+    } catch {
+        # Set needs a registered WSL creator; before the VM platform is active, New creates the policy ahead of any WSL VM.
+        if ($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound) { throw }
+        New-NetFirewallHyperVVMSetting -Name $creator @policy -ErrorAction Stop | Out-Null
+    }
     # Explicit allow rules survive default Block. Remove our previous rules first, including deleted/refused entries.
     foreach ($old in @(Get-NetFirewallHyperVRule -ErrorAction Stop)) {
         if ($old.Name -like 'MiOS-WSL-*' -and [string]$old.VMCreatorId -and [guid]$old.VMCreatorId -eq [guid]$creator) {

@@ -33,7 +33,8 @@ function Import-MiosFunctions([string]$Path) {
         'Assert-MiosNoReparsePath', 'Set-MiosHostTierAcl', 'Initialize-MiosHostTierDirectory', 'Write-MiosHostToml',
         'Repair-MiosHostTierCredentials', 'Get-MiosTomlTableArray', 'ConvertTo-MiosWindowsPath', 'Test-MiosDefenderExclusionRefused',
         'Get-MiosDefenderExclusionPlan', 'Add-MiosDefenderExclusions', 'Set-MiosWslFirewallPolicy', 'Set-MiosPrivateUserTomlAcl',
-        'Import-MiosUserToml', 'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder', 'Get-MiosUserTomlReceiverScript', 'Get-MiosWslConfigText')
+        'Import-MiosUserToml', 'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder', 'Get-MiosUserTomlReceiverScript', 'Get-MiosWslConfigText',
+        'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Enable-MiOSWindowsFeatures')
     $defs = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) |
         Where-Object { $want -contains $_.Name })
     foreach ($name in $want) { if (@($defs | Where-Object Name -eq $name).Count -ne 1) { throw "Missing/duplicate canonical function $name" } }
@@ -150,9 +151,26 @@ function Install-ApiMocks {
     $script:firewallRemoved = New-Object System.Collections.Generic.List[string]
     $script:firewallAdded = New-Object System.Collections.Generic.List[object]
     $script:firewallDefault = ''
+    $script:firewallCreated = ''
+    $script:wslCreatorRegistered = $true   # false = a PC whose VM platform is not active yet: Set finds no object
+    $script:firewallSetError = ''          # a Windows failure other than not-found
     function global:Set-NetFirewallHyperVVMSetting {
         [CmdletBinding()]param($Name, $Enabled, $DefaultInboundAction, $DefaultOutboundAction, $LoopbackEnabled, $AllowHostPolicyMerge)
+        if ($script:firewallSetError) {
+            $PSCmdlet.ThrowTerminatingError([Management.Automation.ErrorRecord]::new([InvalidOperationException]::new($script:firewallSetError),
+                'Fixture', [Management.Automation.ErrorCategory]::PermissionDenied, $Name))
+        }
+        if (-not $script:wslCreatorRegistered) {
+            $PSCmdlet.ThrowTerminatingError([Management.Automation.ErrorRecord]::new([InvalidOperationException]::new(
+                "No MSFT_NetFirewallHyperVVMSetting objects found with property 'Name' equal to '$Name'."),
+                'CmdletizationQuery_NotFound_Name', [Management.Automation.ErrorCategory]::ObjectNotFound, $Name))
+        }
         $script:firewallDefault = $DefaultInboundAction
+    }
+    function global:New-NetFirewallHyperVVMSetting {
+        [CmdletBinding()]param($Name, $Enabled, $DefaultInboundAction, $DefaultOutboundAction, $LoopbackEnabled, $AllowHostPolicyMerge)
+        $script:firewallCreated = "$Name|$Enabled|$DefaultInboundAction|$DefaultOutboundAction"
+        $script:wslCreatorRegistered = $true
     }
     function global:Get-NetFirewallHyperVRule {
         [CmdletBinding()]param()
@@ -234,6 +252,25 @@ function Invoke-Checks([string]$Path, [switch]$SkipReceiverProtocol) {
     $script:fixtureVendor = ''; Set-MiosWslFirewallPolicy
     Check ($script:firewallDefault -eq 'Block') 'WSL inbound remains Block by default'
     Check ($script:firewallRemoved.Count -eq 1 -and $script:firewallRemoved[0] -eq 'MiOS-WSL-deleted') 'deleted owned allow rules are removed and other rules preserved'
+    Check (-not $script:firewallCreated) 'a registered WSL creator is updated in place, never re-created'
+    # A PC whose VM platform is not active yet: Set finds no WSL setting. The policy must be created, still Block-inbound.
+    $script:wslCreatorRegistered = $false; $script:firewallCreated = ''; $created = $false
+    try { Set-MiosWslFirewallPolicy; $created = $true } catch {}
+    Check ($created -and $script:firewallCreated -ceq '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}|True|Block|Allow') 'an unregistered WSL creator gets the Block-inbound policy created'
+    $script:wslCreatorRegistered = $true   # independent of the outcome above: later checks run against a registered creator
+    $script:firewallSetError = 'Access is denied.'; $script:firewallCreated = ''
+    Expect-Throw { Set-MiosWslFirewallPolicy } 'a firewall failure other than not-found stops the installer'
+    Check (-not $script:firewallCreated) 'only a not-found answer creates the WSL policy'
+    $script:firewallSetError = ''
+    # dism: 3010 and 'Enable Pending' mean enabled-but-inactive -> the run must halt for the restart, never skip it
+    Check ((Get-MiosDismEnableOutcome 0) -eq 'enabled' -and (Get-MiosDismEnableOutcome 3010) -eq 'restart' -and
+           (Get-MiosDismEnableOutcome 50) -eq 'unavailable') 'dism exit 3010 is enabled-with-restart, not unavailable'
+    Check ((Get-MiosFeatureState @('Feature Name : VirtualMachinePlatform', 'State : Enabled')) -eq 'enabled' -and
+           (Get-MiosFeatureState @('State : Enable Pending')) -eq 'pending' -and
+           (Get-MiosFeatureState @('State : Disabled')) -eq 'disabled') 'feature state separates Enabled from Enable Pending'
+    $features = (Get-Command Enable-MiOSWindowsFeatures).ScriptBlock.ToString()
+    Check ($features -match "(?s)\`$state -eq 'pending'\)\s*\{[^}]*\`$rebootPending = \`$true" -and
+           $features -match "(?s)\`$outcome -eq 'restart'\)\s*\{[^}]*\`$rebootPending = \`$true") 'a pending or restart-requiring feature halts for the reboot'
     $script:fixtureVendor = @'
 [[wsl2.inbound]]
 name = 'fixture'
@@ -443,9 +480,13 @@ try {
     $plants = @(
         @{ Name = 'raw host projection'; ExpectedException = 'The host projection still contains credential fields; refusing to write.'; From = '$proj = ConvertTo-MiosCredentialFreeToml $Text'; To = '$proj = $Text' },
         @{ Name = 'canonical alias pass omitted'; Expected = 'canonical alias pgvector.pass is recognized'; From = 'password|passwd|pass|passphrase'; To = 'password|passwd|passphrase' },
-        @{ Name = 'inbound Allow'; Expected = 'WSL inbound remains Block by default'; From = '-DefaultInboundAction Block'; To = '-DefaultInboundAction Allow' },
+        @{ Name = 'inbound Allow'; Expected = 'WSL inbound remains Block by default'; From = "DefaultInboundAction = 'Block'"; To = "DefaultInboundAction = 'Allow'" },
         @{ Name = 'path canonicalization omitted'; Expected = 'Defender refuses C:/'; From = 'try { $p = ConvertTo-MiosWindowsPath $Path }'; To = 'try { $p = $Path }' },
-        @{ Name = 'stale inbound removal omitted'; Expected = 'deleted owned allow rules are removed and other rules preserved'; From = 'Remove-NetFirewallHyperVRule -Name $old.Name -ErrorAction Stop'; To = '$null = $old.Name' }
+        @{ Name = 'stale inbound removal omitted'; Expected = 'deleted owned allow rules are removed and other rules preserved'; From = 'Remove-NetFirewallHyperVRule -Name $old.Name -ErrorAction Stop'; To = '$null = $old.Name' },
+        @{ Name = 'unregistered WSL creator not created'; Expected = 'an unregistered WSL creator gets the Block-inbound policy created'; From = 'New-NetFirewallHyperVVMSetting -Name $creator @policy -ErrorAction Stop | Out-Null'; To = 'throw' },
+        @{ Name = 'every firewall error swallowed'; Expected = 'a firewall failure other than not-found stops the installer'; From = 'if ($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound) { throw }'; To = '' },
+        @{ Name = 'dism 3010 read as unavailable'; Expected = 'dism exit 3010 is enabled-with-restart, not unavailable'; From = "3010 { return 'restart' }"; To = "3010 { return 'unavailable' }" },
+        @{ Name = 'restart outcome does not halt'; Expected = 'a pending or restart-requiring feature halts for the reboot'; From = "elseif (`$outcome -eq 'restart') {"; To = "elseif (`$outcome -eq 'restart-never') {" }
     )
     $caught = 0
     foreach ($plant in $plants) {

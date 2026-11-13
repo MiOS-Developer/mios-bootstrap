@@ -829,7 +829,15 @@ function Sync-MiosUserTomlToBuilder {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Distro, [string]$User = 'mios')
     if ($Distro -notmatch '^[A-Za-z0-9_.-]+$' -or $User -notmatch '^[A-Za-z_][A-Za-z0-9_-]*$') { throw 'Invalid builder distribution or user name.' }
     Set-MiosPrivateUserTomlAcl $Path
-    $put = 'set -eu; umask 077; test ! -L "$HOME/.config"; test ! -L "$HOME/.config/mios"; mkdir -p "$HOME/.config/mios"; chmod 700 "$HOME/.config/mios"; pending=$(mktemp "$HOME/.config/mios/.mios.XXXXXXXX"); trap ''rm -f -- "$pending"'' EXIT HUP INT TERM; cat > "$pending"; chmod 600 "$pending"; mv -f -- "$pending" "$HOME/.config/mios/mios.toml"'
+    function Get-MiosUserTomlReceiverScript {
+        param([Parameter(Mandatory)][long]$ExpectedBytes)
+        if ($ExpectedBytes -lt 0) { throw 'Invalid private TOML byte count.' }
+        # A closed client pipe can look like successful EOF. Verify the nonsecret byte count before publishing.
+        $program = 'set -eu; umask 077; test ! -L "$HOME/.config"; test ! -L "$HOME/.config/mios"; mkdir -p "$HOME/.config/mios"; chmod 700 "$HOME/.config/mios"; pending=$(mktemp "$HOME/.config/mios/.mios.XXXXXXXX"); trap ''rm -f -- "$pending"'' EXIT HUP INT TERM; cat > "$pending"; test "$(wc -c < "$pending")" -eq __MIOS_EXPECTED_BYTES__; chmod 600 "$pending"; mv -f -- "$pending" "$HOME/.config/mios/mios.toml"'
+        return $program.Replace('__MIOS_EXPECTED_BYTES__', $ExpectedBytes.ToString([Globalization.CultureInfo]::InvariantCulture))
+    }
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $put = Get-MiosUserTomlReceiverScript -ExpectedBytes $bytes.LongLength
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName = 'wsl.exe'
     $psi.Arguments = (@('-d', $Distro, '--user', $User, '--exec', 'sh', '-c', $put) | ForEach-Object { ConvertTo-MiosNativeArgument $_ }) -join ' '
@@ -840,7 +848,6 @@ function Sync-MiosUserTomlToBuilder {
     try {
         if (-not $proc.Start()) { throw 'Could not start the private builder handoff.' }
         $stdout = $proc.StandardOutput.ReadToEndAsync(); $stderr = $proc.StandardError.ReadToEndAsync()
-        $bytes = [IO.File]::ReadAllBytes($Path)
         $write = $proc.StandardInput.BaseStream.WriteAsync($bytes, 0, $bytes.Length)
         if (-not $write.Wait(60000)) { throw 'Private builder handoff stdin timed out; the saved file was retained.' }
         $null = $write.GetAwaiter().GetResult()
@@ -902,6 +909,10 @@ case "${3:-}" in
     --sudo) git_command() { sudo -n git "$@"; } ;;
     *) echo '[mios-pull] Invalid checkout execution mode; no source was changed.' >&2; exit 1 ;;
 esac
+if [ ! -d "$checkout/.git" ] && [ ! -f "$checkout/.git" ]; then
+    echo '[mios-pull] Checkout is not initialized; preserving the staged tree for the build.'
+    exit 0
+fi
 if ! changes=$(git_command -C "$checkout" status --porcelain=v1 --untracked-files=normal 2>/dev/null); then
     echo '[mios-pull] Cannot inspect the checkout; no source was changed.' >&2
     exit 1
@@ -936,6 +947,39 @@ if ! git_command -C "$checkout" merge --ff-only --no-edit --no-autostash --no-ov
 fi
 echo '[mios-pull] Checkout is current after a clean fast-forward.'
 '@
+}
+
+function Get-MiosWslConfigText {
+    param([AllowEmptyString()][string]$Existing, [string[]]$ManagedLines, [Parameter(Mandatory)][bool]$Firewall)
+    if (-not $Firewall) { throw 'mios.toml [wsl2].firewall=false disables the required inbound security policy; enable it before continuing.' }
+    $managed = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $ManagedLines) {
+        if ($line -match '^firewall=') { continue }
+        if ($line -notmatch '^(memory|networkingMode|localhostForwarding|guiApplications)=[^\r\n\x00]+$') {
+            throw 'Invalid managed WSL configuration line.'
+        }
+        $managed.Add($line)
+    }
+    # Filtering is mandatory: firewall=false bypasses the Hyper-V default/rule policy altogether.
+    $managed.Add('firewall=' + $Firewall.ToString().ToLowerInvariant())
+    $out = New-Object System.Collections.Generic.List[string]
+    $inside = $false; $seen = $false
+    foreach ($line in ($Existing -split "`r?`n")) {
+        if ($line -match '^\s*\[\s*wsl2\s*\]\s*(?:[#;].*)?$') {
+            if ($seen) { throw 'Duplicate WSL2 configuration sections; refusing an ambiguous firewall policy.' }
+            $seen = $true; $inside = $true; $out.Add($line)
+            foreach ($entry in $managed) { $out.Add($entry) }
+            continue
+        }
+        if ($line -match '^\s*\[') { $inside = $false }
+        if ($inside -and $line -match '^\s*(memory|networkingMode|localhostForwarding|firewall|guiApplications)\s*=') { continue }
+        $out.Add($line)
+    }
+    if (-not $seen) {
+        $out.Add('[wsl2]')
+        foreach ($entry in $managed) { $out.Add($entry) }
+    }
+    return ($out -join "`r`n")
 }
 
 function Get-MiosTomlTableArray {
@@ -4756,7 +4800,7 @@ Add-MiosDefenderExclusions
 
 $_netMode  = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'networking_mode'      -Default 'NAT')
 $_lhfwd    = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'localhost_forwarding' -Default 'true')
-$_fwall    = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'firewall'             -Default 'false')
+$_fwall    = Get-MiosTomlValue -Section 'wsl2' -Key 'firewall' -Default $true
 $_gui      = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'gui_applications'     -Default 'true')
 $_isMirror = ($_netMode -ieq 'mirrored')
 $_wslHostRamGB = try { [math]::Floor((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1GB) } catch { 16 }
@@ -4765,57 +4809,20 @@ $_wslReserveGB  = [math]::Max(0, [int](Get-MiosTomlValue -Section 'bootstrap.dev
 $_wslRamGB = [math]::Max(4, $_wslHostRamGB - [math]::Max($_wslReserveGB, [math]::Floor($_wslHostRamGB * $_wslReservePct / 100)))
 
 $_wslCfg = Join-Path $env:USERPROFILE ".wslconfig"
-$_wslCfgRaw = if (Test-Path $_wslCfg) { Get-Content $_wslCfg -Raw } else { "" }
+$_wslCfgRaw = if (Test-Path -LiteralPath $_wslCfg) { [IO.File]::ReadAllText($_wslCfg) } else { '' }
 
 # Build the section body from TOML-resolved values.
 $_keyLines = New-Object System.Collections.Generic.List[string]
 $_keyLines.Add("memory=${_wslRamGB}GB")
 $_keyLines.Add("networkingMode=$_netMode")
-if ($_isMirror) {
-    if ($_fwall -ieq 'true') { $_keyLines.Add('firewall=true') }
-} else {
-    if ($_lhfwd -ieq 'true') { $_keyLines.Add('localhostForwarding=true') }
-}
+if (-not $_isMirror -and $_lhfwd -ieq 'true') { $_keyLines.Add('localhostForwarding=true') }
 if ($_gui -ieq 'true') { $_keyLines.Add('guiApplications=true') }
 
-# Detect divergence: any required key missing or value mismatched.
-$_needWrite = $false
-foreach ($_kv in $_keyLines) {
-    $_pat = '(?m)^' + [regex]::Escape($_kv) + '\s*$'
-    if ($_wslCfgRaw -notmatch $_pat) { $_needWrite = $true; break }
-}
-if ($_needWrite) {
-    if ($_wslCfgRaw -notmatch "\[wsl2\]") {
-        $_baseline = @"
-
-[wsl2]
-# MiOS pre-Phase-0 settings, generated from mios.toml [wsl2] and
-# [bootstrap.dev_vm.host_reserve] by
-# Get-MiOS.ps1 on every irm|iex. Edit values in mios.html, not here --
-# this block is regenerated.
-$($_keyLines -join "`r`n")
-"@
-        [System.IO.File]::WriteAllText($_wslCfg, $_baseline, (New-Object System.Text.UTF8Encoding($false)))
-    } else {
-        # [wsl2] section exists -- replace its keys with the TOML-resolved
-        # set. Strip ALL legacy networking keys (networkingMode,
-        # localhostForwarding, firewall) so a prior mode doesn't survive.
-        $_lines = Get-Content $_wslCfg
-        $_in    = $false
-        $_out   = [System.Collections.Generic.List[string]]::new()
-        $_added = $false
-        foreach ($_l in $_lines) {
-            if ($_l -match '^\[wsl2\]') {
-                $_in = $true; $_out.Add($_l)
-                if (-not $_added) { foreach ($_kv in $_keyLines) { $_out.Add($_kv) }; $_added = $true }
-                continue
-            } elseif ($_l -match '^\[') { $_in = $false }
-            if ($_in -and $_l -match '^(memory|networkingMode|localhostForwarding|firewall|guiApplications)\s*=') { continue }
-            $_out.Add($_l)
-        }
-        [System.IO.File]::WriteAllLines($_wslCfg, $_out, (New-Object System.Text.UTF8Encoding($false)))
-    }
-    Write-Host "  [+] .wslconfig: $_netMode mode and ${_wslRamGB}GB RAM written from mios.toml (pre-Phase-0)" -ForegroundColor Green
+# Reconcile the entire managed key set, including a stale firewall=false even when all resource keys match.
+$_desiredWslConfig = Get-MiosWslConfigText -Existing $_wslCfgRaw -ManagedLines $_keyLines.ToArray() -Firewall $_fwall
+if ($_desiredWslConfig -cne $_wslCfgRaw) {
+    [IO.File]::WriteAllText($_wslCfg, $_desiredWslConfig, (New-Object Text.UTF8Encoding($false)))
+    Write-Host "  [+] .wslconfig: $_netMode mode, ${_wslRamGB}GB RAM and SSOT firewall filtering reconciled" -ForegroundColor Green
     & wsl.exe --shutdown 2>$null | Out-Null
 }
 

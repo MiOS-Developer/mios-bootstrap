@@ -123,10 +123,28 @@ function Install-ApiMocks {
     function global:Resolve-MiosTomlText { return $script:fixtureUser }
     function global:Resolve-MiosVendorTomlText { return $script:fixtureVendor }
     $script:removedExclusions = New-Object System.Collections.Generic.List[string]
+    $script:removedProcesses = New-Object System.Collections.Generic.List[string]
     $script:addedExclusions = New-Object System.Collections.Generic.List[string]
-    function global:Get-MpPreference { [CmdletBinding()]param() return [pscustomobject]@{ ExclusionPath = @('M:/', 'M:', ($env:TEMP + '/'), 'C:\MiOS\other') } }
-    function global:Remove-MpPreference { [CmdletBinding()]param($ExclusionPath) $script:removedExclusions.Add($ExclusionPath) }
-    function global:Add-MpPreference { [CmdletBinding()]param($ExclusionPath, $ExclusionProcess) $script:addedExclusions.Add([string]$ExclusionPath + [string]$ExclusionProcess) }
+    $script:mockDefenderPaths = @('M:/', 'M:', ($env:TEMP + '/'), 'C:\usr', 'C:\MiOS\bin', ($env:LOCALAPPDATA + '\Microsoft\WinGet'), 'D:\Admin\owned')
+    $script:mockDefenderProcesses = @('C:\MiOS\bin\mios-launch.exe', 'M:\MiOS\bin\mios-launch.exe', 'D:\Admin\owned.exe')
+    function global:Get-MpPreference { [CmdletBinding()]param() return [pscustomobject]@{ ExclusionPath = $script:mockDefenderPaths; ExclusionProcess = $script:mockDefenderProcesses } }
+    function global:Remove-MpPreference {
+        [CmdletBinding()]param($ExclusionPath, $ExclusionProcess)
+        if ($ExclusionPath) {
+            $script:removedExclusions.Add($ExclusionPath)
+            $script:mockDefenderPaths = @($script:mockDefenderPaths | Where-Object { $_ -cne $ExclusionPath })
+        }
+        if ($ExclusionProcess) {
+            $script:removedProcesses.Add($ExclusionProcess)
+            $script:mockDefenderProcesses = @($script:mockDefenderProcesses | Where-Object { $_ -cne $ExclusionProcess })
+        }
+    }
+    function global:Add-MpPreference {
+        [CmdletBinding()]param($ExclusionPath, $ExclusionProcess)
+        $script:addedExclusions.Add([string]$ExclusionPath + [string]$ExclusionProcess)
+        if ($ExclusionPath) { $script:mockDefenderPaths += $ExclusionPath }
+        if ($ExclusionProcess) { $script:mockDefenderProcesses += $ExclusionProcess }
+    }
     $script:firewallRemoved = New-Object System.Collections.Generic.List[string]
     $script:firewallAdded = New-Object System.Collections.Generic.List[object]
     $script:firewallDefault = ''
@@ -207,8 +225,10 @@ function Invoke-Checks([string]$Path) {
     Check (@($plan.processes).Count -eq 1) 'an explicit narrow process is planned'
     Check (@($plan.refused).Count -eq 3) 'temp/root/missing-reason exclusions are refused'
     Add-MiosDefenderExclusions
-    Check ($script:removedExclusions.Count -eq 3) 'legacy root/temp aliases are removed using their original stored spelling'
-    Check ($script:addedExclusions.Count -eq 2) 'only explicit canonical narrow exclusions are added'
+    Check ($script:removedExclusions.Count -eq 6 -and $script:removedExclusions.Contains('C:\usr') -and $script:removedExclusions.Contains($env:LOCALAPPDATA + '\Microsoft\WinGet')) 'exact known legacy roots/temp/usr/WinGet/path signatures are removed'
+    Check ($script:removedProcesses.Count -eq 2) 'exact known legacy process signatures are removed'
+    Check ($script:mockDefenderPaths -contains 'D:\Admin\owned' -and $script:mockDefenderProcesses -contains 'D:\Admin\owned.exe') 'unrelated administrator path and process exclusions remain'
+    Check ($script:addedExclusions.Count -eq 2 -and $script:mockDefenderPaths -contains 'C:\MiOS\bin' -and $script:mockDefenderProcesses -contains 'C:\MiOS\bin\mios-launch.exe') 'validated current SSOT path/process exclusions are re-added'
     $script:fixtureVendor = ''; Set-MiosWslFirewallPolicy
     Check ($script:firewallDefault -eq 'Block') 'WSL inbound remains Block by default'
     Check ($script:firewallRemoved.Count -eq 1 -and $script:firewallRemoved[0] -eq 'MiOS-WSL-deleted') 'deleted owned allow rules are removed and other rules preserved'

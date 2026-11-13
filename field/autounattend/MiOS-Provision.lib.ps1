@@ -218,7 +218,7 @@ function Write-MiOSPrivateText {
                 } finally { $old.Dispose() }
             }
             Assert-MiOSPrivateFile -Path $target
-            [IO.File]::Replace($tmp, $target, $null)
+            [IO.File]::Replace($tmp, $target, [System.Management.Automation.Language.NullString]::Value)
         } else {
             # Move refuses an existing destination, including a dangling link.
             [IO.File]::Move($tmp, $target)

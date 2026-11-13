@@ -72,7 +72,7 @@ function New-Sidecar([byte[]]$Bmp, [hashtable]$Over = @{}) {
     return ,$bytes
 }
 function New-VendorToml([hashtable]$Over = @{}) {
-    $v = @{ projection = $defaultRel; bgref = 'colors.bg'; bg = '#282262' }
+    $v = @{ projection = $defaultRel; bgref = 'colors.bg'; bg = '#282262'; root = 'Windows'; logo = $defaultLogo; logoRef = 'branding.oem_logo' }
     foreach ($k in $Over.Keys) { $v[$k] = $Over[$k] }
     $text = @"
 # Synthesized vendor SSOT: only the MiOS shapes this staging reads.
@@ -81,7 +81,7 @@ bg          = "$($v.bg)"   # deep indigo
 accent      = "#1A407F"
 
 [branding]
-oem_logo            = 'C:\Windows\Web\MiOS\mios-logo.bmp'
+oem_logo            = '$($v.logo)'
 
 [units."mios-firewall-ports.service".Service]
 ExecStart = '''/bin/bash -c '\
@@ -91,9 +91,9 @@ ExecStart = '''/bin/bash -c '\
 accounts = [ { name = "fixture" } ]
 
 [windows.xbox.identity]
-system_root           = 'Windows'
+system_root           = '$($v.root)'
 background_color_ref  = "$($v.bgref)"
-oem_logo_ref          = "branding.oem_logo"
+oem_logo_ref          = "$($v.logoRef)"
 oem_logo_projection   = "$($v.projection)"
 "@
     $bytes = $utf8.GetBytes($text)
@@ -120,6 +120,29 @@ function New-View([hashtable]$Scalars = @{}) {
     foreach ($k in $base.Keys) { $v.scalars[$k] = $base[$k] }
     foreach ($k in $Scalars.Keys) { $v.scalars[$k] = $Scalars[$k] }
     return $v
+}
+function New-ReceiptFixture($View) {
+    # Model the process-private receipt using scratch bytes. No product entrypoint or live destination is used.
+    $file = Join-Path $scratch ('receipt-' + [guid]::NewGuid().ToString('N') + '.bmp')
+    [IO.File]::WriteAllBytes($file, $script:bmpA)
+    $e = [pscustomobject]@{ Path = $defaultLogo.ToUpperInvariant(); Sha256 = (Get-Hex $script:bmpA); Commit = $shaA; Size = $script:bmpA.Length }
+    $script:MiOSOemLogoReceipt = @{ Evidence = $e; Path = $e.Path; FilePath = $file; Fixture = $false; Sha256 = $e.Sha256; Commit = $e.Commit; Size = $e.Size;
+        BackgroundKey = 'colors.bg'; Vendor = (ConvertFrom-MiosTomlFile -ContentBytes (New-VendorToml) -ProjectedCredentials);
+        Binding = (Get-MiOSOemLogoBinding -Toml $View -BackgroundKey 'colors.bg') }
+    return $e
+}
+function Invoke-AclFixture($Acl, [switch]$VolumeRoot) {
+    # Exercise the real ACL policy with an in-memory descriptor; never read or write a host ACL.
+    function Get-Acl { [CmdletBinding()] param($LiteralPath) return $Acl }
+    try { Assert-MiOSOemLogoAcl -Path 'C:\fixture' -VolumeRoot:$VolumeRoot; return '' } catch { return $_.Exception.Message }
+}
+function New-AclFixture([string]$Owner = 'S-1-5-32-544', $Rights = ([Security.AccessControl.FileSystemRights]::ReadAndExecute), [switch]$InheritOnly) {
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetOwner([Security.Principal.SecurityIdentifier]::new($Owner))
+    $inheritance = [Security.AccessControl.InheritanceFlags]::None; $propagation = [Security.AccessControl.PropagationFlags]::None
+    if ($InheritOnly) { $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit; $propagation = [Security.AccessControl.PropagationFlags]::InheritOnly }
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'), $Rights, $inheritance, $propagation, [Security.AccessControl.AccessControlType]::Allow))
+    return $acl
 }
 function Invoke-Stage([string]$Case, $View, [string]$Commit, [switch]$Existing) {
     $dir = Join-Path $scratch ('stage-' + $Case + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -160,9 +183,11 @@ function Invoke-GuardInProcess([string]$Command, $Value, [bool]$FileExists) {
 }
 function New-GuardProbe([string]$Command, [string]$Value, [string]$Marker, [string]$FixtureKey) {
     # Shadows the registry cmdlets inside the child and points the key at an absent fixture key.
-    $prelude = 'function Get-ItemProperty { [CmdletBinding()] param($LiteralPath, $Name) [pscustomobject]@{ Logo = ''' + $Value.Replace("'", "''") + ''' } }; ' +
+    $value64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Value))
+    $marker64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Marker))
+    $prelude = 'function Get-ItemProperty { [CmdletBinding()] param($LiteralPath, $Name) [pscustomobject]@{ Logo = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(''' + $value64 + ''')) } }; ' +
         'function Test-Path { [CmdletBinding()] param($LiteralPath, $PathType) $false }; ' +
-        'function Remove-ItemProperty { [CmdletBinding()] param($LiteralPath, $Name) [IO.File]::WriteAllText(''' + $Marker + ''', $LiteralPath + ''|'' + $Name) }; '
+        'function Remove-ItemProperty { [CmdletBinding()] param($LiteralPath, $Name) [IO.File]::WriteAllText([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(''' + $marker64 + ''')), $LiteralPath + ''|'' + $Name) }; '
     if (([regex]::Matches($Command, [regex]::Escape('-Command "'))).Count -ne 1 -or -not $Command.Contains($oemKey)) { return $null }
     return $Command.Replace('-Command "', '-Command "' + $prelude).Replace($oemKey, $FixtureKey)
 }
@@ -171,7 +196,8 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     $script:fail = 0; $script:checks = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
     $libAst = Import-MiosFunctions $LibPath @('Find-MiosTomlMultilineEnd', 'ConvertFrom-MiosTomlFile', 'Get-MiOSVendorBytes', 'Invoke-MiOSVendorFetch',
         'Get-MiOSVendorSource', 'Resolve-MiOSVendorCommit', 'Get-MiOSOemLogoTargetGap', 'Assert-MiOSOemLogoBitmap', 'Install-MiOSOemLogo',
-        'New-MiOSOemLogoCommands', 'New-MiOSBrandingCommands', 'New-MiOSProvisionCommands', 'Invoke-MiOSHostCommands')
+        'Get-MiOSOemLogoSystemRoot', 'Assert-MiOSOemLogoAcl', 'Assert-MiOSOemLogoWritePath', 'Set-MiOSOemLogoStreamAcl',
+        'Get-MiOSOemLogoBinding', 'Test-MiOSOemLogoEvidence', 'New-MiOSOemLogoCommands', 'New-MiOSBrandingCommands', 'New-MiOSProvisionCommands', 'Invoke-MiOSHostCommands')
     $null = Import-MiosFunctions $realUnattend @('ConvertTo-UnattendPassword', 'New-MiOSAutounattendXml') -OnlyRequired
     # The spec-driven preference group is out of scope here and needs keys this fixture does not carry.
     function global:New-MiOSGlobalPrefCommands { param($Toml) return @() }
@@ -189,6 +215,7 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     $script:bmpA = New-FixtureBmp -Seed 11
     $script:bmpMain = New-FixtureBmp -Seed 99
     $script:oldBytes = $utf8.GetBytes('fixture-old-logo')
+    $script:MiOSOemLogoReceipt = $null
 
     # --- The lib's own TOML reader must read the vendor grammar it is handed -------
     $readerPath = Join-Path $scratch 'reader.toml'
@@ -196,6 +223,10 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     $reader = $null
     try { $reader = ConvertFrom-MiosTomlFile -Path $readerPath } catch { Write-Host "    (reader: $($_.Exception.Message))" }
     Check ($null -ne $reader -and $reader.scalars['s.k'] -ceq ('a' + [Environment]::NewLine + "  b\'") -and $reader.scalars['s.m'] -ceq "x'" -and $reader.scalars['s.q'] -ceq '1') 'reader accepts quotes before a closing triple quote'
+    $bomBytes = [byte[]](@(0xEF, 0xBB, 0xBF) + [IO.File]::ReadAllBytes($readerPath))
+    $fromBytes = ConvertFrom-MiosTomlFile -ContentBytes $bomBytes
+    Check ($fromBytes.scalars['s.k'] -ceq $reader.scalars['s.k'] -and $fromBytes.scalars['s.m'] -ceq $reader.scalars['s.m']) 'byte input with a UTF-8 BOM uses the same multiline scanner as file input'
+    Expect-Throw { ConvertFrom-MiosTomlFile -ContentBytes ([byte[]](0xFF, 0xFE, 0x61)) } 'byte input refuses invalid UTF-8'
     [IO.File]::WriteAllText($readerPath, "[s]`nbad = '''x''''''`n", $utf8)
     Expect-Throw { ConvertFrom-MiosTomlFile -Path $readerPath } 'reader still refuses a six-quote closing run'
 
@@ -224,6 +255,9 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     $e = $out.Result
     Check ($null -ne $e -and $e.Commit -ceq $shaA -and $e.Sha256 -ceq (Get-Hex $script:bmpA) -and $e.Size -eq $script:bmpA.Length -and
            $e.Path -ceq $out.Dest -and (Test-SameBytes $out.Bytes $script:bmpA)) 'happy path stages the exact vendor bytes and returns evidence bound to the resolved commit'
+    Check ([object]::ReferenceEquals($script:MiOSOemLogoReceipt.Evidence, $e) -and $script:MiOSOemLogoReceipt.Path -ceq $out.Dest) 'staging registers only the actual destination evidence in the current process'
+    $fixtureCommands = @(New-MiOSOemLogoCommands -Toml (New-View) -OemLogo $e)
+    Check (@($fixtureCommands | Where-Object { $_ -match '/v Logo ' }).Count -eq 0) 'a scratch destination receipt cannot authorize a Logo at the configured live path'
     Check (@($out.Files).Count -eq 1 -and $out.Files[0] -ceq 'mios-logo.bmp' -and $out.Warning -eq '') 'staging leaves only the logo, with no warning'
     $api = @($script:fetchLog | Where-Object { $_.StartsWith('https://api.github.com/') })
     $raw = @($script:fetchLog | Where-Object { $_.StartsWith('https://raw.githubusercontent.com/') })
@@ -245,6 +279,22 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     $w = $null
     $disabled = Install-MiOSOemLogo -Toml (New-View @{ 'branding.windows.enable' = 'false' }) -Fetch $script:fetch -DestinationPath (Join-Path $scratch 'disabled.bmp') -WarningVariable w -WarningAction SilentlyContinue
     Check ($null -eq $disabled -and $script:fetchLog.Count -eq 0 -and -not (Test-Path -LiteralPath (Join-Path $scratch 'disabled.bmp')) -and @($w).Count -eq 0) 'disabled Windows branding stages nothing and fetches nothing'
+
+    # A non-default declared system root is respected; the image drive remains C: like the renderer.
+    Set-Tree -Vendor (New-VendorToml @{ root = 'WinNT'; logo = 'C:\WinNT\Web\MiOS\mios-logo.bmp' })
+    $out = Invoke-Stage 'custom-root' (New-View @{ 'branding.oem_logo' = 'C:\WinNT\Web\MiOS\mios-logo.bmp'; 'windows.xbox.identity.system_root' = 'WinNT' })
+    Check ($null -ne $out.Result -and (Test-SameBytes $out.Bytes $script:bmpA)) 'staging accepts the declared effective and vendor system root'
+    Set-Tree -Vendor (New-VendorToml @{ root = 'WinNT'; logo = 'C:\WinNT\Web\MiOS\mios-logo.bmp' })
+    $out = Invoke-Stage 'vendor-root' (New-View @{ 'branding.oem_logo' = 'C:\WinNT\Web\MiOS\mios-logo.bmp' })
+    Check ($null -ne $out.Result) 'a missing effective system_root uses the pinned vendor declaration'
+    Set-Tree -Vendor (New-VendorToml @{ root = 'WinNT' })
+    Check-Refused 'refuses a target under the wrong vendor system root' (Invoke-Stage 'wrong-root' (New-View)) 'declared system_root'
+    Set-Tree -Vendor (New-VendorToml @{ logoRef = 'branding.other_logo' })
+    Check-Refused 'refuses a vendor branding ref outside branding.oem_logo' (Invoke-Stage 'logo-ref' (New-View)) 'oem_logo_ref'
+    Set-Tree
+    Check-Refused 'refuses an effective branding ref different from the vendor binding' (Invoke-Stage 'host-logo-ref' (New-View @{ 'windows.xbox.identity.oem_logo_ref' = 'branding.other_logo' })) 'effective oem_logo_ref'
+    Set-Tree
+    Check-Refused 'refuses an effective background ref different from the vendor binding' (Invoke-Stage 'host-bg-ref' (New-View @{ 'windows.xbox.identity.background_color_ref' = 'colors.accent' })) 'effective background_color_ref'
 
     # --- Staging: refusals (each returns $null, writes nothing, names the gap) ----------
     Set-Tree -Sidecar (New-Sidecar $script:bmpA @{ sha256 = (Get-Hex $script:bmpMain) })
@@ -275,15 +325,21 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     Check-Refused 'refuses a sidecar background that differs from the vendor colour' (Invoke-Stage 'vendorbg' (New-View)) "sidecar background '#282262' is not vendor colors.bg"
     Set-Tree
     Check-Refused 'refuses an operator colour override' (Invoke-Stage 'override' (New-View @{ 'colors.bg' = '#112233' })) 'overrides vendor'
-    foreach ($case in @(@{ Path = 'D:\Logos\mios-logo.bmp'; Name = 'refuses a target outside C:\Windows'; Token = 'is not a C:\Windows' },
+    Set-Tree
+    Check-Refused 'names a missing effective required colour instead of claiming an override' (Invoke-Stage 'missing-host-bg' (New-View @{ 'colors.bg' = '' })) "effective required colour 'colors.bg' is missing"
+    Set-Tree -Vendor (New-VendorToml @{ bg = '' })
+    Check-Refused 'names a missing vendor required colour' (Invoke-Stage 'missing-vendor-bg' (New-View)) "vendor required colour 'colors.bg' is missing"
+    foreach ($case in @(@{ Path = 'D:\Logos\mios-logo.bmp'; Name = 'refuses a target outside the C: image drive'; Token = 'system_root' },
                         @{ Path = 'C:\Windows\Web\..\mios-logo.bmp'; Name = 'refuses a target with a .. segment'; Token = "'..' segment" },
-                        @{ Path = 'C:\Windows\Web\MiOS\mios-logo.png'; Name = 'refuses a non-.bmp target'; Token = 'is not a C:\Windows' },
-                        @{ Path = 'C:\Windows\mios-logo.bmp'; Name = 'refuses a target without a folder under C:\Windows'; Token = 'is not a C:\Windows' },
-                        @{ Path = 'C:\Windows\Web\%MIOS%\mios-logo.bmp'; Name = 'refuses a target cmd would expand'; Token = 'cannot carry' })) {
+                        @{ Path = 'C:\Windows\Web\MiOS\mios-logo.png'; Name = 'refuses a non-.bmp target'; Token = 'declared system_root' },
+                        @{ Path = 'C:\Windows\mios-logo.bmp'; Name = 'refuses a target without a folder under system_root'; Token = 'declared system_root' },
+                        @{ Path = 'C:\Windows\Web\%MIOS%\mios-logo.bmp'; Name = 'refuses a target cmd would expand'; Token = 'cannot carry' },
+                        @{ Path = 'C:\Windows\Web.\MiOS\mios-logo.bmp'; Name = 'refuses a trailing-dot alias'; Token = 'Windows-aliased' },
+                        @{ Path = 'C:\Windows\Web\NUL.bmp'; Name = 'refuses a Windows device alias'; Token = 'Windows-aliased' })) {
         Set-Tree
         $out = Invoke-Stage 'target' (New-View @{ 'branding.oem_logo' = $case.Path })
         Check-Refused $case.Name $out $case.Token
-        if ($case.Name -eq 'refuses a target outside C:\Windows') { Check ($script:fetchLog.Count -eq 0) 'a bad target is refused before any network fetch' }
+        if ($case.Name -eq 'refuses a target outside the C: image drive') { Check ($script:fetchLog.Count -eq 0) 'a bad target is refused before any network fetch' }
     }
     Set-Tree -ApiBody 'not-a-sha'
     Check-Refused 'refuses a commit that does not resolve to 40 hex' (Invoke-Stage 'unresolved' (New-View)) '40-hex commit'
@@ -296,17 +352,41 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     $vendorTempAfter = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Filter 'mios-vendor-*.toml' -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
     Check (@($vendorTempAfter | Where-Object { $vendorTempBefore -notcontains $_ }).Count -eq 0) 'staging leaves no vendor TOML temporary file behind'
 
+    # --- Actual scratch reparse boundary, plus in-memory Windows ACL policy -----------
+    Set-Tree
+    $realDirectory = Join-Path $scratch ('real-' + [guid]::NewGuid().ToString('N'))
+    $linkDirectory = Join-Path $scratch ('linked-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $realDirectory -ErrorAction Stop | Out-Null
+    $linkType = if ($env:OS -eq 'Windows_NT') { 'Junction' } else { 'SymbolicLink' }
+    New-Item -ItemType $linkType -Path $linkDirectory -Target $realDirectory -ErrorAction Stop | Out-Null
+    $w = $null
+    $linked = Install-MiOSOemLogo -Toml (New-View) -Fetch $script:fetch -DestinationPath (Join-Path $linkDirectory 'mios-logo.bmp') -WarningVariable w -WarningAction SilentlyContinue
+    Check ($null -eq $linked -and (@($w) -join ' ').Contains('link or not a directory') -and @(Get-ChildItem -LiteralPath $realDirectory -Force).Count -eq 0) 'staging refuses a reparse-point ancestor without writing through it'
+    Check ((Invoke-AclFixture (New-AclFixture)) -ceq '') 'the ACL policy permits system-owned paths with Users read access'
+    Check ((Invoke-AclFixture (New-AclFixture -Owner 'S-1-5-32-545')).Contains('untrusted owner')) 'the ACL policy refuses a Users-owned destination'
+    Check ((Invoke-AclFixture (New-AclFixture -Rights ([Security.AccessControl.FileSystemRights]::Modify))).Contains('write access')) 'the ACL policy refuses a destination writable by Users'
+    Check ((Invoke-AclFixture (New-AclFixture -Rights ([Security.AccessControl.FileSystemRights]::Write) -InheritOnly)) -ceq '') 'an inherit-only ACE does not falsely describe current directory write access'
+    Check ((Invoke-AclFixture (New-AclFixture -Rights ([Security.AccessControl.FileSystemRights]::AppendData)) -VolumeRoot) -ceq '') 'the volume-root policy permits creating sibling directories'
+    Check ((Invoke-AclFixture (New-AclFixture -Rights ([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles)) -VolumeRoot).Contains('write access')) 'the volume-root policy refuses deleting existing children'
+    $stageAst = @($libAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Install-MiOSOemLogo' }, $true))[0]
+    $stageText = $stageAst.Extent.Text
+    Check ($stageText.Contains('ConvertFrom-MiosTomlFile -ContentBytes $vendorBytes -ProjectedCredentials') -and -not $stageText.Contains('mios-vendor-')) 'vendor parsing consumes fetched bytes without a shared temporary path'
+    $writeCalls = @($stageAst.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Assert-MiOSOemLogoWritePath' }, $true))
+    Check ($writeCalls.Count -eq 2 -and $writeCalls[0].Extent.StartOffset -lt $stageText.IndexOf('[IO.FileStream]::new') + $stageAst.Extent.StartOffset) 'staging checks its write boundary before temp creation and again before commit'
+    $aclCall = $stageText.IndexOf('Set-MiOSOemLogoStreamAcl -Stream $stream'); $writeCall = $stageText.IndexOf('$stream.Write($bmp')
+    Check ($aclCall -ge 0 -and $aclCall -lt $writeCall) 'live staging protects the temp handle ACL before writing bytes'
+
     # --- Branding emits Logo only from evidence; otherwise the guarded removal ---------
     $view = New-View
-    $evidence = [pscustomobject]@{ Path = $defaultLogo.ToUpperInvariant(); Sha256 = (Get-Hex $script:bmpA); Commit = $shaA; Size = $script:bmpA.Length }
+    $evidence = New-ReceiptFixture $view
     $logoLine = 'reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation" /v Logo /t REG_SZ /d "' + $defaultLogo + '" /f'
     $with = @(New-MiOSBrandingCommands -Toml $view -OemLogo $evidence)
     Check (@($with | Where-Object { $_ -match '/v Logo ' }).Count -eq 1 -and $with -ccontains $logoLine -and @($with | Where-Object { $_.Contains('Remove-ItemProperty') }).Count -eq 0) 'branding emits the Logo value from matching staging evidence'
     $bake = @(New-MiOSBrandingCommands -Toml $view)
     Check (@($bake | Where-Object { $_ -match '/v Logo ' }).Count -eq 0) 'bake-style branding (no evidence) emits no Logo value'
     $guards = @($bake | Where-Object { $_.Contains('Remove-ItemProperty') })
-    Check ($guards.Count -eq 1 -and $guards[0].StartsWith('powershell.exe -NoProfile -Command "') -and $guards[0].Contains("`$p='$defaultLogo';") -and
-           $null -ne (Get-GuardScript $guards[0])) 'bake-style branding emits the guarded owned-dangling removal'
+    Check ($guards.Count -eq 1 -and $guards[0].StartsWith('powershell.exe -NoProfile -Command "') -and $guards[0].Contains([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($defaultLogo))) -and
+           $null -ne (Get-GuardScript $guards[0])) 'bake-style branding emits the guarded owned-value removal'
     $others = @($bake | Where-Object { $_ -match 'OEMInformation" /v (Manufacturer|Model|SupportURL|SupportHours) ' })
     Check ($others.Count -eq 4 -and @($with | Where-Object { $_ -match 'OEMInformation" /v (Manufacturer|Model|SupportURL|SupportHours) ' }).Count -eq 4) 'the other OEMInformation values are emitted unchanged'
     $foreign = [pscustomobject]@{ Path = (Join-Path $scratch 'stage\mios-logo.bmp'); Sha256 = $evidence.Sha256; Commit = $shaA; Size = 1 }
@@ -316,9 +396,11 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     Check (@($r | Where-Object { $_ -match '/v Logo ' }).Count -eq 0) 'branding ignores evidence without a 64-hex sha256'
     $r = @(New-MiOSBrandingCommands -Toml $view -OemLogo ([pscustomobject]@{ Path = $defaultLogo; Sha256 = $evidence.Sha256; Commit = 'main' }))
     Check (@($r | Where-Object { $_ -match '/v Logo ' }).Count -eq 0) 'branding ignores evidence not bound to a concrete commit'
-    $all = @(New-MiOSBrandingCommands -Toml (New-View @{ 'branding.oem_logo' = 'C:\Windows\Web\%X%\a.bmp' }) -OemLogo $evidence 3>&1)
-    $w = @($all | Where-Object { $_ -is [Management.Automation.WarningRecord] }); $r = @($all | Where-Object { $_ -is [string] })
-    Check ($r.Count -gt 0 -and @($r | Where-Object { $_ -match '/v Logo |Remove-ItemProperty' }).Count -eq 0 -and (@($w) -join ' ').Contains('cannot be carried')) 'an uncarriable configured path emits neither Logo nor cleanup, and says so'
+    $uncarriable = 'C:\Windows\Web\%X%\a"!&.bmp'
+    $all = @(New-MiOSBrandingCommands -Toml (New-View @{ 'branding.oem_logo' = $uncarriable }) -OemLogo $evidence)
+    $unsafeGuards = @($all | Where-Object { $_.Contains('Remove-ItemProperty') })
+    Check (@($all | Where-Object { $_ -match '/v Logo ' }).Count -eq 0 -and $unsafeGuards.Count -eq 1 -and
+        (Invoke-GuardInProcess $unsafeGuards[0] $uncarriable $true) -ceq ($script:inProcessKey + '|Logo')) 'a path unsafe for registry-add still receives safe owned-value cleanup'
     $groups = @(New-MiOSProvisionCommands -Toml $view -OemLogo $evidence)
     $brand = @(@($groups | Where-Object { $_.Description -like 'MiOS global branding*' })[0].Commands)
     Check ($brand -ccontains $logoLine) 'New-MiOSProvisionCommands threads staging evidence to branding'
@@ -326,16 +408,40 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     $brand = @(@($groups | Where-Object { $_.Description -like 'MiOS global branding*' })[0].Commands)
     Check (@($brand | Where-Object { $_ -match '/v Logo ' }).Count -eq 0 -and @($brand | Where-Object { $_.Contains('Remove-ItemProperty') }).Count -eq 1) 'New-MiOSProvisionCommands without evidence keeps the bake shape'
 
+    # --- Current-process evidence: forged, mutated, stale, or no-longer-matching receipts are refused ---
+    $copy = $evidence | ConvertTo-Json | ConvertFrom-Json
+    Check (-not (Test-MiOSOemLogoEvidence -Toml $view -OemLogo $copy)) 'serialized evidence cannot replay the private staging receipt'
+    Check (-not (Test-MiOSOemLogoEvidence -Toml (New-View @{ 'colors.bg' = '#112233' }) -OemLogo $evidence)) 'a receipt is invalid after an effective colour change'
+    Check (-not (Test-MiOSOemLogoEvidence -Toml (New-View @{ 'windows.xbox.identity.system_root' = 'WinNT' }) -OemLogo $evidence)) 'a receipt is invalid after a system root change'
+    Check (-not (Test-MiOSOemLogoEvidence -Toml (New-View @{ 'bootstrap.mios_ref' = 'other' }) -OemLogo $evidence)) 'a receipt is invalid after a vendor ref change'
+    Check (-not (Test-MiOSOemLogoEvidence -Toml (New-View @{ 'windows.xbox.identity.background_color_ref' = 'colors.accent' }) -OemLogo $evidence)) 'a receipt is invalid after a colour ref change'
+    $evidence.Sha256 = ('f' * 64)
+    Check (-not (Test-MiOSOemLogoEvidence -Toml $view -OemLogo $evidence)) 'a receipt rejects a mutated but syntactically valid hash'
+    $evidence = New-ReceiptFixture $view
+    [IO.File]::WriteAllBytes($script:MiOSOemLogoReceipt.FilePath, $script:bmpMain)
+    Check (-not (Test-MiOSOemLogoEvidence -Toml $view -OemLogo $evidence)) 'a receipt is invalid if the staged bytes change'
+    $evidence = New-ReceiptFixture $view
+    $disabledCommands = @(New-MiOSBrandingCommands -Toml (New-View @{ 'branding.windows.enable' = 'false' }) -OemLogo $evidence)
+    Check ($disabledCommands.Count -eq 1 -and $disabledCommands[0].Contains('Remove-ItemProperty')) 'disabled Windows branding still cleans only the configured owned Logo value'
+    $null = Install-MiOSOemLogo -Toml (New-View @{ 'branding.windows.enable' = 'false' }) -Fetch $script:fetch -DestinationPath (Join-Path $scratch 'disabled-again.bmp')
+    Check (-not (Test-MiOSOemLogoEvidence -Toml $view -OemLogo $evidence)) 'a disabled staging attempt invalidates the previous receipt'
+    $evidence = New-ReceiptFixture $view
+    Set-Tree -Sidecar (New-Sidecar $script:bmpA @{ sha256 = (Get-Hex $script:bmpMain) })
+    $failedStage = Invoke-Stage 'stale-existing' $view -Existing
+    $staleCommands = @(New-MiOSBrandingCommands -Toml $view -OemLogo $evidence)
+    Check ($null -eq $failedStage.Result -and (Test-SameBytes $failedStage.Bytes $script:oldBytes) -and
+        @($staleCommands | Where-Object { $_ -match '/v Logo ' }).Count -eq 0 -and @($staleCommands | Where-Object { $_.Contains('Remove-ItemProperty') }).Count -eq 1) 'failed staging preserves the old file and invalidates its previous Logo receipt'
+
     # --- The guard's own logic, run in-process with shadowed registry cmdlets ----------
     $guard = $guards[0]
-    Check ((Invoke-GuardInProcess $guard $defaultLogo.ToLowerInvariant() $false) -ceq ($script:inProcessKey + '|Logo')) 'guard removes our Logo value when its file is absent'
-    Check ((Invoke-GuardInProcess $guard $defaultLogo $true) -ceq '') 'guard keeps our Logo value while its file exists'
+    Check ((Invoke-GuardInProcess $guard $defaultLogo.ToLowerInvariant() $false) -ceq ($script:inProcessKey + '|Logo')) 'guard removes our unverified Logo value when its file is absent'
+    Check ((Invoke-GuardInProcess $guard $defaultLogo $true) -ceq ($script:inProcessKey + '|Logo')) 'guard removes our unverified Logo value even while its file exists'
     Check ((Invoke-GuardInProcess $guard 'C:\OEM\vendor-logo.bmp' $false) -ceq '') 'guard keeps a foreign Logo value'
     Check ((Invoke-GuardInProcess $guard $null $false) -ceq '') 'guard is a no-op when no Logo value exists'
     Check ((Invoke-GuardInProcess $guard ([byte[]](1, 2)) $false) -ceq '') 'guard ignores a non-string Logo value'
     $quoted = "C:\Windows\Web\O'Brien\mios-logo.bmp"
     $qGuard = @(@(New-MiOSBrandingCommands -Toml (New-View @{ 'branding.oem_logo' = $quoted })) | Where-Object { $_.Contains('Remove-ItemProperty') })
-    Check ($qGuard.Count -eq 1 -and (Invoke-GuardInProcess $qGuard[0] $quoted $false) -ceq ($script:inProcessKey + '|Logo')) 'guard literal escapes a single quote in the configured path'
+    Check ($qGuard.Count -eq 1 -and (Invoke-GuardInProcess $qGuard[0] $quoted $false) -ceq ($script:inProcessKey + '|Logo')) 'guard transports a single quote in the configured path'
 
     # --- Bake path: the rendered FirstLogon script carries the guard and no Logo -------
     $bakeView = New-View @{ 'identity.username' = 'fixture'; 'identity.default_password' = 'FIXTURE-ONLY'; 'autounattend.service.enable' = 'false';
@@ -360,10 +466,13 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
         $fixtureKey = 'HKCU:\Software\MiOS-Fixture-' + [guid]::NewGuid().ToString('N')
         $marker = Join-Path $scratch ('live-owned-' + [guid]::NewGuid().ToString('N') + '.txt')
         Invoke-MiOSHostCommands -Commands @((New-GuardProbe $guard $defaultLogo $marker $fixtureKey))
-        Check ([IO.File]::Exists($marker) -and [IO.File]::ReadAllText($marker) -ceq ($fixtureKey + '|Logo')) 'live path: cmd.exe /c delivers the guard intact and it removes our dangling value'
+        Check ([IO.File]::Exists($marker) -and [IO.File]::ReadAllText($marker) -ceq ($fixtureKey + '|Logo')) 'live path: cmd.exe /c delivers the guard intact and it removes our unverified value'
         $marker = Join-Path $scratch ('live-foreign-' + [guid]::NewGuid().ToString('N') + '.txt')
         & cmd.exe /c (New-GuardProbe $guard 'C:\OEM\vendor-logo.bmp' $marker $fixtureKey) *> $null
         Check ($LASTEXITCODE -eq 0 -and -not [IO.File]::Exists($marker)) 'live path: the guard runs cleanly and keeps a foreign value'
+        $marker = Join-Path $scratch ('live-data-' + [guid]::NewGuid().ToString('N') + '.txt')
+        & cmd.exe /v:on /c (New-GuardProbe $unsafeGuards[0] $uncarriable $marker $fixtureKey) *> $null
+        Check ($LASTEXITCODE -eq 0 -and [IO.File]::Exists($marker) -and [IO.File]::ReadAllText($marker) -ceq ($fixtureKey + '|Logo')) 'live path: unsafe path text remains data through cmd delayed expansion'
         $marker = Join-Path $scratch ('baked-owned-' + [guid]::NewGuid().ToString('N') + '.txt')
         if ($bakedGuard.Count -eq 1) {
             $probe = New-GuardProbe $bakedGuard[0] $defaultLogo $marker $fixtureKey
@@ -418,14 +527,22 @@ try {
         @{ Name = 'commit pinning replaced by main'; File = 'lib'; Expected = 'every vendor fetch is pinned to the resolved commit'; From = '$base = $source.Raw + ''/'' + $Commit + ''/'''; To = '$base = $source.Raw + ''/main/''' },
         @{ Name = 'explicit commit validation removed'; File = 'lib'; Expected = 'refuses an explicit non-hex commit'; From = 'if ($Commit -cnotmatch ''^[0-9a-f]{40}$'')'; To = 'if ($false)' },
         @{ Name = 'resolved commit validation removed'; File = 'lib'; Expected = 'refuses a commit that does not resolve to 40 hex'; From = 'if ($sha -cnotmatch ''^[0-9a-f]{40}$'')'; To = 'if ($false)' },
-        @{ Name = 'target path rule removed'; File = 'lib'; Expected = 'refuses a target outside C:\Windows'; From = 'if ($gap) { throw $gap }'; To = 'if ($false) { throw $gap }' },
+        @{ Name = 'target path rule removed'; File = 'lib'; Expected = 'refuses a target under the wrong vendor system root'; From = '$gap = Get-MiOSOemLogoTargetGap -Path $target -Toml $Toml -Vendor $vendor'; To = '$gap = $null' },
         @{ Name = 'Logo emitted without evidence'; File = 'lib'; Expected = 'bake-style branding (no evidence) emits no Logo value'; From = 'if ($hasEvidence) {'; To = 'if ($true) {' },
-        @{ Name = 'evidence path binding removed'; File = 'lib'; Expected = 'branding ignores evidence for a different path'; From = '[string]::Equals([string]$OemLogo.Path, $logo, [StringComparison]::OrdinalIgnoreCase)'; To = '$true' },
-        @{ Name = 'guarded removal dropped'; File = 'lib'; Expected = 'bake-style branding emits the guarded owned-dangling removal'; From = 'return @(''powershell.exe -NoProfile -Command "'' + $guard + ''"'')'; To = 'return @()' },
-        @{ Name = 'guard value equality dropped'; File = 'lib'; Expected = 'guard keeps a foreign Logo value'; From = '$v -ieq $p -and '; To = '' },
-        @{ Name = 'guard file test dropped'; File = 'lib'; Expected = 'guard keeps our Logo value while its file exists'; From = ' -and -not (Test-Path -LiteralPath $p -PathType Leaf)'; To = '' },
-        @{ Name = 'reader quote-run fix reverted'; File = 'lib'; Expected = 'reader accepts quotes before a closing triple quote'; From = 'while ($run -lt $Text.Length -and $Text[$run] -eq $Delimiter[0] -and $run - $end -lt 5) { $run++ }'; To = '$null = $run' },
+        @{ Name = 'evidence verification bypassed'; File = 'lib'; Expected = 'branding ignores evidence for a different path'; From = '(Test-MiOSOemLogoEvidence -Toml $Toml -OemLogo $OemLogo)'; To = '$true' },
+        @{ Name = 'guarded removal dropped'; File = 'lib'; Expected = 'bake-style branding emits the guarded owned-value removal'; From = 'return @(''powershell.exe -NoProfile -Command "'' + $guard + ''"'')'; To = 'return @()' },
+        @{ Name = 'guard value equality dropped'; File = 'lib'; Expected = 'guard keeps a foreign Logo value'; From = ' -and [string]::Equals($v, $p, [StringComparison]::OrdinalIgnoreCase)'; To = '' },
+        @{ Name = 'guard incorrectly requires a missing file'; File = 'lib'; Expected = 'guard removes our unverified Logo value even while its file exists'; From = '[string]::Equals($v, $p, [StringComparison]::OrdinalIgnoreCase))'; To = '[string]::Equals($v, $p, [StringComparison]::OrdinalIgnoreCase) -and -not (Test-Path -LiteralPath $p -PathType Leaf))' },
+        @{ Name = 'reader quote-run fix reverted'; File = 'lib'; Expected = 'reader accepts quotes before a closing triple quote'; From = '$i + $run - 3'; To = '$i' },
         @{ Name = 'branding threading dropped'; File = 'lib'; Expected = 'New-MiOSProvisionCommands threads staging evidence to branding'; From = 'New-MiOSBrandingCommands   -Toml $Toml -OemLogo $OemLogo'; To = 'New-MiOSBrandingCommands   -Toml $Toml' },
+        @{ Name = 'disabled branding cleanup skipped'; File = 'lib'; Expected = 'disabled Windows branding still cleans only the configured owned Logo value'; From = '{ return @(New-MiOSOemLogoCommands -Toml $Toml) }'; To = '{ return @() }' },
+        @{ Name = 'receipt identity check removed'; File = 'lib'; Expected = 'serialized evidence cannot replay the private staging receipt'; From = ' -or -not [object]::ReferenceEquals($receipt.Evidence, $OemLogo)'; To = '' },
+        @{ Name = 'receipt input binding removed'; File = 'lib'; Expected = 'a receipt is invalid after an effective colour change'; From = '$receipt.Binding -ceq (Get-MiOSOemLogoBinding -Toml $Toml -BackgroundKey $receipt.BackgroundKey)'; To = '$true' },
+        @{ Name = 'receipt byte verification removed'; File = 'lib'; Expected = 'a receipt is invalid if the staged bytes change'; From = '(Get-MiOSSha256Hex -Bytes $bytes) -ceq $receipt.Sha256'; To = '$true' },
+        @{ Name = 'receipt reset dropped'; File = 'lib'; Expected = 'a disabled staging attempt invalidates the previous receipt'; From = '    $script:MiOSOemLogoReceipt = $null'; To = '    # receipt reset omitted' },
+        @{ Name = 'ancestor link check removed'; File = 'lib'; Expected = 'staging refuses a reparse-point ancestor without writing through it'; From = '($attributes -band [IO.FileAttributes]::ReparsePoint) -or -not ($attributes -band [IO.FileAttributes]::Directory)'; To = '$false' },
+        @{ Name = 'ACL write check removed'; File = 'lib'; Expected = 'the ACL policy refuses a destination writable by Users'; From = '($rule.FileSystemRights -band $writeMask)'; To = '$false' },
+        @{ Name = 'missing effective colour mislabeled'; File = 'lib'; Expected = 'names a missing effective required colour instead of claiming an override'; From = 'if (-not $hostBg)'; To = 'if ($false)' },
         @{ Name = 'live entry drops evidence'; File = 'provision'; Expected = 'live apply passes Install-MiOSOemLogo evidence to New-MiOSProvisionCommands'; From = 'New-MiOSProvisionCommands -Toml $toml -OemLogo $oemLogo'; To = 'New-MiOSProvisionCommands -Toml $toml' }
     )
     $caught = 0; $index = 0

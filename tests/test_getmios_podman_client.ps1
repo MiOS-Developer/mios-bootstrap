@@ -39,7 +39,8 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
     $script:fail = 0; $script:checks = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
     $entryAst = Get-Ast $Entry; $buildAst = Get-Ast $Build
     Import-Functions $entryAst @('Get-MiosTomlValue', 'Get-MiosPodmanVersion', 'Get-MiosRequiredPodmanVersion', 'Install-MiosPodmanClient', 'Get-MiosMachineWorkerScript',
-        'Get-MiosMachinePodmanExe', 'Get-MiosMachinePodmanVersion')
+        'Get-MiosMachinePodmanExe', 'Get-MiosMachinePodmanVersion', 'Get-MiosOlderPodmanEntries', 'Get-MiosPodmanRemovalPlan', 'Remove-MiosOlderPodman')
+    $savedProgramData = $env:ProgramData
     Import-Functions $buildAst @('Assert-MiosPodmanInitSupport')
 
     # --- Fake podman: a real executable script whose version and help the fixture controls; every run leaves a mark --------
@@ -94,11 +95,48 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
             $script:signatureChecks.Add($LiteralPath)
             return [pscustomobject]@{ Status = $script:sigStatus; SignerCertificate = [pscustomobject]@{ Subject = $script:sigSubject } }
         }
+        if ($LiteralPath -like '*podman-setup.exe') {
+            $script:bundleSignatureChecks.Add($LiteralPath)
+            return [pscustomobject]@{ Status = $script:bundleSigStatus; SignerCertificate = [pscustomobject]@{ Subject = $script:bundleSigSubject } }
+        }
         $script:exeSignatureChecks.Add($LiteralPath)
         return [pscustomobject]@{ Status = $script:exeSigStatus; SignerCertificate = [pscustomobject]@{ Subject = $script:exeSigSubject } }
     }
+    # --- Uninstall registrations: a fake registry read as data, removals recorded and applied to it, never real ------------
+    $env:ProgramData = Join-Path $scratch 'ProgramData'
+    $bundleKey = '{A1EC0C19-E860-4554-9787-72ECCE3E9ED7}'; $msiKey = '{C1B3D45C-260B-4853-9BAA-AA68F4A20A02}'
+    $cacheExe = Join-Path $env:ProgramData ('Package Cache\' + $bundleKey + '\podman-setup.exe')
+    $outsideExe = Join-Path $scratch ('elsewhere\' + $bundleKey + '\podman-setup.exe')
+    foreach ($f in $cacheExe, $outsideExe) { New-Item -ItemType Directory -Force -Path (Split-Path $f) | Out-Null; [IO.File]::WriteAllText($f, 'fixture bundle') }
+    $msiexecPath = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+    function New-Entry([string]$Key, [string]$Name = 'Podman', [string]$Publisher = 'Red Hat', [string]$Version = '5.8.10', [string]$Cache = '', [string]$Quiet = '', [string]$Wi = '') {
+        $provider = if ($Cache) { $Key } else { '' }
+        return [pscustomobject]@{ Root = 'HKLM:\fixture'; Key = $Key; DisplayName = $Name; Publisher = $Publisher; DisplayVersion = $Version; WindowsInstaller = $Wi
+            BundleCachePath = $Cache; BundleProviderKey = $provider; QuietUninstallString = $Quiet }
+    }
+    function New-RealShape([string]$Cache = $cacheExe) {
+        # The shape winget's Podman 5.8.10 setup left on mios-1: a visible bundle and its hidden Windows Installer product.
+        return @((New-Entry $bundleKey -Cache $Cache -Quiet ('"' + $Cache + '" /uninstall /quiet')), (New-Entry $msiKey -Name 'podman' -Publisher 'Red Hat Inc.' -Wi '1'))
+    }
+    $bystanders = @((New-Entry '{11111111-1111-1111-1111-111111111111}' -Name 'Podman Desktop' -Version '1.30.5' -Wi '1'),
+        (New-Entry '{22222222-2222-2222-2222-222222222222}' -Publisher 'Contoso' -Wi '1'),
+        (New-Entry '{33333333-3333-3333-3333-333333333333}' -Version '6.2.0' -Wi '1'))
+    function global:Read-MiosPodmanUninstallEntries { return @($script:registry) }
+    function global:Invoke-MiosPodmanRemoval {
+        param([string]$FilePath, [string[]]$Arguments)
+        $script:removals.Add($FilePath + '|' + ($Arguments -join ' '))
+        $kind = if ($FilePath -like '*podman-setup.exe') { 'bundle' } else { 'msi' }
+        $script:events.Add('remove-' + $kind)
+        if ($script:removalExit -notin @(0, 3010) -or $script:removalLeavesEntries) { return $script:removalExit }
+        $gone = if ($kind -eq 'bundle') { @($script:registry | Where-Object { $_.BundleCachePath -eq $FilePath -or ($script:bundleRemovesMsi -and $_.Key -eq $msiKey) }) }
+                else { @($script:registry | Where-Object { $_.Key -eq $Arguments[1] }) }
+        $script:registry = @($script:registry | Where-Object { $gone -notcontains $_ })
+        $script:clientAbsent = $true
+        return $script:removalExit
+    }
     function global:Invoke-MiosMsiInstall {
         param($Path)
+        $script:events.Add('install')
         $script:installs.Add($Path)
         $script:installedExisted = Test-Path -LiteralPath $Path
         if ($script:msiUpgradesTo) { $env:MIOS_FAKE_PODMAN_VERSION = $script:msiUpgradesTo; $script:clientAbsent = $false }
@@ -115,6 +153,9 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
         $script:msiExit = 0; $script:msiUpgradesTo = '6.2.0'; $script:installedExisted = $false
         $script:downloads = New-Object System.Collections.Generic.List[string]; $script:installs = New-Object System.Collections.Generic.List[string]
         $script:written = New-Object System.Collections.Generic.List[string]; $script:signatureChecks = New-Object System.Collections.Generic.List[string]
+        $script:registry = @(); $script:removals = New-Object System.Collections.Generic.List[string]; $script:events = New-Object System.Collections.Generic.List[string]
+        $script:bundleSigStatus = 'Valid'; $script:bundleSigSubject = $signer; $script:bundleSignatureChecks = New-Object System.Collections.Generic.List[string]
+        $script:removalExit = 0; $script:bundleRemovesMsi = $false; $script:removalLeavesEntries = $false
         if (Test-Path -LiteralPath $download) { Remove-Item -LiteralPath $download -Recurse -Force }
     }
     function Invoke-Install { $script:outcome = $null; $script:installError = ''; try { $script:outcome = Install-MiosPodmanClient -DownloadDirectory $download } catch { $script:installError = $_.Exception.Message } }
@@ -168,6 +209,33 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
     Reset-Scenario; $script:vendorText = New-Vendor -Tag 'latest'; Invoke-Install
     Check ($script:installError -match 'machine_os_tag') 'an unversioned machine-os tag refuses the comparison'
 
+    # --- Older registrations the pinned MSI cannot upgrade (its installer refuses with 1603) -------------------------------
+    $bundleCall = $cacheExe + '|/uninstall /quiet /norestart'; $msiCall = $msiexecPath + '|/x ' + $msiKey + ' /qn /norestart'
+    Reset-Scenario '5.8.10'; $script:registry = @(New-RealShape) + $bystanders; Invoke-Install
+    Check ($script:outcome -eq 'installed' -and (@($script:removals) -join ';') -ceq ($bundleCall + ';' + $msiCall) -and
+           (@($script:events) -join ',') -ceq 'remove-bundle,remove-msi,install' -and $script:bundleSignatureChecks.Count -eq 1) 'an older bundle and its MSI are removed in order with fixed arguments, then 6.2 is installed'
+    Check (@($script:registry | Where-Object { $bystanders -contains $_ }).Count -eq 3 -and @($script:removals | Where-Object { $_ -match '\{(1|2|3)' }).Count -eq 0) 'Podman Desktop, a non-Red Hat Podman and a current 6.2 entry are never touched'
+    Reset-Scenario '5.8.10'; $script:registry = @(New-RealShape); $script:bundleRemovesMsi = $true; Invoke-Install
+    Check ($script:outcome -eq 'installed' -and (@($script:removals) -join ';') -ceq $bundleCall) 'an MSI its bundle already removed is not removed again'
+    Reset-Scenario '5.8.10'; $script:registry = @($bystanders); Invoke-Install
+    Check ($script:outcome -eq 'installed' -and $script:removals.Count -eq 0) 'with no older Red Hat Podman registered nothing is removed'
+    Reset-Scenario '5.8.10'; $script:registry = @(New-RealShape -Cache $outsideExe); Invoke-Install
+    Check ($script:installError -match 'outside' -and $script:removals.Count -eq 0 -and (Test-NothingInstalled)) 'a bundle exe outside Package Cache refuses with nothing removed'
+    Reset-Scenario '5.8.10'; $script:registry = @(New-RealShape); $script:bundleSigStatus = 'NotSigned'; Invoke-Install
+    Check ($script:installError -match 'NotSigned signature, not Valid; nothing was removed' -and $script:removals.Count -eq 0 -and (Test-NothingInstalled)) 'an unsigned bundle exe refuses with nothing removed'
+    Reset-Scenario '5.8.10'; $script:registry = @(New-RealShape); $script:bundleSigSubject = 'CN="Planted, LLC", O="Planted, LLC"'; Invoke-Install
+    Check ($script:installError -match 'not the SSOT signer; nothing was removed' -and $script:removals.Count -eq 0 -and (Test-NothingInstalled)) 'a foreign-signed bundle exe refuses with nothing removed'
+    Reset-Scenario '5.8.10'; $odd = @(New-RealShape); $odd[0].QuietUninstallString = '"' + $cacheExe + '" /uninstall /quiet /passive & cmd /c calc'; $script:registry = $odd; Invoke-Install
+    Check ($script:installError -match 'unexpected uninstall command' -and $script:removals.Count -eq 0 -and (Test-NothingInstalled)) 'an odd uninstall-string shape refuses with nothing removed'
+    Reset-Scenario '5.8.10'; $script:registry = @(New-Entry 'not-a-guid' -Wi '1'); Invoke-Install
+    Check ($script:installError -match 'neither a cached setup bundle nor a Windows Installer product' -and $script:removals.Count -eq 0 -and (Test-NothingInstalled)) 'an MSI entry without a GUID key refuses with nothing removed'
+    Reset-Scenario '5.8.10'; $script:registry = @(New-RealShape); $script:removalExit = 1603; Invoke-Install
+    Check ($script:installError -match 'failed \(exit 1603\); the pinned Podman MSI was not installed' -and $script:installs.Count -eq 0) 'an uninstall failure code refuses before install'
+    Reset-Scenario '5.8.10'; $script:registry = @(New-RealShape); $script:removalLeavesEntries = $true; Invoke-Install
+    Check ($script:installError -match 'still registered after removal' -and $script:installs.Count -eq 0) 'an older Podman still registered after removal refuses before install'
+    Reset-Scenario '5.8.10'; $script:registry = @(New-RealShape); $script:sigStatus = 'NotSigned'; Invoke-Install
+    Check ($script:removals.Count -eq 0 -and $script:installError -match 'signature is NotSigned') 'nothing is removed unless the replacement MSI is verified first'
+
     # --- Guard before init ----------------------------------------------------------------------------------------------
     # The user-side guard stays PATH-based: the fake podman is first on PATH, and the refusal names the path it resolved.
     $savedPath = $env:PATH
@@ -208,12 +276,22 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
     $versionText = (Get-Function $entryAst 'Get-MiosMachinePodmanVersion').Body.Extent.Text
     Check (-not ($installText -match 'Resolve-MiosPodmanExe|Get-Command|\$env:PATH') -and -not ($machineText -match 'Get-Command|\$env:PATH|Resolve-MiosPodmanExe') -and
            $machineText.Contains("Join-Path `${env:ProgramFiles} 'RedHat\Podman\podman.exe'") -and
-           @([regex]::Matches($installText, 'Get-MiosMachinePodmanVersion -Signer \$signer')).Count -eq 2 -and
+           @([regex]::Matches($installText, 'Get-MiosMachinePodmanVersion -Signer \$signer')).Count -eq 3 -and
            $versionText.IndexOf('Get-AuthenticodeSignature -LiteralPath $exe') -ge 0 -and
            $versionText.IndexOf('Get-AuthenticodeSignature -LiteralPath $exe') -lt $versionText.IndexOf('Get-MiosPodmanVersion $exe')) 'the elevated check resolves only the machine path and verifies it before running it'
+    $readText = (Get-Function $entryAst 'Read-MiosPodmanUninstallEntries').Body.Extent.Text
+    $planText = (Get-Function $entryAst 'Get-MiosPodmanRemovalPlan').Body.Extent.Text
+    $removeText = (Get-Function $entryAst 'Remove-MiosOlderPodman').Body.Extent.Text
+    Check ($readText.Contains("'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'") -and $readText.Contains("'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'") -and
+           $planText.Contains("Arguments = @('/uninstall', '/quiet', '/norestart')") -and $planText.Contains("Arguments = @('/x', `$e.Key, '/qn', '/norestart')") -and
+           -not (($readText + $planText + $removeText) -match 'Invoke-Expression|\biex\b|cmd(\.exe)?\s+/c|\[scriptblock\]::Create|\.UninstallString') -and
+           $removeText.Contains('Invoke-MiosPodmanRemoval -FilePath $step.FilePath -Arguments $step.Arguments')) 'removal reads both registry views as data and runs only fixed arguments'
+    $removeAt = $installText.IndexOf('Remove-MiosOlderPodman -Required $required -Signer $signer')
+    Check ($removeAt -gt $signerAt -and $removeAt -lt $msiAt) 'older registrations are removed only after the replacement MSI is verified and before it installs'
     $worker = ''; try { $worker = Get-MiosMachineWorkerScript -Source ([IO.File]::ReadAllText($Entry)) } catch { $worker = '' }
     $missingHelpers = @(@('Get-MiosMachinePodmanExe', 'Get-MiosMachinePodmanVersion', 'Get-MiosPodmanVersion', 'Get-MiosRequiredPodmanVersion', 'Get-MiosPinnedDownloadBytes',
-        'Invoke-MiosMsiInstall', 'Install-MiosPodmanClient') | Where-Object { $worker -notmatch ('(?m)^function ' + [regex]::Escape($_) + ' \{') })
+        'Invoke-MiosMsiInstall', 'Install-MiosPodmanClient', 'Read-MiosPodmanUninstallEntries', 'Get-MiosOlderPodmanEntries', 'Get-MiosPodmanRemovalPlan',
+        'Invoke-MiosPodmanRemoval', 'Remove-MiosOlderPodman') | Where-Object { $worker -notmatch ('(?m)^function ' + [regex]::Escape($_) + ' \{') })
     Check ([bool]$worker -and $missingHelpers.Count -eq 0) 'the elevated worker carries every Podman client helper'
 
     # --- The shipped template pin parses to the expected shapes ----------------------------------------------------------
@@ -225,6 +303,7 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
            $s -cmatch '^[0-9a-f]{64}$' -and $g.StartsWith('CN="Red Hat, LLC", OU=Podman, O="Red Hat, LLC"')) 'the template carries a parseable pinned MSI URL, sha256 and signer'
 
     Remove-Item Env:MIOS_FAKE_PODMAN_VERSION, Env:MIOS_FAKE_PODMAN_FLAG, Env:MIOS_FAKE_MARKER -ErrorAction SilentlyContinue
+    $env:ProgramData = $savedProgramData
     Write-Host "PODMAN_CLIENT_ASSERTIONS $($script:checks)"
     return $script:fail
 }
@@ -248,6 +327,16 @@ try {
         @{ Name = 'machine exe signature check removed'; File = 'entry'; Expected = 'an unsigned machine Podman client is never run elevated'; From = "if ([string]`$signature.Status -ne 'Valid') { throw `"The machine Podman client"; To = "if (`$false) { throw `"The machine Podman client" },
         @{ Name = 'guard removed'; File = 'build'; Expected = 'a client without --update-connection stops before init with version, path, requirement and remedy'; From = "if (`$help -match '(?m)^\s*(?:-\w,\s*)?--update-connection\b') { return }"; To = 'return' },
         @{ Name = 'guard call removed'; File = 'build'; Expected = 'the guard runs after the machine-os tag resolves and before the image download and init'; From = '    Assert-MiosPodmanInitSupport -RequiredTag $machineTag'; To = '    $null = $machineTag' },
+        @{ Name = 'publisher filter removed'; File = 'entry'; Expected = 'Podman Desktop, a non-Red Hat Podman and a current 6.2 entry are never touched'
+           From = "`$_.DisplayName -ieq 'Podman' -and `$_.Publisher -cin `$publishers -and"; To = "`$_.DisplayName -ieq 'Podman' -and" },
+        @{ Name = 'version guard removed'; File = 'entry'; Expected = 'Podman Desktop, a non-Red Hat Podman and a current 6.2 entry are never touched'
+           From = "(New-Object Version ([int]`$Matches[1]), ([int]`$Matches[2])) -lt `$Required })"; To = "`$true })" },
+        @{ Name = 'bundle signer check removed'; File = 'entry'; Expected = 'a foreign-signed bundle exe refuses with nothing removed'
+           From = "if (`$subject -cne `$Signer) { throw `"The Podman bundle"; To = "if (`$false) { throw `"The Podman bundle" },
+        @{ Name = 'Package Cache path check removed'; File = 'entry'; Expected = 'a bundle exe outside Package Cache refuses with nothing removed'
+           From = "if (`$full -ine `$exe -or -not `$full.StartsWith(`$cacheRoot, [StringComparison]::OrdinalIgnoreCase)) { throw"; To = "if (`$false) { throw" },
+        @{ Name = 'registry arguments executed'; File = 'entry'; Expected = 'an older bundle and its MSI are removed in order with fixed arguments, then 6.2 is installed'
+           From = "Arguments = @('/uninstall', '/quiet', '/norestart')"; To = 'Arguments = @(([string]$e.QuietUninstallString -replace ''^"[^"]*"\s*'', '''') -split ''\s+'')' },
         @{ Name = 'pin read from the operator layer'; File = 'entry'; Expected = 'the pinned MSI URL comes from the system SSOT, never the operator layer'; From = "-Key 'podman_cli_msi_url' -Default '' -VendorOnly"; To = "-Key 'podman_cli_msi_url' -Default ''" }
     )
     $caught = 0; $index = 0

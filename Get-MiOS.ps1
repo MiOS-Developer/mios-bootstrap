@@ -2419,7 +2419,8 @@ function Get-MiosMachineWorkerScript {
         'Invoke-MiosPlatformGate', 'Assert-MiosOriginContext', 'Initialize-MiosPipePeerApi',
         'Initialize-MiosMachineStorage', 'Publish-MiosMachineToml', 'Register-MiosBootstrapResume',
         'Get-MiosMachinePodmanExe', 'Get-MiosMachinePodmanVersion', 'Get-MiosPodmanVersion', 'Get-MiosRequiredPodmanVersion',
-        'Get-MiosPinnedDownloadBytes', 'Invoke-MiosMsiInstall', 'Install-MiosPodmanClient',
+        'Get-MiosPinnedDownloadBytes', 'Invoke-MiosMsiInstall', 'Install-MiosPodmanClient', 'Read-MiosPodmanUninstallEntries',
+        'Get-MiosOlderPodmanEntries', 'Get-MiosPodmanRemovalPlan', 'Invoke-MiosPodmanRemoval', 'Remove-MiosOlderPodman',
         'Read-MiosPipeLine', 'Invoke-MiosMachineWorker', 'Invoke-MiosMachinePreparationRequest', 'Invoke-MiosMachinePreparationCore')
     $functions = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $names }, $true))
     foreach ($name in $names) { if (@($functions | Where-Object Name -eq $name).Count -ne 1) { throw "Missing or duplicate machine helper: $name" } }
@@ -5305,6 +5306,89 @@ function Invoke-MiosMsiInstall {
     return [int]$proc.ExitCode
 }
 
+function Read-MiosPodmanUninstallEntries {
+    # Machine-wide uninstall registrations (64-bit and WOW6432Node views) read as data; no registry command text is ever run.
+    $entries = New-Object System.Collections.Generic.List[object]
+    foreach ($root in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
+            $p = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+            if (-not $p -or [string]$p.DisplayName -notmatch 'podman') { continue }
+            $entries.Add([pscustomobject]@{ Root = $root; Key = [string]$key.PSChildName; DisplayName = [string]$p.DisplayName; Publisher = [string]$p.Publisher
+                DisplayVersion = [string]$p.DisplayVersion; WindowsInstaller = [string]$p.WindowsInstaller; BundleCachePath = [string]$p.BundleCachePath
+                BundleProviderKey = [string]$p.BundleProviderKey; QuietUninstallString = [string]$p.QuietUninstallString })
+        }
+    }
+    return $entries.ToArray()
+}
+
+function Get-MiosOlderPodmanEntries {
+    # Only an entry named exactly 'Podman' from Red Hat whose version is older than machine-os major.minor. 'Podman Desktop',
+    # other publishers and current versions never match.
+    param([Parameter(Mandatory)][Version]$Required)
+    $publishers = @('Red Hat', 'Red Hat Inc.', 'Red Hat, LLC')
+    return @(@(Read-MiosPodmanUninstallEntries) | Where-Object {
+        $_.DisplayName -ieq 'Podman' -and $_.Publisher -cin $publishers -and $_.DisplayVersion -match '^(\d+)\.(\d+)' -and
+        (New-Object Version ([int]$Matches[1]), ([int]$Matches[2])) -lt $Required })
+}
+
+function Get-MiosPodmanRemovalPlan {
+    # Every older entry is validated before anything is removed: a setup bundle whose cached exe lies under
+    # %ProgramData%\Package Cache and carries the SSOT signer (run with fixed arguments), or a Windows Installer product
+    # addressed only by its GUID key. Any other shape refuses; registry argument text is data, never executed.
+    param([Parameter(Mandatory)][object[]]$Entries, [Parameter(Mandatory)][string]$Signer)
+    $cacheRoot = [IO.Path]::GetFullPath((Join-Path $env:ProgramData 'Package Cache')).TrimEnd('\') + '\'
+    $plan = New-Object System.Collections.Generic.List[object]
+    foreach ($e in $Entries) {
+        $label = "$($e.DisplayName) $($e.DisplayVersion) [$($e.Key)]"
+        if ($e.BundleCachePath -or $e.BundleProviderKey) {
+            $exe = [string]$e.BundleCachePath
+            if (-not $exe -or -not [IO.Path]::IsPathRooted($exe) -or $exe -notmatch '\.exe$') { throw "The Podman bundle $label has no absolute cached bundle exe; nothing was removed." }
+            $full = [IO.Path]::GetFullPath($exe)
+            if ($full -ine $exe -or -not $full.StartsWith($cacheRoot, [StringComparison]::OrdinalIgnoreCase)) { throw "The Podman bundle $label caches its exe outside $cacheRoot; nothing was removed." }
+            $quiet = ([string]$e.QuietUninstallString).Trim()
+            if ($quiet -and $quiet -ine ('"' + $exe + '" /uninstall /quiet')) { throw "The Podman bundle $label has an unexpected uninstall command; nothing was removed." }
+            if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "The Podman bundle $label cached exe is missing; nothing was removed." }
+            $signature = Get-AuthenticodeSignature -LiteralPath $full
+            if ([string]$signature.Status -ne 'Valid') { throw "The Podman bundle $label exe has a $($signature.Status) signature, not Valid; nothing was removed." }
+            $subject = if ($signature.SignerCertificate) { [string]$signature.SignerCertificate.Subject } else { '' }
+            if ($subject -cne $Signer) { throw "The Podman bundle $label exe is signed by '$subject', not the SSOT signer; nothing was removed." }
+            $plan.Add([pscustomobject]@{ Order = 0; Kind = 'bundle'; Label = $label; Key = $e.Key; FilePath = $full; Arguments = @('/uninstall', '/quiet', '/norestart') })
+        } elseif ($e.WindowsInstaller -eq '1' -and $e.Key -match '^\{[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$') {
+            $plan.Add([pscustomobject]@{ Order = 1; Kind = 'msi'; Label = $label; Key = $e.Key; FilePath = (Join-Path $env:SystemRoot 'System32\msiexec.exe'); Arguments = @('/x', $e.Key, '/qn', '/norestart') })
+        } else { throw "The Podman entry $label is neither a cached setup bundle nor a Windows Installer product; nothing was removed." }
+    }
+    return @($plan | Sort-Object Order)
+}
+
+function Invoke-MiosPodmanRemoval {
+    param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$Arguments)
+    $proc = Start-Process -FilePath $FilePath -ArgumentList $Arguments -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+    return [int]$proc.ExitCode
+}
+
+function Remove-MiosOlderPodman {
+    # The pinned MSI cannot upgrade an older Podman in place (its installer refuses with 1603), so the older Red Hat
+    # registrations go first: the setup bundle, then any Windows Installer product still registered. The vendor preserves
+    # containers, images, machines and data on uninstall; no podman command, user directory or policy is touched here.
+    param([Parameter(Mandatory)][Version]$Required, [Parameter(Mandatory)][string]$Signer)
+    $older = @(Get-MiosOlderPodmanEntries -Required $Required)
+    if (-not $older.Count) { return 0 }
+    $plan = @(Get-MiosPodmanRemovalPlan -Entries $older -Signer $Signer)
+    $removed = 0
+    foreach ($step in $plan) {
+        # A bundle normally removes its own Windows Installer product; only what is still registered is removed here.
+        if ($step.Kind -eq 'msi' -and -not @(@(Get-MiosOlderPodmanEntries -Required $Required) | Where-Object { $_.Key -eq $step.Key }).Count) { continue }
+        Write-Info "Removing $($step.Label) ($($step.Kind)); the vendor preserves containers, images, machines and data."
+        $code = Invoke-MiosPodmanRemoval -FilePath $step.FilePath -Arguments $step.Arguments
+        if ($code -notin @(0, 3010)) { throw "Removing $($step.Label) failed (exit $code); the pinned Podman MSI was not installed." }
+        $removed++
+    }
+    $left = @(Get-MiosOlderPodmanEntries -Required $Required)
+    if ($left.Count) { throw "An older Red Hat Podman is still registered after removal ($(@($left | ForEach-Object { "$($_.DisplayName) $($_.DisplayVersion) [$($_.Key)]" }) -join ', ')); the pinned Podman MSI was not installed." }
+    return $removed
+}
+
 function Install-MiosPodmanClient {
     # Elevated machine preparation (the operator's UAC): bring the Podman client up to the machine-os version MiOS-DEV needs.
     # Only the system SSOT pin is trusted: the MSI must match its sha256, carry a Valid Authenticode signature and the pinned
@@ -5342,8 +5426,15 @@ function Install-MiosPodmanClient {
         if ([string]$signature.Status -ne 'Valid') { throw "The pinned Podman MSI signature is $($signature.Status), not Valid. Nothing was installed." }
         $subject = if ($signature.SignerCertificate) { [string]$signature.SignerCertificate.Subject } else { '' }
         if ($subject -cne $signer) { throw "The pinned Podman MSI is signed by '$subject', not the SSOT signer '$signer'. Nothing was installed." }
+        # Only with a verified replacement in hand: remove an older Red Hat Podman the MSI cannot upgrade, then re-check.
+        $removed = Remove-MiosOlderPodman -Required $required -Signer $signer
+        # Re-read the machine client after a removal: anything left at the machine path must still carry the SSOT signer.
+        if ($removed) { $null = Get-MiosMachinePodmanVersion -Signer $signer }
         $code = Invoke-MiosMsiInstall -Path $msi
-        if ($code -notin @(0, 3010)) { throw "msiexec could not install the verified Podman MSI (exit $code); $have is unchanged." }
+        if ($code -notin @(0, 3010)) {
+            $state = if ($removed) { "the older Podman was already removed ($removed registration(s))" } else { "$have is unchanged" }
+            throw "msiexec could not install the verified Podman MSI (exit $code); $state."
+        }
     } finally { Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue }
     $after = Get-MiosMachinePodmanVersion -Signer $signer
     if (-not $after -or (New-Object Version $after.Major, $after.Minor) -lt $required) {

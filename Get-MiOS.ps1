@@ -752,10 +752,9 @@ function Initialize-MiosHostTierDirectory {
         throw 'A host TOML destination must be etc/mios/mios.toml.'
     }
     Assert-MiosNoReparsePath $Path
-    # Protect both directory levels: a writable parent grants delete/replace even when the file itself is read-only.
+    # Both levels, vendor-style: an existing directory must already pass admission; an absent one is created atomically protected.
     foreach ($d in @($etc, $dir)) {
-        if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -ErrorAction Stop | Out-Null }
-        Set-MiosHostTierAcl $d
+        if (Test-Path -LiteralPath $d) { Assert-MiosMachineWriteBoundary $d } else { New-MiosProtectedMachineDirectory $d }
     }
     Assert-MiosNoReparsePath $Path
 }
@@ -807,12 +806,13 @@ function New-MiosProtectedMachineDirectory {
         $methods = @([IO.FileSystemAclExtensions].GetMethods())
         $method = @($methods | Where-Object { $_.Name -eq 'CreateDirectory' -and $_.GetParameters().Count -eq 2 -and
             $_.GetParameters()[0].ParameterType -eq [Security.AccessControl.DirectorySecurity] -and $_.GetParameters()[1].ParameterType -eq [string] }) | Select-Object -First 1
-        if ($method) { $null = $method.Invoke($null, @($acl, $Path)) }
+        # Reflection needs the raw .NET objects, not the PSObject wrappers function output carries.
+        if ($method) { $null = $method.Invoke($null, [object[]]@($acl.psobject.BaseObject, $Path)) }
         else {
             $method = @($methods | Where-Object { $_.Name -eq 'Create' -and $_.GetParameters().Count -eq 2 -and
                 $_.GetParameters()[0].ParameterType -eq [IO.DirectoryInfo] -and $_.GetParameters()[1].ParameterType -eq [Security.AccessControl.DirectorySecurity] }) | Select-Object -First 1
             if (-not $method) { throw 'Atomic directory creation with a protected ACL is unavailable.' }
-            $null = $method.Invoke($null, @((New-Object IO.DirectoryInfo $Path), $acl))
+            $null = $method.Invoke($null, [object[]]@((New-Object IO.DirectoryInfo $Path).psobject.BaseObject, $acl.psobject.BaseObject))
         }
     }
     # A concurrent pre-existing directory must pass the same boundary checks; never take over its ACL or owner.
@@ -830,8 +830,8 @@ function Write-MiosPrivateMachineFile {
         $method = @([IO.FileSystemAclExtensions].GetMethods() | Where-Object { $_.Name -eq 'Create' -and $_.GetParameters().Count -eq 7 -and
             $_.GetParameters()[0].ParameterType -eq [IO.FileInfo] -and $_.GetParameters()[6].ParameterType -eq [Security.AccessControl.FileSecurity] }) | Select-Object -First 1
         if (-not $method) { throw 'Atomic file creation with a protected ACL is unavailable.' }
-        $stream = $method.Invoke($null, @((New-Object IO.FileInfo $Path), [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write,
-            [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $acl))
+        $stream = $method.Invoke($null, [object[]]@((New-Object IO.FileInfo $Path).psobject.BaseObject, [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write,
+            [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $acl.psobject.BaseObject))
     }
     try { $stream.Write($Bytes, 0, $Bytes.Length); $stream.Flush() } finally { $stream.Dispose() }
 }
@@ -852,6 +852,428 @@ function Assert-MiosMachineWriteBoundary {
         if (($rule.FileSystemRights -band $write) -and $rule.IdentityReference.Value -notin $trusted) {
             throw 'An existing machine TOML path allows an untrusted account to modify or replace it.'
         }
+    }
+}
+
+function Initialize-MiosMachineBoundaryApi {
+    if (-not ('MiosMachineBoundaryNative' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public sealed class MiosBoundaryInfo {
+    public uint Attributes; public uint Links; public uint Volume; public ulong Index; public long Created; public long Written; public ulong Size;
+}
+public static class MiosMachineBoundaryNative {
+    [StructLayout(LayoutKind.Sequential)] struct FT { public uint Low; public uint High; }
+    [StructLayout(LayoutKind.Sequential)] struct BHFI { public uint Attributes; public FT Created; public FT Accessed; public FT Written;
+        public uint Volume; public uint SizeHigh; public uint SizeLow; public uint Links; public uint IndexHigh; public uint IndexLow; }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandle(SafeFileHandle handle, out BHFI info);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder path, uint length, uint flags);
+    [DllImport("advapi32.dll")]
+    static extern uint GetSecurityInfo(SafeFileHandle handle, int type, uint info, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr descriptor);
+    [DllImport("advapi32.dll")] static extern uint SetSecurityInfo(SafeFileHandle handle, int type, uint info, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr descriptor, uint revision, uint info, out IntPtr text, out uint length);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string text, uint revision, out IntPtr descriptor, out uint length);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetSecurityDescriptorOwner(IntPtr descriptor, out IntPtr owner, out bool defaulted);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetSecurityDescriptorDacl(IntPtr descriptor, out bool present, out IntPtr dacl, out bool defaulted);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetSecurityDescriptorControl(IntPtr descriptor, out ushort control, out uint revision);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+    [StructLayout(LayoutKind.Sequential)] struct LUID { public uint Low; public int High; }
+    [StructLayout(LayoutKind.Sequential)] struct TOKEN_PRIVILEGES { public uint Count; public LUID Luid; public uint Attributes; }
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool LookupPrivilegeValueW(string system, string name, out LUID luid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TOKEN_PRIVILEGES state, uint length, IntPtr previous, IntPtr returnLength);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
+    const uint OwnerInfo = 0x1, DaclInfo = 0x4, ProtectedDacl = 0x80000000, UnprotectedDacl = 0x20000000;
+    // Restoring another account as owner needs SeRestorePrivilege; an elevated token holds it disabled.
+    public static void EnablePrivilege(string name) {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x20u | 0x8u, out token)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        try {
+            LUID luid;
+            if (!LookupPrivilegeValueW(null, name, out luid)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            TOKEN_PRIVILEGES state = new TOKEN_PRIVILEGES(); state.Count = 1; state.Luid = luid; state.Attributes = 0x2;
+            if (!AdjustTokenPrivileges(token, false, ref state, 0u, IntPtr.Zero, IntPtr.Zero)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            int error = Marshal.GetLastWin32Error();
+            if (error == 1300) { throw new Win32Exception(error, name + " is not held by this token."); }
+        } finally { CloseHandle(token); }
+    }
+    // DACL only: unprotected makes Windows recompute this object's inherited ACEs from its parent.
+    public static void SetDacl(SafeFileHandle handle, string sddl, bool isProtected) {
+        IntPtr descriptor; uint length;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1u, out descriptor, out length)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        try {
+            IntPtr dacl; bool present, defaulted;
+            if (!GetSecurityDescriptorDacl(descriptor, out present, out dacl, out defaulted) || !present || dacl == IntPtr.Zero) {
+                throw new InvalidOperationException("The descriptor has no DACL.");
+            }
+            uint result = SetSecurityInfo(handle, 1, DaclInfo | (isProtected ? ProtectedDacl : UnprotectedDacl), IntPtr.Zero, IntPtr.Zero, dacl, IntPtr.Zero);
+            if (result != 0) { throw new Win32Exception((int)result); }
+        } finally { LocalFree(descriptor); }
+    }
+    // READ_CONTROL | FILE_READ_ATTRIBUTES (+ FILE_READ_DATA | WRITE_DAC | WRITE_OWNER); OPEN_EXISTING; BACKUP_SEMANTICS | OPEN_REPARSE_POINT.
+    // A write handle shares read only, so no one else may write or delete the object while it is held. Windows enforces
+    // share modes only for handles with data access, so the write handle carries FILE_READ_DATA (FILE_LIST_DIRECTORY).
+    public static SafeFileHandle Open(string path, bool write) {
+        uint access = 0x20000u | 0x80u | (write ? (0x1u | 0x40000u | 0x80000u) : 0u);
+        SafeFileHandle handle = CreateFileW(path, access, write ? 1u : 7u, IntPtr.Zero, 3u, 0x02000000u | 0x00200000u, IntPtr.Zero);
+        if (handle.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot open " + path); }
+        return handle;
+    }
+    // An ancestor pin (FILE_LIST_DIRECTORY, so its share mode is enforced) shares read and write but not delete,
+    // so the directory cannot be renamed or removed while held.
+    public static SafeFileHandle Pin(string path) {
+        SafeFileHandle handle = CreateFileW(path, 0x1u | 0x20000u | 0x80u, 3u, IntPtr.Zero, 3u, 0x02000000u | 0x00200000u, IntPtr.Zero);
+        if (handle.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot pin " + path); }
+        return handle;
+    }
+    public static MiosBoundaryInfo Info(SafeFileHandle handle) {
+        BHFI raw;
+        if (!GetFileInformationByHandle(handle, out raw)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        MiosBoundaryInfo info = new MiosBoundaryInfo();
+        info.Attributes = raw.Attributes; info.Links = raw.Links; info.Volume = raw.Volume;
+        info.Index = ((ulong)raw.IndexHigh << 32) | raw.IndexLow; info.Size = ((ulong)raw.SizeHigh << 32) | raw.SizeLow;
+        info.Created = (long)(((ulong)raw.Created.High << 32) | raw.Created.Low);
+        info.Written = (long)(((ulong)raw.Written.High << 32) | raw.Written.Low);
+        return info;
+    }
+    public static string FinalPath(SafeFileHandle handle) {
+        StringBuilder buffer = new StringBuilder(4096);
+        uint length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0u);
+        if (length == 0 || length >= buffer.Capacity) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        string path = buffer.ToString();
+        if (path.StartsWith(@"\\?\UNC\", StringComparison.Ordinal)) { return @"\\" + path.Substring(8); }
+        if (path.StartsWith(@"\\?\", StringComparison.Ordinal)) { return path.Substring(4); }
+        return path;
+    }
+    public static string GetSddl(SafeFileHandle handle) {
+        IntPtr owner, group, dacl, sacl, descriptor;
+        uint result = GetSecurityInfo(handle, 1, OwnerInfo | DaclInfo, out owner, out group, out dacl, out sacl, out descriptor);
+        if (result != 0) { throw new Win32Exception((int)result); }
+        try {
+            IntPtr text; uint length;
+            if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1u, OwnerInfo | DaclInfo, out text, out length)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            try { return Marshal.PtrToStringUni(text); } finally { LocalFree(text); }
+        } finally { LocalFree(descriptor); }
+    }
+    public static void SetSddl(SafeFileHandle handle, string sddl) {
+        IntPtr descriptor; uint length;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1u, out descriptor, out length)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        try {
+            IntPtr owner, dacl; bool defaulted, present; ushort control; uint revision;
+            if (!GetSecurityDescriptorOwner(descriptor, out owner, out defaulted) || owner == IntPtr.Zero) { throw new InvalidOperationException("The descriptor has no owner."); }
+            if (!GetSecurityDescriptorDacl(descriptor, out present, out dacl, out defaulted) || !present || dacl == IntPtr.Zero) {
+                throw new InvalidOperationException("The descriptor has no DACL.");
+            }
+            if (!GetSecurityDescriptorControl(descriptor, out control, out revision)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            uint info = OwnerInfo | DaclInfo | ((control & 0x1000) != 0 ? ProtectedDacl : UnprotectedDacl);
+            uint result = SetSecurityInfo(handle, 1, info, owner, IntPtr.Zero, dacl, IntPtr.Zero);
+            if (result != 0) { throw new Win32Exception((int)result); }
+        } finally { LocalFree(descriptor); }
+    }
+}
+'@ -ErrorAction Stop
+    }
+}
+
+function Get-MiosMachineBoundaryGap {
+    param([Parameter(Mandatory)][string]$Path)
+    try { Assert-MiosMachineWriteBoundary $Path; return '' } catch { return $_.Exception.Message }
+}
+
+function Read-MiosBoundaryObject {
+    # One object read by handle. Strict mode refuses reparse points, other final paths and hard-linked files; -Lenient only records them.
+    param([Parameter(Mandatory)][string]$Path, [switch]$WithBytes, [switch]$Lenient)
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $handle = [MiosMachineBoundaryNative]::Open($full, $false)
+    try {
+        $info = [MiosMachineBoundaryNative]::Info($handle)
+        $isReparse = [bool]($info.Attributes -band 0x400)
+        $isDirectory = [bool]($info.Attributes -band 0x10)
+        if (-not $Lenient) {
+            if ($isReparse) { throw "Boundary recovery refuses a reparse point: $full" }
+            $final = [MiosMachineBoundaryNative]::FinalPath($handle).TrimEnd('\')
+            if ($final -ine $full) { throw "Boundary recovery refuses a path that resolves elsewhere: $full" }
+            if (-not $isDirectory -and $info.Links -ne 1) { throw "Boundary recovery refuses a hard-linked file: $full" }
+        }
+        $sddl = [MiosMachineBoundaryNative]::GetSddl($handle)
+    } finally { $handle.Dispose() }
+    $sha = ''; $bytes = $null
+    if (-not $isDirectory -and -not $isReparse) {
+        $content = [IO.File]::ReadAllBytes($full)
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        try { $sha = [BitConverter]::ToString($hasher.ComputeHash($content)).Replace('-', '').ToLowerInvariant() } finally { $hasher.Dispose() }
+        if ($WithBytes) { $bytes = [Convert]::ToBase64String($content) }
+    }
+    $record = [ordered]@{
+        Path = $full; Kind = $(if ($isDirectory) { 'directory' } else { 'file' })
+        Owner = (New-Object Security.AccessControl.RawSecurityDescriptor $sddl).Owner.Value; Sddl = $sddl
+        Attributes = [string]$info.Attributes; Links = [string]$info.Links; Volume = [string]$info.Volume; Index = ('{0:x16}' -f $info.Index)
+        Created = [string]$info.Created; Written = [string]$info.Written; Size = [string]$info.Size; Sha256 = $sha
+    }
+    if ($WithBytes) { $record.Bytes = $bytes }
+    return [pscustomobject]$record
+}
+
+function Get-MiosBoundaryDescendants {
+    # Bounded, breadth-first, parents before children; a reparse point anywhere below is refused.
+    param([Parameter(Mandatory)][string]$Path, [int]$Limit = 512)
+    $found = New-Object System.Collections.Generic.List[string]
+    $queue = New-Object System.Collections.Generic.Queue[string]
+    $queue.Enqueue([IO.Path]::GetFullPath($Path))
+    while ($queue.Count) {
+        foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($queue.Dequeue())) {
+            if ($found.Count -ge $Limit) { throw "Boundary recovery refuses more than $Limit descendants below $Path" }
+            $attributes = [IO.File]::GetAttributes($entry)
+            if ($attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Boundary recovery refuses a reparse point below ${Path}: $entry" }
+            $found.Add($entry)
+            if ($attributes -band [IO.FileAttributes]::Directory) { $queue.Enqueue($entry) }
+        }
+    }
+    return $found.ToArray()
+}
+
+function Get-MiosExplicitAces {
+    param([Parameter(Mandatory)][string]$Sddl)
+    $acl = (New-Object Security.AccessControl.RawSecurityDescriptor $Sddl).DiscretionaryAcl
+    return @(@($acl) | Where-Object { -not ([int]$_.AceFlags -band 0x10) } |   # 0x10 INHERITED_ACE
+        ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.AceType, $_.AceFlags, $_.AccessMask, $_.SecurityIdentifier.Value })
+}
+
+function Test-MiosSameExplicitAces {
+    param([Parameter(Mandatory)][string]$Before, [Parameter(Mandatory)][string]$After)
+    return [bool](((Get-MiosExplicitAces $Before) -join ';') -ceq ((Get-MiosExplicitAces $After) -join ';'))
+}
+
+function Get-MiosInheritedWriteGrants {
+    # Inherited allow ACEs that still give a non-trusted account write, delete or ownership rights on this object.
+    param([Parameter(Mandatory)][string]$Sddl)
+    $raw = New-Object Security.AccessControl.RawSecurityDescriptor $Sddl
+    if ([int]$raw.ControlFlags -band 0x1000) { return @() }
+    $write = 0x116 -bor 0x10000 -bor 0x40 -bor 0x40000 -bor 0x80000 -bor 0x40000000 -bor 0x10000000
+    return @(@($raw.DiscretionaryAcl) | Where-Object { ([int]$_.AceFlags -band 0x10) -and -not ([int]$_.AceFlags -band 0x08) -and
+        [string]$_.AceQualifier -eq 'AccessAllowed' -and ($_.AccessMask -band $write) -and $_.SecurityIdentifier.Value -notin @('S-1-5-18', 'S-1-5-32-544') } |
+        ForEach-Object { $_.SecurityIdentifier.Value })
+}
+
+function Get-MiosBoundaryOwnerAction {
+    # The owner after recovery: SYSTEM and Administrators stay; only the validated operator is replaced; anyone else is refused.
+    param([Parameter(Mandatory)][string]$Owner, [Parameter(Mandatory)][string]$OriginSid, [Parameter(Mandatory)][string]$Path)
+    if ($Owner -in @('S-1-5-18', 'S-1-5-32-544')) { return $Owner }
+    if ($Owner -eq $OriginSid) { return 'S-1-5-32-544' }
+    throw "Boundary recovery refuses $Path owned by ${Owner}: only SYSTEM, Administrators or the validated operator can be recovered"
+}
+
+function Assert-MiosBoundaryAcePolicy {
+    # Only plain allow ACEs are reviewed policy; a deny, object, callback or NULL DACL stops recovery unchanged.
+    param([Parameter(Mandatory)][string]$Sddl, [Parameter(Mandatory)][string]$Path)
+    $raw = New-Object Security.AccessControl.RawSecurityDescriptor $Sddl
+    if ($null -eq $raw.DiscretionaryAcl) { throw "Boundary recovery refuses $Path with a NULL DACL" }
+    foreach ($ace in @($raw.DiscretionaryAcl)) {
+        if ($ace -isnot [Security.AccessControl.CommonAce] -or [string]$ace.AceQualifier -ne 'AccessAllowed' -or $ace.IsCallback) {
+            throw "Boundary recovery refuses $Path with an unreviewed ACE ($($ace.AceType))"
+        }
+    }
+}
+
+function New-MiosSharedPrefixSddl {
+    # Shared FHS prefix: trusted access on the directory itself only; every inheritable ACE it passes to children stays, as InheritOnly.
+    param([Parameter(Mandatory)][string]$Sddl, [Parameter(Mandatory)][string]$Owner)
+    $current = New-Object Security.AccessControl.RawSecurityDescriptor $Sddl
+    $acl = New-Object Security.AccessControl.RawAcl -ArgumentList ([byte]2), 0
+    foreach ($self in @(@('S-1-5-18', 0x1F01FF), @('S-1-5-32-544', 0x1F01FF), @('S-1-5-32-545', 0x1200A9))) {
+        $sid = New-Object Security.Principal.SecurityIdentifier $self[0]
+        $acl.InsertAce($acl.Count, (New-Object Security.AccessControl.CommonAce -ArgumentList ([Security.AccessControl.AceFlags]::None),
+            ([Security.AccessControl.AceQualifier]::AccessAllowed), ([int]$self[1]), $sid, $false, $null))
+    }
+    foreach ($ace in @($current.DiscretionaryAcl)) {
+        $flags = [int]$ace.AceFlags
+        if (-not ($flags -band 0x03)) { continue }   # OBJECT_INHERIT | CONTAINER_INHERIT
+        $template = $ace.Copy()
+        $template.AceFlags = [Security.AccessControl.AceFlags](($flags -bor 0x08) -band (-bnot 0x10))   # + INHERIT_ONLY, - INHERITED
+        $acl.InsertAce($acl.Count, $template)
+    }
+    $control = [Security.AccessControl.ControlFlags]'DiscretionaryAclPresent, DiscretionaryAclProtected, SelfRelative'
+    $result = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList $control, (New-Object Security.Principal.SecurityIdentifier $Owner), $null, $null, $acl
+    return $result.GetSddlForm([Security.AccessControl.AccessControlSections]'Owner, Access')
+}
+
+function New-MiosLeafSddl {
+    # MiOS-namespaced leaf: exactly the descriptor fresh creation uses, with the owner the recovery policy decided.
+    param([Parameter(Mandatory)][bool]$Directory, [Parameter(Mandatory)][string]$Owner)
+    $raw = New-Object Security.AccessControl.RawSecurityDescriptor ((New-MiosMachineCreationAcl -Directory:$Directory).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]'Owner, Access'))
+    $raw.Owner = New-Object Security.Principal.SecurityIdentifier $Owner
+    return $raw.GetSddlForm([Security.AccessControl.AccessControlSections]'Owner, Access')
+}
+
+function Open-MiosBoundaryAncestors {
+    # Pins every ancestor against rename or delete for one repair; handles opened earlier by other processes are not revoked.
+    param([Parameter(Mandatory)][string]$Path)
+    $chain = New-Object System.Collections.Generic.List[string]
+    $dir = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    while ($dir) {
+        $chain.Insert(0, $dir)
+        $up = Split-Path -Parent $dir
+        if (-not $up -or $up -eq $dir) { break }
+        $dir = $up
+    }
+    $pins = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($p in $chain) {
+            $handle = [MiosMachineBoundaryNative]::Pin($p)
+            $info = [MiosMachineBoundaryNative]::Info($handle)
+            $pins.Add([pscustomobject]@{ Path = $p; Handle = $handle; Volume = [string]$info.Volume; Index = ('{0:x16}' -f $info.Index) })
+            if (-not ($info.Attributes -band 0x10) -or ($info.Attributes -band 0x400) -or
+                [MiosMachineBoundaryNative]::FinalPath($handle).TrimEnd('\') -ine $p.TrimEnd('\')) { throw "Boundary recovery refuses an unstable ancestor: $p" }
+        }
+    } catch { foreach ($pin in $pins) { $pin.Handle.Dispose() }; throw }
+    return $pins.ToArray()
+}
+
+function Update-MiosBoundaryInheritance {
+    # Recompute one descendant's inherited ACEs from its repaired parent, by handle; its owner and explicit ACEs stay.
+    param([Parameter(Mandatory)]$Object, [Parameter(Mandatory)][string]$Backup)
+    $handle = [MiosMachineBoundaryNative]::Open([string]$Object.Path, $true)
+    try {
+        $now = [MiosMachineBoundaryNative]::Info($handle)
+        if ([string]$now.Volume -ne [string]$Object.Volume -or ('{0:x16}' -f $now.Index) -ne [string]$Object.Index -or ($now.Attributes -band 0x400) -or
+            (-not ($now.Attributes -band 0x10) -and $now.Links -ne 1) -or [MiosMachineBoundaryNative]::FinalPath($handle).TrimEnd('\') -ine [string]$Object.Path) {
+            throw "Boundary recovery descendant changed before its inheritance update: $($Object.Path); backup $Backup"
+        }
+        $raw = New-Object Security.AccessControl.RawSecurityDescriptor ([MiosMachineBoundaryNative]::GetSddl($handle))
+        if ([int]$raw.ControlFlags -band 0x1000) { return }   # SE_DACL_PROTECTED: inherits nothing
+        $explicit = New-Object Security.AccessControl.RawAcl -ArgumentList ([byte]2), 0
+        foreach ($ace in @($raw.DiscretionaryAcl)) { if (-not ([int]$ace.AceFlags -band 0x10)) { $explicit.InsertAce($explicit.Count, $ace.Copy()) } }
+        $only = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList ([Security.AccessControl.ControlFlags]'DiscretionaryAclPresent, SelfRelative'), $null, $null, $null, $explicit
+        [MiosMachineBoundaryNative]::SetDacl($handle, $only.GetSddlForm([Security.AccessControl.AccessControlSections]::Access), $false)
+    } finally { $handle.Dispose() }
+}
+
+function Save-MiosBoundaryBackup {
+    # One new private file per recovery run (CreateNew, SYSTEM/Administrators only), never overwriting an earlier backup.
+    param([Parameter(Mandatory)][object[]]$Objects, [object[]]$Tomls = @(), [Parameter(Mandatory)][string]$Reason, [string]$Directory)
+    if (-not $Directory) { $Directory = Join-Path $env:ProgramData 'MiOS\boundary-recovery' }
+    foreach ($level in @((Split-Path -Parent $Directory), $Directory)) {
+        if (Test-Path -LiteralPath $level) { Assert-MiosMachineWriteBoundary $level } else { New-MiosProtectedMachineDirectory $level }
+    }
+    $file = Join-Path $Directory ((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ') + '-' + [guid]::NewGuid().ToString('N') + '.json')
+    $document = [ordered]@{ schema = 'mios-boundary-recovery/2'; created = (Get-Date).ToUniversalTime().ToString('o'); reason = $Reason
+        objects = @($Objects); tomls = @($Tomls) }
+    Write-MiosPrivateMachineFile -Path $file -Bytes ((New-Object Text.UTF8Encoding($false)).GetBytes(($document | ConvertTo-Json -Depth 4 -Compress)))
+    return $file
+}
+
+function Invoke-MiosMachineBoundaryRecovery {
+    # Explicit recovery of the existing MiOS boundary on the system drive only, after origin validation and before any TOML write.
+    # Admission (Assert-MiosMachineWriteBoundary) is unchanged and decides afterwards; nothing changes when every path already passes.
+    param([Parameter(Mandatory)][string]$OriginSid, [string]$Root, [string]$BackupDirectory)
+    if (-not $Root) { $Root = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' } }
+    $Root = [IO.Path]::GetFullPath($Root.TrimEnd('\') + '\')
+    if ($OriginSid -notmatch '^S-1-[0-9]+(-[0-9]+)+$') { throw 'Boundary recovery needs the validated origin SID.' }
+    $plan = New-Object System.Collections.Generic.List[object]
+    foreach ($item in @(@('usr', 'shared'), @('usr\share', 'shared'), @('usr\share\mios', 'leaf'), @('usr\share\mios\mios.toml', 'leaf'),
+                        @('etc', 'shared'), @('etc\mios', 'leaf'))) {
+        $path = (Join-Path $Root $item[0]).TrimEnd('\')
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        Assert-MiosNoReparsePath $path
+        $gap = Get-MiosMachineBoundaryGap $path
+        if ($gap) { $plan.Add([pscustomobject]@{ Path = $path; Policy = $item[1]; Gap = $gap }) }
+    }
+    if (-not $plan.Count) { return $null }
+    if (-not (Test-MiosElevated)) { throw "Boundary recovery requires an elevated token ($($plan[0].Path): $($plan[0].Gap))" }
+    Initialize-MiosMachineBoundaryApi
+    $planned = @($plan | ForEach-Object { $_.Path })
+    $objects = New-Object System.Collections.Generic.List[object]
+    foreach ($step in $plan) {
+        $record = Read-MiosBoundaryObject $step.Path
+        Assert-MiosBoundaryAcePolicy -Sddl $record.Sddl -Path $step.Path
+        $children = @(); $siblings = @()
+        if ($step.Policy -eq 'leaf' -and $record.Kind -eq 'directory') { $children = @(Get-MiosBoundaryDescendants $step.Path | ForEach-Object { Read-MiosBoundaryObject $_ }) }
+        if ($step.Policy -eq 'shared') {
+            $siblings = @([IO.Directory]::EnumerateFileSystemEntries($step.Path) | Where-Object { $_ -notin $planned } | ForEach-Object { Read-MiosBoundaryObject $_ -Lenient })
+        }
+        $step | Add-Member -NotePropertyName Owner -NotePropertyValue (Get-MiosBoundaryOwnerAction -Owner $record.Owner -OriginSid $OriginSid -Path $step.Path)
+        $step | Add-Member -NotePropertyName Record -NotePropertyValue $record
+        $step | Add-Member -NotePropertyName Children -NotePropertyValue $children
+        $step | Add-Member -NotePropertyName Siblings -NotePropertyValue $siblings
+        foreach ($o in @($record) + $children) { if (-not @($objects | Where-Object { $_.Path -eq $o.Path }).Count) { $objects.Add($o) } }
+    }
+    $tomls = @(@('usr\share\mios\mios.toml', 'etc\mios\mios.toml') | ForEach-Object { Join-Path $Root $_ } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | ForEach-Object { Read-MiosBoundaryObject $_ -WithBytes })
+    $backup = Save-MiosBoundaryBackup -Objects $objects.ToArray() -Tomls $tomls -Directory $BackupDirectory `
+        -Reason (($plan | ForEach-Object { "$($_.Path) [$($_.Policy)]: $($_.Gap)" }) -join '; ')
+    foreach ($step in $plan) {
+        $pins = @(Open-MiosBoundaryAncestors $step.Path)
+        try {
+            $handle = [MiosMachineBoundaryNative]::Open($step.Path, $true)
+            try {
+                $now = [MiosMachineBoundaryNative]::Info($handle)
+                $sddlNow = [MiosMachineBoundaryNative]::GetSddl($handle)
+                if ([string]$now.Volume -ne $step.Record.Volume -or ('{0:x16}' -f $now.Index) -ne $step.Record.Index -or ($now.Attributes -band 0x400) -or
+                    [MiosMachineBoundaryNative]::FinalPath($handle).TrimEnd('\') -ine $step.Path -or
+                    (New-Object Security.AccessControl.RawSecurityDescriptor $sddlNow).Owner.Value -ne $step.Record.Owner -or
+                    -not (Test-MiosSameExplicitAces -Before $step.Record.Sddl -After $sddlNow)) { throw "Boundary recovery target changed after its backup: $($step.Path); backup $backup" }
+                $target = if ($step.Policy -eq 'shared') { New-MiosSharedPrefixSddl -Sddl $sddlNow -Owner $step.Owner }
+                          else { New-MiosLeafSddl -Directory ($step.Record.Kind -eq 'directory') -Owner $step.Owner }
+                [MiosMachineBoundaryNative]::SetSddl($handle, $target)
+            } finally { $handle.Dispose() }
+            foreach ($child in $step.Children) { Update-MiosBoundaryInheritance -Object $child -Backup $backup }
+            foreach ($pin in $pins) {
+                $info = [MiosMachineBoundaryNative]::Info($pin.Handle)
+                if ([string]$info.Volume -ne $pin.Volume -or ('{0:x16}' -f $info.Index) -ne $pin.Index) { throw "Boundary recovery ancestor changed: $($pin.Path); backup $backup" }
+            }
+        } finally { foreach ($pin in $pins) { $pin.Handle.Dispose() } }
+    }
+    $problems = New-Object System.Collections.Generic.List[string]
+    foreach ($step in $plan) {
+        $after = Read-MiosBoundaryObject $step.Path
+        foreach ($field in 'Volume', 'Index', 'Created', 'Written', 'Size', 'Sha256') { if ($after.$field -ne $step.Record.$field) { $problems.Add("$($step.Path) $field changed") } }
+        $gap = Get-MiosMachineBoundaryGap $step.Path
+        if ($gap) { $problems.Add($gap) }
+        foreach ($old in $step.Children) {
+            $new = Read-MiosBoundaryObject $old.Path
+            foreach ($field in 'Volume', 'Index', 'Created', 'Written', 'Size', 'Sha256', 'Owner') { if ($new.$field -ne $old.$field) { $problems.Add("$($old.Path) $field changed") } }
+            if (-not (Test-MiosSameExplicitAces -Before $old.Sddl -After $new.Sddl)) { $problems.Add("$($old.Path) explicit ACEs changed") }
+            foreach ($sid in (Get-MiosInheritedWriteGrants $new.Sddl)) { $problems.Add("$($old.Path) still inherits write access for $sid") }
+        }
+        foreach ($old in $step.Siblings) {
+            $new = Read-MiosBoundaryObject $old.Path -Lenient
+            foreach ($field in 'Sddl', 'Owner', 'Volume', 'Index', 'Written', 'Size', 'Sha256') { if ($new.$field -cne $old.$field) { $problems.Add("sibling $($old.Path) $field changed") } }
+        }
+    }
+    if ($problems.Count) { throw "Boundary recovery could not be verified ($($problems -join '; ')); original descriptors and TOML bytes are in $backup" }
+    Write-Host "  [+] Recovered the MiOS machine boundary ($($plan.Count) path(s)); originals: $backup" -ForegroundColor DarkGray
+    return $backup
+}
+
+function Restore-MiosMachineBoundary {
+    # Rollback: re-applies one backup's recorded descriptors by handle, top-down as recorded. TOML bytes stay in the backup for manual use.
+    param([Parameter(Mandatory)][string]$BackupPath)
+    if (-not (Test-MiosElevated)) { throw 'Boundary restore requires an elevated token.' }
+    Initialize-MiosMachineBoundaryApi
+    [MiosMachineBoundaryNative]::EnablePrivilege('SeRestorePrivilege')
+    $document = [IO.File]::ReadAllText($BackupPath) | ConvertFrom-Json
+    if ($document.schema -cne 'mios-boundary-recovery/2') { throw "Not a MiOS boundary backup: $BackupPath" }
+    foreach ($object in @($document.objects)) {
+        $handle = [MiosMachineBoundaryNative]::Open([string]$object.Path, $true)
+        try {
+            $now = [MiosMachineBoundaryNative]::Info($handle)
+            if ([string]$now.Volume -ne [string]$object.Volume -or ('{0:x16}' -f $now.Index) -ne [string]$object.Index -or ($now.Attributes -band 0x400) -or
+                [MiosMachineBoundaryNative]::FinalPath($handle).TrimEnd('\') -ine [string]$object.Path) { throw "Boundary restore target is not the recorded object: $($object.Path)" }
+            [MiosMachineBoundaryNative]::SetSddl($handle, [string]$object.Sddl)
+        } finally { $handle.Dispose() }
     }
 }
 
@@ -1736,6 +2158,10 @@ function Get-MiosMachineWorkerScript {
         'Set-MiosHostTierAcl', 'Initialize-MiosHostTierDirectory', 'Write-MiosHostToml', 'Repair-MiosHostTierCredentials',
         'Assert-MiosMachineWriteBoundary', 'Initialize-MiosVendorTierDirectory', 'Write-MiosVendorToml',
         'New-MiosMachineCreationAcl', 'New-MiosProtectedMachineDirectory', 'Write-MiosPrivateMachineFile',
+        'Initialize-MiosMachineBoundaryApi', 'Get-MiosMachineBoundaryGap', 'Read-MiosBoundaryObject', 'Get-MiosBoundaryDescendants',
+        'Get-MiosExplicitAces', 'Test-MiosSameExplicitAces', 'Get-MiosInheritedWriteGrants', 'Get-MiosBoundaryOwnerAction',
+        'Assert-MiosBoundaryAcePolicy', 'New-MiosSharedPrefixSddl', 'New-MiosLeafSddl', 'Open-MiosBoundaryAncestors',
+        'Update-MiosBoundaryInheritance', 'Save-MiosBoundaryBackup', 'Invoke-MiosMachineBoundaryRecovery',
         'Write-Info', 'Write-Good', 'Write-Err', 'Initialize-DataDisk',
         'Test-MiosElevated', 'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Enable-MiOSWindowsFeatures',
         'Get-MiosTomlTableArray', 'ConvertTo-MiosWindowsPath', 'Test-MiosDefenderExclusionRefused', 'Get-MiosDefenderExclusionPlan',
@@ -5204,6 +5630,8 @@ function Invoke-MiosMachinePreparationCore {
     if (-not (Test-MiosElevated)) { throw 'Machine preparation requires an elevated token.' }
     Assert-MiosOriginContext $Context
     $script:MiosMachineOrigin = $Context
+    # Explicit, backed-up boundary recovery on the system drive, only after the origin is validated and before any TOML write.
+    $null = Invoke-MiosMachineBoundaryRecovery -OriginSid ([string]$Context.Sid)
     Publish-MiosMachineToml -Context $Context
     Initialize-MiosMachineStorage -Context $Context
     Add-MiosDefenderExclusions

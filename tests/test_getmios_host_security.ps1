@@ -64,7 +64,8 @@ function Import-MiosFunctions([string]$Path) {
         'Get-MiosDefenderExclusionPlan', 'Add-MiosDefenderExclusions', 'Set-MiosWslFirewallPolicy', 'Set-MiosPrivateUserTomlAcl',
         'Import-MiosUserToml', 'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder', 'Get-MiosUserTomlReceiverScript', 'Get-MiosWslConfigText',
         'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Enable-MiOSWindowsFeatures', 'Test-MiosWslVmCreator', 'Register-MiosWslVmCreator',
-        'Invoke-MiosPlatformGate', 'Get-MiosElevationContextError')
+        'Invoke-MiosPlatformGate', 'Get-MiosElevationContextError', 'Assert-MiosMachineWriteBoundary', 'New-MiosMachineCreationAcl',
+        'New-MiosProtectedMachineDirectory')
     $defs = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) |
         Where-Object { $want -contains $_.Name })
     foreach ($name in $want) { if (@($defs | Where-Object Name -eq $name).Count -ne 1) { throw "Missing/duplicate canonical function $name" } }
@@ -152,6 +153,19 @@ function Install-ApiMocks {
         if ($Path -like '*.tmp' -and $Private -and (Test-Path -LiteralPath $Path)) {
             if ((Get-Item -LiteralPath $Path -Force).Length -ne 0) { throw 'Fixture: private ACL was set after bytes were written' }
         }
+    }
+    # Host-tier directories: strict admission when present, atomic protected creation when absent (real helpers run under -WindowsAcl).
+    $script:boundaryCalls = New-Object System.Collections.Generic.List[string]
+    $script:failAdmission = $false
+    function global:Assert-MiosMachineWriteBoundary {
+        param([string]$Path)
+        $script:boundaryCalls.Add('admit|' + [IO.Path]::GetFullPath($Path))
+        if ($script:failAdmission) { throw 'Fixture: an existing machine TOML path allows an untrusted account to modify or replace it.' }
+    }
+    function global:New-MiosProtectedMachineDirectory {
+        param([string]$Path)
+        $script:boundaryCalls.Add('create|' + [IO.Path]::GetFullPath($Path))
+        New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null
     }
     function global:Resolve-MiosTomlText { return $script:fixtureUser }
     function global:Resolve-MiosVendorTomlText { return $script:fixtureVendor }
@@ -318,8 +332,21 @@ function Invoke-Checks([string]$Path, [switch]$SkipReceiverProtocol) {
     Expect-Throw { ConvertTo-MiosCredentialFreeToml ('[identity.default_password]' + "`n" + 'value = "FIXTURE-SECRET-TABLE"') } 'credential namespaces represented as tables fail closed'
     Expect-Throw { ConvertTo-MiosCredentialFreeToml ('[identity]' + "`n" + 'default_password = "unterminated') } 'unterminated strings fail closed'
     $hostTier = Join-Path (Join-Path (Join-Path $scratch 'etc') 'mios') 'mios.toml'
+    $hostDirs = @([IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $hostTier))), [IO.Path]::GetFullPath((Split-Path -Parent $hostTier)))
+    $expectedFirst = @($hostDirs | ForEach-Object { $(if (Test-Path -LiteralPath $_) { 'admit|' } else { 'create|' }) + $_ })
+    $script:boundaryCalls.Clear(); $script:aclCalls.Clear()
     Write-MiosHostToml -Path $hostTier -Text $fixture
     Check ([IO.File]::ReadAllText($hostTier) -notmatch 'FIXTURE-SECRET') 'host writer publishes only the projection'
+    Check (($script:boundaryCalls -join ';') -ceq ($expectedFirst -join ';')) 'absent host-tier directories are created atomically protected and present ones admitted'
+    Check (@($script:aclCalls | Where-Object { [IO.Path]::GetFullPath($_.Split('|')[0]) -in $hostDirs }).Count -eq 0) 'host-tier directories are never rewritten in place'
+    $script:boundaryCalls.Clear()
+    Write-MiosHostToml -Path $hostTier -Text $fixture
+    Check (($script:boundaryCalls -join ';') -ceq (($hostDirs | ForEach-Object { 'admit|' + $_ }) -join ';')) 'an existing host tier is admitted at both levels and never recreated'
+    $published = [IO.File]::ReadAllText($hostTier)
+    $script:failAdmission = $true
+    Expect-Throw { Write-MiosHostToml -Path $hostTier -Text ($fixture + "`n[fixture_refused]`nvalue = 1`n") } 'a refused host-tier directory stops the writer'
+    $script:failAdmission = $false
+    Check ([IO.File]::ReadAllText($hostTier) -ceq $published) 'a refused host-tier directory leaves the published file unchanged'
     [IO.File]::WriteAllText($hostTier, $unsupported)
     $script:aclCalls.Clear()
     Expect-Throw { Repair-MiosHostTierCredentials -Paths @($hostTier) } 'an unsupported legacy raw host file aborts repair'

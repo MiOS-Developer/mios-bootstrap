@@ -83,6 +83,9 @@ function Run-Checks([string]$Text) {
         Microsoft.PowerShell.Management\Get-Item @PSBoundParameters
     }
     function global:Set-MiosHostTierAcl { param($Path, [switch]$Private) }
+    # Host-tier directories are admitted when present and created atomically protected when absent; source-only fixtures record both.
+    function global:Assert-MiosMachineWriteBoundary { param($Path) }
+    function global:New-MiosProtectedMachineDirectory { param($Path) New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null }
     $origin = [pscustomobject]@{ Sid = $script:opSid; Profile = $operator; LocalAppData = $script:registeredLocal
         ConfigPath = $opPath; ProcessId = 4242; SessionId = 17 }
     $vendor = "[meta]`nname = 'fixture'`n[identity]`nusername = 'vendor'`n[packages.windows]`npkgs = []`n"
@@ -163,6 +166,8 @@ function Run-Checks([string]$Text) {
     # Execute the actual machine orchestration under ready/pending/error. Redirector calls are tripwires.
     Import-Functions $ast @('Invoke-MiosMachinePreparationCore')
     function global:Test-MiosElevated { return $true }
+    $script:recoverySids = New-Object System.Collections.Generic.List[string]
+    function global:Invoke-MiosMachineBoundaryRecovery { param($OriginSid, $Root, $BackupDirectory) $script:recoverySids.Add([string]$OriginSid); return $null }
     function global:Publish-MiosMachineToml { param($Context) }
     function global:Initialize-MiosMachineStorage { param($Context) }
     function global:Add-MiosDefenderExclusions {}
@@ -184,6 +189,7 @@ function Run-Checks([string]$Text) {
         Check ($script:legacyRedirectCalls -eq 0) ('actual ' + $mode + ' machine dispatch performs zero profile or shared package redirects')
         Check (($mode -eq 'error' -and $failed) -or ($mode -ne 'error' -and -not $failed -and $result.Status -eq $mode)) ('actual machine orchestration preserves ' + $mode + ' readiness')
     }
+    Check ($script:recoverySids.Count -eq 3 -and @($script:recoverySids | Where-Object { $_ -ne $origin.Sid }).Count -eq 0) 'actual machine orchestration runs boundary recovery once per dispatch with the validated operator SID'
     $defaultResolution = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.IfStatementAst] -and
         $n.Clauses[0].Item1.Extent.Text -eq '[string]::IsNullOrWhiteSpace($RepoDir)' }, $true))
     foreach ($elevated in @($false, $true)) {

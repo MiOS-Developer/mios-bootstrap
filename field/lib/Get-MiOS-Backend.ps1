@@ -4786,9 +4786,9 @@ function mios-mini {
 }
 
 function mios-mon {
-    $py = if (Test-Path "$env:LOCALAPPDATA\Programs\Python\Python314\python.exe") { "$env:LOCALAPPDATA\Programs\Python\Python314\python.exe" } else { "python.exe" }
-    $mon = if (Test-Path "C:\MiOS\usr\libexec\mios\mios-mon.py") { "C:\MiOS\usr\libexec\mios\mios-mon.py" } else { "M:\usr\libexec\mios\mios-mon.py" }
-    & $py $mon @Args
+    `$py = if (Test-Path "`$env:LOCALAPPDATA\Programs\Python\Python314\python.exe") { "`$env:LOCALAPPDATA\Programs\Python\Python314\python.exe" } else { "python.exe" }
+    `$mon = if (Test-Path "C:\MiOS\usr\libexec\mios\mios-mon.py") { "C:\MiOS\usr\libexec\mios\mios-mon.py" } else { "M:\usr\libexec\mios\mios-mon.py" }
+    & `$py `$mon @Args
 }
 
 function mios-monitor {
@@ -4796,10 +4796,10 @@ function mios-monitor {
 }
 
 function mios-dash {
-    $py = if (Test-Path "$env:LOCALAPPDATA\Programs\Python\Python314\python.exe") { "$env:LOCALAPPDATA\Programs\Python\Python314\python.exe" } else { "python.exe" }
-    $mon = if (Test-Path "C:\MiOS\usr\libexec\mios\mios-mon.py") { "C:\MiOS\usr\libexec\mios\mios-mon.py" } else { "M:\usr\libexec\mios\mios-mon.py" }
-    & $py $mon --dash @Args
-}
+    [CmdletBinding()]
+    param([switch]`$Live, [Parameter(ValueFromRemainingArguments)]`$Args)
+    # Preserve the full snapshot by default; the live dashboard uses the shared monitor launcher.
+    if (`$Live) { mios-mon --dash @Args; return }
     # FULL MiOS dashboard -- ASCII banner + fastfetch (full width,
     # no compact frame trim) + MiOS-DEV service status + extended
     # sys specs. "the invoked 'mios dash'
@@ -4885,7 +4885,7 @@ function mios-help {
     Write-Host '  mios config   open the HTML configurator (mios.toml editor)' -ForegroundColor White
     Write-Host '  mios ai       open Open WebUI (rich LLM interface) in your browser' -ForegroundColor White
     Write-Host '  mios dev      wsl into the MiOS-DEV distro (root /, user mios)' -ForegroundColor White
-    Write-Host '  mios dash     FULL dashboard: ASCII banner + services + extended sys specs' -ForegroundColor White
+    Write-Host '  mios dash     FULL dashboard: banner + services + specs; -Live opens the monitor' -ForegroundColor White
     Write-Host '  mios xbox     Xbox VM Secure Boot / XML repair' -ForegroundColor White
     Write-Host '  mios virt     apply optimized VM config + CPU pinning' -ForegroundColor White
     Write-Host '  mios vfio     configure GPU/USB passthrough (Isolation)' -ForegroundColor White

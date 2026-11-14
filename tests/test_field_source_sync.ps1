@@ -17,10 +17,13 @@ function Check([bool]$Condition, [string]$Name) {
     $script:checks++
     if (-not $Condition) { throw ('ASSERT: ' + $Name) }
 }
-function Read-Ast([string]$Text) {
+function Read-Ast([string]$Text, [string]$Context = 'source fixture') {
     $tokens = $null; $errors = $null
     $ast = [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
-    if ($errors.Count) { throw ('Source parser rejected a fixture: ' + $errors[0].Message) }
+    if ($errors.Count) {
+        $parseError = $errors[0]
+        throw ('Source parser rejected ' + $Context + ' at ' + $parseError.Extent.StartLineNumber + ':' + $parseError.Extent.StartColumnNumber + ' (' + $parseError.ErrorId + '): ' + $parseError.Message)
+    }
     return $ast
 }
 function Definition($Ast, [string]$Name) {
@@ -260,7 +263,24 @@ try {
     $profileHelper = (Definition $profileHelperAst 'Update-MiosWindowsBuildCheckout').Extent.Text
     Check ($profileHelper.Replace("`r`n", "`n") -ceq $canonicalHelper) 'Field embeds the canonical lossless refresh function verbatim'
     $profile = Get-FixtureFieldProfile -FieldAst $fieldAst -WindowsRefreshBlock $windowsRefreshBlock
-    $profileAst = Read-Ast $profile
+    $profileAst = Read-Ast -Text $profile -Context 'rendered Field profile'
+    $monitor = Definition $profileAst 'mios-mon'
+    $assignments = @($monitor.FindAll({ param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -in @('$py', '$mon')
+    }, $true))
+    $launches = @($monitor.FindAll({ param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and $node.CommandElements.Count -eq 3 -and
+        $node.CommandElements[0].Extent.Text -eq '$py' -and $node.CommandElements[1].Extent.Text -eq '$mon' -and
+        $node.CommandElements[2].Extent.Text -eq '@Args'
+    }, $true))
+    Check ($assignments.Count -eq 2 -and $launches.Count -eq 1) 'the generated monitor launcher retains runtime paths and forwards its arguments'
+    $dashboard = Definition $profileAst 'mios-dash'
+    $live = @($dashboard.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Live' })
+    $commands = @($dashboard.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true))
+    Check ($live.Count -eq 1 -and @($commands | Where-Object {
+        $_.GetCommandName() -eq 'mios-mon' -and $_.CommandElements[1].Extent.Text -eq '--dash'
+    }).Count -eq 1 -and @($commands | Where-Object { $_.GetCommandName() -eq 'fastfetch' }).Count -gt 0 -and
+        @($commands | Where-Object { $_.GetCommandName() -eq 'podman' }).Count -gt 0) 'the dashboard preserves its full snapshot and exposes the live monitor explicitly'
     $agentCells = @($profileAst.FindAll({ param($node)
         $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq '_ServiceCell'
     }, $true) | Where-Object {

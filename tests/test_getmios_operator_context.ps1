@@ -174,6 +174,8 @@ function Run-Checks([string]$Text) {
     function global:Add-MiosDefenderExclusions {}
     function global:Register-MiosBootstrapResume { param($Context) $script:pendingSid = $Context.Sid }
     function global:Unregister-ScheduledTask { param($TaskName, $Confirm, $ErrorAction) }
+    $script:podmanClientCalls = New-Object System.Collections.Generic.List[string]
+    function global:Install-MiosPodmanClient { param($DownloadDirectory) $script:podmanClientCalls.Add($script:platformMode); return 'current' }
     function global:Set-ItemProperty { param($Path, $Name, $Value, $Type, [switch]$Force, $ErrorAction) }
     function global:Set-Acl { throw 'Unexpected ACL mutation in source-only machine orchestration.' }
     $script:legacyRedirectCalls = 0
@@ -191,6 +193,7 @@ function Run-Checks([string]$Text) {
         Check (($mode -eq 'error' -and $failed) -or ($mode -ne 'error' -and -not $failed -and $result.Status -eq $mode)) ('actual machine orchestration preserves ' + $mode + ' readiness')
     }
     Check ($script:recoverySids.Count -eq 3 -and @($script:recoverySids | Where-Object { $_ -ne $origin.Sid }).Count -eq 0) 'actual machine orchestration runs boundary recovery once per dispatch with the validated operator SID'
+    Check ((@($script:podmanClientCalls) -join ',') -ceq 'ready') 'the Podman client step runs only once the platform is ready, never on a pending or failed gate'
     $defaultResolution = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.IfStatementAst] -and
         $n.Clauses[0].Item1.Extent.Text -eq '[string]::IsNullOrWhiteSpace($RepoDir)' }, $true))
     foreach ($elevated in @($false, $true)) {

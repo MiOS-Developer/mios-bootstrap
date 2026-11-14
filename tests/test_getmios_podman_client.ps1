@@ -1,0 +1,274 @@
+# Podman client fixtures: AST-extracted functions from Get-MiOS.ps1 and build-mios.ps1, a fake podman (scratch .cmd), and
+# mocked download, signature and msiexec. Nothing is downloaded, signed-checked against a real file, or installed.
+# Default runs the fixtures; -PlantDefect plants each guarded defect into a copy of the product and requires a red result.
+[CmdletBinding()]
+param([switch]$PlantDefect, [string]$EntryPath, [string]$BuildPath)
+$ErrorActionPreference = 'Stop'
+$repoRoot = Split-Path $PSScriptRoot -Parent
+if (-not $EntryPath) { $EntryPath = Join-Path $repoRoot 'Get-MiOS.ps1' }
+if (-not $BuildPath) { $BuildPath = Join-Path $repoRoot 'build-mios.ps1' }
+$templateToml = Join-Path $repoRoot 'mios.toml'
+$scratch = Join-Path ([IO.Path]::GetTempPath()) ('mios-podman-client-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $scratch -ErrorAction Stop | Out-Null
+
+$script:fail = 0; $script:checks = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
+function Check([bool]$Ok, [string]$What) {
+    $script:checks++
+    if ($Ok) { Write-Host "  PASS $What" } else { Write-Host "  FAIL $What"; $script:fail++; $script:failedChecks.Add($What) }
+}
+function Get-Ast([string]$Path) {
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw "Product source does not parse: $Path $($errors[0].Message)" }
+    return $ast
+}
+function Get-Function($Ast, [string]$Name) {
+    $found = @($Ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $Name }, $true))
+    if ($found.Count -ne 1) { throw "Missing or duplicate function $Name" }
+    return $found[0]
+}
+function Import-Functions($Ast, [string[]]$Names) {
+    foreach ($name in $Names) { . ([scriptblock]::Create(((Get-Function $Ast $name).Extent.Text -replace '^function\s+', 'function global:'))) }
+}
+function Get-Sha256Hex([byte[]]$Bytes) {
+    $h = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($h.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() } finally { $h.Dispose() }
+}
+
+function Invoke-Checks([string]$Entry, [string]$Build) {
+    $script:fail = 0; $script:checks = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
+    $entryAst = Get-Ast $Entry; $buildAst = Get-Ast $Build
+    Import-Functions $entryAst @('Get-MiosTomlValue', 'Get-MiosPodmanVersion', 'Get-MiosRequiredPodmanVersion', 'Install-MiosPodmanClient', 'Get-MiosMachineWorkerScript',
+        'Get-MiosMachinePodmanExe', 'Get-MiosMachinePodmanVersion')
+    Import-Functions $buildAst @('Assert-MiosPodmanInitSupport')
+
+    # --- Fake podman: a real executable script whose version and help the fixture controls; every run leaves a mark --------
+    $fake = Join-Path $scratch 'podman.cmd'
+    [IO.File]::WriteAllText($fake, ("@echo off`r`n" +
+        "if defined MIOS_FAKE_MARKER echo ran>>""%MIOS_FAKE_MARKER%""`r`n" +
+        "if ""%1""==""--version"" ( echo podman version %MIOS_FAKE_PODMAN_VERSION% & exit /b 0 )`r`n" +
+        "if ""%1""==""machine"" if ""%2""==""init"" if ""%3""==""--help"" (`r`n" +
+        "  echo Usage: podman machine init [options] [NAME]`r`n" +
+        "  echo       --now                    Start machine now`r`n" +
+        "  if ""%MIOS_FAKE_PODMAN_FLAG%""==""1"" echo       --update-connection      Set the default system connection`r`n" +
+        "  echo       --rootful                Whether this machine should prefer rootful container execution`r`n" +
+        "  exit /b 0 )`r`n" +
+        "exit /b 125`r`n"), (New-Object Text.ASCIIEncoding))
+    $script:fakeExe = $fake
+    $script:marker = Join-Path $scratch 'machine-client-ran.txt'
+    # The machine path is %ProgramFiles%\...\podman.exe; scenarios stand the fake in for it, the PATH scenario uses the real one.
+    $script:realMachineExe = (Get-Item function:Get-MiosMachinePodmanExe).ScriptBlock
+    function global:Get-MiosMachinePodmanExe {
+        if ($script:useRealMachineExe) { return (& $script:realMachineExe) }
+        if ($script:clientAbsent) { return $null }
+        return $script:fakeExe
+    }
+
+    # --- SSOT fixtures: the vendor tier carries the pin; the operator layer tries to override it -------------------------
+    $msiBytes = [byte[]](1..200 | ForEach-Object { [byte]($_ % 251) })
+    $msiSha = Get-Sha256Hex $msiBytes
+    $signer = 'CN="Fixture Signer, LLC", OU=Podman, O="Fixture Signer, LLC", C=US'
+    $vendorUrl = 'https://example.invalid/vendor/podman-installer-windows-amd64.msi'
+    function New-Vendor([string]$Url = $vendorUrl, [string]$Sha = $msiSha, [string]$Signer = $signer, [string]$Tag = '6.2') {
+        $lines = @('[image]', "machine_os_tag = ""$Tag""", '', '[bootstrap.prereqs]', 'podman_cli_pkg = "RedHat.Podman"')
+        if ($Url) { $lines += "podman_cli_msi_url = ""$Url""" }
+        if ($Sha) { $lines += "podman_cli_msi_sha256 = ""$Sha""" }
+        if ($Signer) { $lines += "podman_cli_msi_signer = '$Signer'" }
+        return ($lines -join "`n") + "`n"
+    }
+    $operatorPins = "[bootstrap.prereqs]`npodman_cli_msi_url = ""https://example.invalid/operator/evil.msi""`npodman_cli_msi_sha256 = ""$('0' * 64)""`npodman_cli_msi_signer = 'CN=Operator'`n"
+    function global:Resolve-MiosVendorTomlText { return $script:vendorText }
+    function global:Resolve-MiosTomlText { return $script:operatorText }
+
+    # --- Elevated-stage collaborators: recorded, never real ----------------------------------------------------------
+    function global:Write-Info { param($m) }
+    function global:Write-Good { param($m) }
+    function global:Log-Fail { param($m) $script:logged = $m }
+    function global:Assert-MiosMachineWriteBoundary { param($Path) }
+    function global:New-MiosProtectedMachineDirectory { param($Path) [IO.Directory]::CreateDirectory($Path) | Out-Null }
+    function global:Write-MiosPrivateMachineFile { param($Path, [byte[]]$Bytes) [IO.File]::WriteAllBytes($Path, $Bytes); $script:written.Add($Path) }
+    function global:Get-MiosPinnedDownloadBytes { param($Uri) $script:downloads.Add($Uri); return , $script:servedBytes }
+    function global:Get-AuthenticodeSignature {
+        [CmdletBinding()] param([string]$LiteralPath)
+        if ($LiteralPath -like '*.msi') {
+            $script:signatureChecks.Add($LiteralPath)
+            return [pscustomobject]@{ Status = $script:sigStatus; SignerCertificate = [pscustomobject]@{ Subject = $script:sigSubject } }
+        }
+        $script:exeSignatureChecks.Add($LiteralPath)
+        return [pscustomobject]@{ Status = $script:exeSigStatus; SignerCertificate = [pscustomobject]@{ Subject = $script:exeSigSubject } }
+    }
+    function global:Invoke-MiosMsiInstall {
+        param($Path)
+        $script:installs.Add($Path)
+        $script:installedExisted = Test-Path -LiteralPath $Path
+        if ($script:msiUpgradesTo) { $env:MIOS_FAKE_PODMAN_VERSION = $script:msiUpgradesTo; $script:clientAbsent = $false }
+        return $script:msiExit
+    }
+    $download = Join-Path $scratch 'downloads'
+    function Reset-Scenario([string]$Version = '5.8.10') {
+        $env:MIOS_FAKE_PODMAN_VERSION = $Version; $env:MIOS_FAKE_PODMAN_FLAG = '0'
+        $script:clientAbsent = $false; $script:vendorText = New-Vendor; $script:operatorText = $operatorPins
+        $script:servedBytes = $msiBytes; $script:sigStatus = 'Valid'; $script:sigSubject = $signer
+        $script:exeSigStatus = 'Valid'; $script:exeSigSubject = $signer; $script:useRealMachineExe = $false
+        $script:exeSignatureChecks = New-Object System.Collections.Generic.List[string]
+        $env:MIOS_FAKE_MARKER = $script:marker; Remove-Item -LiteralPath $script:marker -Force -ErrorAction SilentlyContinue
+        $script:msiExit = 0; $script:msiUpgradesTo = '6.2.0'; $script:installedExisted = $false
+        $script:downloads = New-Object System.Collections.Generic.List[string]; $script:installs = New-Object System.Collections.Generic.List[string]
+        $script:written = New-Object System.Collections.Generic.List[string]; $script:signatureChecks = New-Object System.Collections.Generic.List[string]
+        if (Test-Path -LiteralPath $download) { Remove-Item -LiteralPath $download -Recurse -Force }
+    }
+    function Invoke-Install { $script:outcome = $null; $script:installError = ''; try { $script:outcome = Install-MiosPodmanClient -DownloadDirectory $download } catch { $script:installError = $_.Exception.Message } }
+    function Test-NothingInstalled { return ($script:installs.Count -eq 0 -and @(Get-ChildItem -LiteralPath $download -Force -ErrorAction SilentlyContinue).Count -eq 0) }
+
+    # --- Installer path -----------------------------------------------------------------------------------------------
+    Reset-Scenario '5.8.10'; Invoke-Install
+    Check ($script:outcome -eq 'installed' -and $script:downloads.Count -eq 1 -and $script:installs.Count -eq 1 -and $script:installedExisted -and
+           $script:signatureChecks.Count -eq 1 -and $script:signatureChecks[0] -eq $script:installs[0] -and $script:written[0] -eq $script:installs[0] -and
+           @(Get-ChildItem -LiteralPath $download -Force).Count -eq 0) 'a 5.8 client takes the pinned MSI path: verified, installed from the private copy, copy removed'
+    Check ($script:downloads[0] -ceq $vendorUrl) 'the pinned MSI URL comes from the system SSOT, never the operator layer'
+    Check ((Test-Path -LiteralPath $script:marker) -and $script:exeSignatureChecks.Count -ge 1 -and $script:exeSignatureChecks[0] -eq $script:fakeExe) 'the machine client runs elevated only after its signature is checked'
+    Reset-Scenario '5.8.10'; $script:exeSigStatus = 'NotSigned'; Invoke-Install
+    Check ($script:installError -match 'never run elevated' -and -not (Test-Path -LiteralPath $script:marker) -and $script:downloads.Count -eq 0 -and (Test-NothingInstalled)) 'an unsigned machine Podman client is never run elevated'
+    Reset-Scenario '5.8.10'; $script:exeSigSubject = 'CN="Planted, LLC", O="Planted, LLC"'; Invoke-Install
+    Check ($script:installError -match 'not the SSOT signer; it is never run elevated' -and -not (Test-Path -LiteralPath $script:marker) -and (Test-NothingInstalled)) 'a machine Podman client from another signer is never run elevated'
+    # A podman.exe planted in a user-writable directory early on PATH (WinGet Links, WindowsApps) must never run elevated.
+    Reset-Scenario '5.8.10'; $script:useRealMachineExe = $true
+    $planted = Join-Path $scratch 'planted'; New-Item -ItemType Directory -Force -Path $planted | Out-Null
+    $plantMarker = Join-Path $scratch 'planted-ran.txt'; Remove-Item -LiteralPath $plantMarker -Force -ErrorAction SilentlyContinue
+    [IO.File]::WriteAllText((Join-Path $planted 'podman.cmd'), ("@echo off`r`necho ran>>""" + $plantMarker + """`r`necho podman version 9.9.9`r`n"), (New-Object Text.ASCIIEncoding))
+    $emptyProgramFiles = Join-Path $scratch 'ProgramFiles'; New-Item -ItemType Directory -Force -Path $emptyProgramFiles | Out-Null
+    $savedProgramFiles = $env:ProgramFiles; $savedPath = $env:PATH
+    try { $env:ProgramFiles = $emptyProgramFiles; $env:PATH = $planted + ';' + $env:PATH; Invoke-Install }
+    finally { $env:ProgramFiles = $savedProgramFiles; $env:PATH = $savedPath }
+    Check (-not (Test-Path -LiteralPath $plantMarker) -and $script:exeSignatureChecks.Count -eq 0) 'a podman planted earlier on PATH is never run by the elevated check'
+    Reset-Scenario '6.2.0'; Invoke-Install
+    Check ($script:outcome -eq 'current' -and $script:downloads.Count -eq 0 -and $script:installs.Count -eq 0) 'a 6.2 client skips the MSI path'
+    Reset-Scenario '6.3.1'; Invoke-Install
+    Check ($script:outcome -eq 'current' -and $script:downloads.Count -eq 0) 'a newer client than machine-os skips the MSI path'
+    Reset-Scenario; $script:clientAbsent = $true; Invoke-Install
+    Check ($script:outcome -eq 'installed' -and $script:installs.Count -eq 1) 'an absent client takes the pinned MSI path'
+    Reset-Scenario; $script:servedBytes = [byte[]](1..200 | ForEach-Object { [byte](($_ + 1) % 251) }); Invoke-Install
+    Check ($script:installError -match 'sha256' -and $script:installError -match 'Nothing was installed' -and $script:written.Count -eq 0 -and (Test-NothingInstalled)) 'a sha256 mismatch refuses before the MSI touches disk'
+    Reset-Scenario; $script:sigStatus = 'NotSigned'; Invoke-Install
+    Check ($script:installError -match 'signature is NotSigned' -and (Test-NothingInstalled)) 'an MSI without a Valid signature refuses and installs nothing'
+    Reset-Scenario; $script:sigStatus = 'HashMismatch'; Invoke-Install
+    Check ($script:installError -match 'signature is HashMismatch' -and (Test-NothingInstalled)) 'a tampered signature refuses and installs nothing'
+    Reset-Scenario; $script:sigSubject = 'CN="Someone Else", O="Someone Else"'; Invoke-Install
+    Check ($script:installError -match 'not the SSOT signer' -and (Test-NothingInstalled)) 'a valid signature from another signer refuses and installs nothing'
+    Reset-Scenario; $script:vendorText = New-Vendor -Signer ''; Invoke-Install
+    Check ($script:installError -match 'no complete pinned Podman MSI' -and $script:downloads.Count -eq 0 -and (Test-NothingInstalled)) 'an incomplete SSOT pin refuses before any download'
+    Reset-Scenario; $script:vendorText = New-Vendor -Sha ($msiSha.ToUpperInvariant()); Invoke-Install
+    Check ($script:installError -match 'no complete pinned Podman MSI' -and $script:downloads.Count -eq 0) 'a malformed SSOT sha256 refuses before any download'
+    Reset-Scenario; $script:vendorText = New-Vendor -Url 'http://example.invalid/podman.msi'; Invoke-Install
+    Check ($script:installError -match 'no complete pinned Podman MSI' -and $script:downloads.Count -eq 0) 'a non-https SSOT URL refuses before any download'
+    Reset-Scenario; $script:msiExit = 1603; $script:msiUpgradesTo = $null; Invoke-Install
+    Check ($script:installError -match 'exit 1603' -and @(Get-ChildItem -LiteralPath $download -Force).Count -eq 0) 'an msiexec failure is reported and the private copy is removed'
+    Reset-Scenario; $script:msiUpgradesTo = $null; Invoke-Install
+    Check ($script:installError -match 'still older than machine-os 6.2') 'a client still too old after the install is refused'
+    Reset-Scenario; $script:vendorText = New-Vendor -Tag 'latest'; Invoke-Install
+    Check ($script:installError -match 'machine_os_tag') 'an unversioned machine-os tag refuses the comparison'
+
+    # --- Guard before init ----------------------------------------------------------------------------------------------
+    # The user-side guard stays PATH-based: the fake podman is first on PATH, and the refusal names the path it resolved.
+    $savedPath = $env:PATH
+    try {
+        $env:PATH = $scratch + ';' + $env:PATH
+        $env:MIOS_FAKE_PODMAN_VERSION = '5.8.10'; $env:MIOS_FAKE_PODMAN_FLAG = '0'; $script:logged = ''
+        $guard = ''; try { Assert-MiosPodmanInitSupport -RequiredTag '6.2' } catch { $guard = $_.Exception.Message }
+        Check ($guard.Contains("Installed 'podman version 5.8.10' ($fake)") -and $guard -match 'Podman 6\.2 or newer' -and $guard -match 're-run the MiOS installer' -and
+               $guard -match 'No machine or connection was created' -and $script:logged -eq $guard) 'a client without --update-connection stops before init with version, path, requirement and remedy'
+        $env:MIOS_FAKE_PODMAN_VERSION = '6.2.0'; $env:MIOS_FAKE_PODMAN_FLAG = '1'
+        $guard = ''; try { Assert-MiosPodmanInitSupport -RequiredTag '6.2' } catch { $guard = $_.Exception.Message }
+        Check ($guard -eq '') 'a client with --update-connection passes the guard'
+    } finally { $env:PATH = $savedPath }
+
+    # --- Source order -------------------------------------------------------------------------------------------------
+    $phase = @($buildAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $n.Body.Extent.Text.Contains("'machine', 'init', `$BuilderDistro") }, $true))
+    $ok = $false
+    if ($phase.Count -eq 1) {
+        $text = $phase[0].Body.Extent.Text
+        $guardAt = $text.IndexOf('Assert-MiosPodmanInitSupport -RequiredTag $machineTag'); $stageAt = $text.IndexOf('Get-PodmanMachineOsImage `')
+        $initAt = $text.IndexOf("'machine', 'init', `$BuilderDistro"); $tagAt = $text.IndexOf("`$machineTag = `"`$(`$Matches[1]).`$(`$Matches[2])`"")
+        $ok = $guardAt -gt $tagAt -and $tagAt -ge 0 -and $guardAt -lt $stageAt -and $guardAt -lt $initAt
+    }
+    Check $ok 'the guard runs after the machine-os tag resolves and before the image download and init'
+    $core = (Get-Function $entryAst 'Invoke-MiosMachinePreparationCore').Body.Extent.Text
+    $installAt = $core.IndexOf('$null = Install-MiosPodmanClient'); $pendingAt = $core.IndexOf("if (`$_platform.Status -eq 'pending')"); $longAt = $core.IndexOf('LongPathsEnabled')
+    Check ($installAt -gt $pendingAt -and $pendingAt -ge 0 -and $installAt -lt $longAt) 'elevated preparation installs the client only after a ready platform gate'
+    $installText = (Get-Function $entryAst 'Install-MiosPodmanClient').Body.Extent.Text
+    $shaAt = $installText.IndexOf('if ($actual -cne $sha) { throw'); $writeAt = $installText.IndexOf('Write-MiosPrivateMachineFile -Path $msi')
+    $sigAt = $installText.IndexOf("if ([string]`$signature.Status -ne 'Valid') { throw"); $signerAt = $installText.IndexOf('if ($subject -cne $signer) { throw')
+    $msiAt = $installText.IndexOf('Invoke-MiosMsiInstall -Path $msi')
+    Check ($shaAt -ge 0 -and $shaAt -lt $writeAt -and $sigAt -gt $writeAt -and $signerAt -gt $sigAt -and $msiAt -gt $signerAt) 'sha256, then the private copy, then signature and signer, all before msiexec'
+    Check (@([regex]::Matches($installText, "Get-MiosTomlValue -Section 'bootstrap\.prereqs' -Key 'podman_cli_msi_(url|sha256|signer)' -Default '' -VendorOnly")).Count -eq 3) 'every pin is read from the system SSOT tier only'
+    $ensure = (Get-Function $entryAst 'Ensure-PodmanDesktop').Body.Extent.Text
+    Check (-not ($ensure -match 'WebClient|DownloadFile|msiexec|podman_url|Invoke-RestMethod')) 'the user-side Podman step has no unverified download or install path'
+    $machineText = (Get-Function $entryAst 'Get-MiosMachinePodmanExe').Body.Extent.Text
+    $versionText = (Get-Function $entryAst 'Get-MiosMachinePodmanVersion').Body.Extent.Text
+    Check (-not ($installText -match 'Resolve-MiosPodmanExe|Get-Command|\$env:PATH') -and -not ($machineText -match 'Get-Command|\$env:PATH|Resolve-MiosPodmanExe') -and
+           $machineText.Contains("Join-Path `${env:ProgramFiles} 'RedHat\Podman\podman.exe'") -and
+           @([regex]::Matches($installText, 'Get-MiosMachinePodmanVersion -Signer \$signer')).Count -eq 2 -and
+           $versionText.IndexOf('Get-AuthenticodeSignature -LiteralPath $exe') -ge 0 -and
+           $versionText.IndexOf('Get-AuthenticodeSignature -LiteralPath $exe') -lt $versionText.IndexOf('Get-MiosPodmanVersion $exe')) 'the elevated check resolves only the machine path and verifies it before running it'
+    $worker = ''; try { $worker = Get-MiosMachineWorkerScript -Source ([IO.File]::ReadAllText($Entry)) } catch { $worker = '' }
+    $missingHelpers = @(@('Get-MiosMachinePodmanExe', 'Get-MiosMachinePodmanVersion', 'Get-MiosPodmanVersion', 'Get-MiosRequiredPodmanVersion', 'Get-MiosPinnedDownloadBytes',
+        'Invoke-MiosMsiInstall', 'Install-MiosPodmanClient') | Where-Object { $worker -notmatch ('(?m)^function ' + [regex]::Escape($_) + ' \{') })
+    Check ([bool]$worker -and $missingHelpers.Count -eq 0) 'the elevated worker carries every Podman client helper'
+
+    # --- The shipped template pin parses to the expected shapes ----------------------------------------------------------
+    $script:vendorText = [IO.File]::ReadAllText($templateToml); $script:operatorText = ''
+    $u = [string](Get-MiosTomlValue -Section 'bootstrap.prereqs' -Key 'podman_cli_msi_url' -Default '' -VendorOnly)
+    $s = [string](Get-MiosTomlValue -Section 'bootstrap.prereqs' -Key 'podman_cli_msi_sha256' -Default '' -VendorOnly)
+    $g = [string](Get-MiosTomlValue -Section 'bootstrap.prereqs' -Key 'podman_cli_msi_signer' -Default '' -VendorOnly)
+    Check ($u -match '^https://github\.com/podman-container-tools/podman/releases/download/v\d+\.\d+\.\d+/podman-installer-windows-amd64\.msi$' -and
+           $s -cmatch '^[0-9a-f]{64}$' -and $g.StartsWith('CN="Red Hat, LLC", OU=Podman, O="Red Hat, LLC"')) 'the template carries a parseable pinned MSI URL, sha256 and signer'
+
+    Remove-Item Env:MIOS_FAKE_PODMAN_VERSION, Env:MIOS_FAKE_PODMAN_FLAG, Env:MIOS_FAKE_MARKER -ErrorAction SilentlyContinue
+    Write-Host "PODMAN_CLIENT_ASSERTIONS $($script:checks)"
+    return $script:fail
+}
+
+try {
+    if (-not $PlantDefect) {
+        $failures = Invoke-Checks $EntryPath $BuildPath
+        if ($failures) { Write-Host "RESULT: FAIL ($failures checks)"; exit 1 }
+        Write-Host 'RESULT: PASS (Podman client fixtures; fake podman, mocked download, signature and msiexec)'; exit 0
+    }
+    $baseline = Invoke-Checks $EntryPath $BuildPath
+    if ($baseline) { Write-Host 'PODMAN_CLIENT_BASELINE_FAILED'; exit 1 }
+    $plants = @(
+        @{ Name = 'sha256 check removed'; File = 'entry'; Expected = 'a sha256 mismatch refuses before the MSI touches disk'; From = 'if ($actual -cne $sha) { throw'; To = 'if ($false) { throw' },
+        @{ Name = 'signature check removed'; File = 'entry'; Expected = 'an MSI without a Valid signature refuses and installs nothing'; From = "if ([string]`$signature.Status -ne 'Valid') { throw `"The pinned Podman MSI signature"; To = "if (`$false) { throw `"The pinned Podman MSI signature" },
+        @{ Name = 'signer check removed'; File = 'entry'; Expected = 'a valid signature from another signer refuses and installs nothing'; From = "if (`$subject -cne `$signer) { throw `"The pinned Podman MSI is signed by"; To = "if (`$false) { throw `"The pinned Podman MSI is signed by" },
+        @{ Name = 'PATH resolution restored in the elevated check'; File = 'entry'; Expected = 'a podman planted earlier on PATH is never run by the elevated check'
+           From = "`$path = Join-Path `${env:ProgramFiles} 'RedHat\Podman\podman.exe'"
+           To = "`$path = [string](Get-Command podman -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source; if (-not `$path) { `$path = Join-Path `${env:ProgramFiles} 'RedHat\Podman\podman.exe' }" },
+        @{ Name = 'machine exe signer check removed'; File = 'entry'; Expected = 'a machine Podman client from another signer is never run elevated'; From = "if (`$subject -cne `$Signer) { throw `"The machine Podman client"; To = "if (`$false) { throw `"The machine Podman client" },
+        @{ Name = 'machine exe signature check removed'; File = 'entry'; Expected = 'an unsigned machine Podman client is never run elevated'; From = "if ([string]`$signature.Status -ne 'Valid') { throw `"The machine Podman client"; To = "if (`$false) { throw `"The machine Podman client" },
+        @{ Name = 'guard removed'; File = 'build'; Expected = 'a client without --update-connection stops before init with version, path, requirement and remedy'; From = "if (`$help -match '(?m)^\s*(?:-\w,\s*)?--update-connection\b') { return }"; To = 'return' },
+        @{ Name = 'guard call removed'; File = 'build'; Expected = 'the guard runs after the machine-os tag resolves and before the image download and init'; From = '    Assert-MiosPodmanInitSupport -RequiredTag $machineTag'; To = '    $null = $machineTag' },
+        @{ Name = 'pin read from the operator layer'; File = 'entry'; Expected = 'the pinned MSI URL comes from the system SSOT, never the operator layer'; From = "-Key 'podman_cli_msi_url' -Default '' -VendorOnly"; To = "-Key 'podman_cli_msi_url' -Default ''" }
+    )
+    $caught = 0; $index = 0
+    foreach ($plant in $plants) {
+        $index++
+        $source = if ($plant.File -eq 'entry') { $EntryPath } else { $BuildPath }
+        $text = [IO.File]::ReadAllText($source)
+        $count = ([regex]::Matches($text, [regex]::Escape($plant.From))).Count
+        if ($count -ne 1) { throw "Missing or ambiguous defect anchor: $($plant.Name) (found $count)" }
+        $copy = Join-Path $scratch ('planted-' + $index + '-' + [IO.Path]::GetFileName($source))
+        [IO.File]::WriteAllText($copy, $text.Replace($plant.From, $plant.To), (New-Object Text.UTF8Encoding($true)))
+        $entry = $EntryPath; $build = $BuildPath
+        if ($plant.File -eq 'entry') { $entry = $copy } else { $build = $copy }
+        $null = Invoke-Checks $entry $build
+        $detected = $script:failedChecks.Contains($plant.Expected)
+        Write-Host ('  {0} planted defect caught: {1}' -f $(if ($detected) { 'PASS' } else { 'FAIL' }), $plant.Name)
+        if ($detected) { $caught++ }
+    }
+    if ($caught -eq $plants.Count) { Write-Host "RESULT: PASS (every planted defect was caught: $caught/$($plants.Count))"; exit 0 }
+    Write-Host "RESULT: FAIL (planted defects caught: $caught/$($plants.Count))"; exit 1
+} finally {
+    Remove-Item Env:MIOS_FAKE_PODMAN_VERSION, Env:MIOS_FAKE_PODMAN_FLAG, Env:MIOS_FAKE_MARKER -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+}

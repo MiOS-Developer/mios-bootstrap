@@ -1827,9 +1827,12 @@ function Get-MiosTomlValue {
     param(
         [Parameter(Mandatory)] [string]$Section,   # e.g. "terminal" or "bootstrap.host_storage"
         [Parameter(Mandatory)] [string]$Key,       # e.g. "cols"
-        [Parameter(Mandatory)] [AllowEmptyString()] $Default  # returned if not found / unparseable
+        [Parameter(Mandatory)] [AllowEmptyString()] $Default, # returned if not found / unparseable
+        # System SSOT only: values an elevated step trusts (download pins) never come from the operator layer.
+        [switch]$VendorOnly
     )
-    foreach ($txt in @((Resolve-MiosTomlText), (Resolve-MiosVendorTomlText))) {
+    $_layers = if ($VendorOnly) { @((Resolve-MiosVendorTomlText)) } else { @((Resolve-MiosTomlText), (Resolve-MiosVendorTomlText)) }
+    foreach ($txt in $_layers) {
     if (-not $txt) { continue }
     # Slice the section body: from `[Section]` (line-anchored) to the next
     # `[other.section]` header or EOF.
@@ -2415,6 +2418,8 @@ function Get-MiosMachineWorkerScript {
         'Add-MiosDefenderExclusions', 'Test-MiosWslVmCreator', 'Register-MiosWslVmCreator', 'Set-MiosWslFirewallPolicy',
         'Invoke-MiosPlatformGate', 'Assert-MiosOriginContext', 'Initialize-MiosPipePeerApi',
         'Initialize-MiosMachineStorage', 'Publish-MiosMachineToml', 'Register-MiosBootstrapResume',
+        'Get-MiosMachinePodmanExe', 'Get-MiosMachinePodmanVersion', 'Get-MiosPodmanVersion', 'Get-MiosRequiredPodmanVersion',
+        'Get-MiosPinnedDownloadBytes', 'Invoke-MiosMsiInstall', 'Install-MiosPodmanClient',
         'Read-MiosPipeLine', 'Invoke-MiosMachineWorker', 'Invoke-MiosMachinePreparationRequest', 'Invoke-MiosMachinePreparationCore')
     $functions = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $names }, $true))
     foreach ($name in $names) { if (@($functions | Where-Object Name -eq $name).Count -ne 1) { throw "Missing or duplicate machine helper: $name" } }
@@ -5236,7 +5241,122 @@ function Ensure-Git {
     }
 }
 
+function Resolve-MiosPodmanExe {
+    # User side only: the podman.exe this unelevated session would run, or $null. Explicit install path after PATH.
+    $cmd = Get-Command podman -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) { return [string]$cmd.Source }
+    $candidate = Join-Path ${env:ProgramFiles} 'RedHat\Podman\podman.exe'
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    return $null
+}
+
+function Get-MiosMachinePodmanExe {
+    # Elevated side: only the MSI's machine path, never PATH. Under admin-approval UAC the elevated PATH still carries
+    # user-writable directories (WinGet Links, WindowsApps), so a podman.exe found through PATH could be a planted one.
+    $path = Join-Path ${env:ProgramFiles} 'RedHat\Podman\podman.exe'
+    if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
+    return $null
+}
+
+function Get-MiosMachinePodmanVersion {
+    # The machine client's version. It is executed elevated only after its Authenticode signature is Valid and its signer
+    # is exactly the SSOT signer; an absent client is $null, a present unsigned or foreign-signed one is refused, never run.
+    param([Parameter(Mandatory)][string]$Signer)
+    $exe = Get-MiosMachinePodmanExe
+    if (-not $exe) { return $null }
+    $signature = Get-AuthenticodeSignature -LiteralPath $exe
+    if ([string]$signature.Status -ne 'Valid') { throw "The machine Podman client $exe has a $($signature.Status) signature, not Valid; it is never run elevated. Nothing was installed." }
+    $subject = if ($signature.SignerCertificate) { [string]$signature.SignerCertificate.Subject } else { '' }
+    if ($subject -cne $Signer) { throw "The machine Podman client $exe is signed by '$subject', not the SSOT signer; it is never run elevated. Nothing was installed." }
+    return Get-MiosPodmanVersion $exe
+}
+
+function Get-MiosPodmanVersion {
+    # major.minor[.build] from `podman --version`, or $null when the client is absent or unreadable.
+    param([AllowEmptyString()][string]$Exe)
+    if (-not $Exe) { return $null }
+    $text = ((& $Exe --version 2>$null) | Out-String)
+    if ($text -match '(\d+)\.(\d+)(?:\.(\d+))?') {
+        $build = if ($Matches[3]) { [int]$Matches[3] } else { 0 }
+        return New-Object Version ([int]$Matches[1]), ([int]$Matches[2]), $build
+    }
+    return $null
+}
+
+function Get-MiosRequiredPodmanVersion {
+    # The Podman client must be at least the machine-os major.minor MiOS-DEV is provisioned from ([image].machine_os_tag).
+    $tag = [string](Get-MiosTomlValue -Section 'image' -Key 'machine_os_tag' -Default '')
+    if ($tag -notmatch '^v?(\d+)\.(\d+)') { throw "The system SSOT [image].machine_os_tag '$tag' is not a major.minor machine-os version; the Podman client cannot be checked." }
+    return New-Object Version ([int]$Matches[1]), ([int]$Matches[2])
+}
+
+function Get-MiosPinnedDownloadBytes {
+    param([Parameter(Mandatory)][string]$Uri)
+    $response = Invoke-WebRequest -Uri $Uri -UseBasicParsing -ErrorAction Stop
+    if ($response.Content -is [byte[]]) { return , $response.Content }
+    if ($response.RawContentStream) { return , $response.RawContentStream.ToArray() }
+    throw "The pinned download $Uri returned no binary content."
+}
+
+function Invoke-MiosMsiInstall {
+    param([Parameter(Mandatory)][string]$Path)
+    $msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+    $proc = Start-Process -FilePath $msiexec -ArgumentList @('/i', ('"' + $Path + '"'), '/qn', '/norestart') -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+    return [int]$proc.ExitCode
+}
+
+function Install-MiosPodmanClient {
+    # Elevated machine preparation (the operator's UAC): bring the Podman client up to the machine-os version MiOS-DEV needs.
+    # Only the system SSOT pin is trusted: the MSI must match its sha256, carry a Valid Authenticode signature and the pinned
+    # signer, all checked before msiexec runs. Any mismatch refuses with a message and installs nothing.
+    param([string]$DownloadDirectory)
+    $required = Get-MiosRequiredPodmanVersion
+    $url = [string](Get-MiosTomlValue -Section 'bootstrap.prereqs' -Key 'podman_cli_msi_url' -Default '' -VendorOnly)
+    $sha = [string](Get-MiosTomlValue -Section 'bootstrap.prereqs' -Key 'podman_cli_msi_sha256' -Default '' -VendorOnly)
+    $signer = [string](Get-MiosTomlValue -Section 'bootstrap.prereqs' -Key 'podman_cli_msi_signer' -Default '' -VendorOnly)
+    # The signer also gates running the installed client elevated, so it is required before any version check.
+    if (-not $signer.Trim()) {
+        throw "The system SSOT has no complete pinned Podman MSI ([bootstrap.prereqs] podman_cli_msi_url, podman_cli_msi_sha256, podman_cli_msi_signer); the machine Podman client cannot be verified before it runs elevated. Nothing was installed."
+    }
+    $installed = Get-MiosMachinePodmanVersion -Signer $signer
+    $have = if ($installed) { "Podman $installed" } else { 'no Podman client' }
+    if ($installed -and (New-Object Version $installed.Major, $installed.Minor) -ge $required) {
+        Write-Good "Podman client $installed satisfies machine-os $required"
+        return 'current'
+    }
+    if ($url -notmatch '^https://[^\s"'']+\.msi$' -or $sha -cnotmatch '^[0-9a-f]{64}$') {
+        throw "Found $have; MiOS-DEV needs Podman $required or newer, and the system SSOT has no complete pinned Podman MSI ([bootstrap.prereqs] podman_cli_msi_url, podman_cli_msi_sha256, podman_cli_msi_signer). Nothing was installed."
+    }
+    if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw "Found $have; the pinned Podman MSI is for amd64, not $($env:PROCESSOR_ARCHITECTURE). Nothing was installed." }
+    if (-not $DownloadDirectory) { $DownloadDirectory = Join-Path $env:ProgramData 'MiOS\downloads' }
+    if (Test-Path -LiteralPath $DownloadDirectory) { Assert-MiosMachineWriteBoundary $DownloadDirectory } else { New-MiosProtectedMachineDirectory $DownloadDirectory }
+    Write-Info "Found $have; installing the pinned Podman MSI for machine-os $required ..."
+    $bytes = Get-MiosPinnedDownloadBytes -Uri $url
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $actual = ([BitConverter]::ToString($hasher.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() } finally { $hasher.Dispose() }
+    if ($actual -cne $sha) { throw "The pinned Podman MSI sha256 is $actual, not the SSOT $sha. Nothing was installed." }
+    $msi = Join-Path $DownloadDirectory ('podman-' + $sha.Substring(0, 16) + '-' + [guid]::NewGuid().ToString('N') + '.msi')
+    Write-MiosPrivateMachineFile -Path $msi -Bytes $bytes
+    try {
+        $signature = Get-AuthenticodeSignature -LiteralPath $msi
+        if ([string]$signature.Status -ne 'Valid') { throw "The pinned Podman MSI signature is $($signature.Status), not Valid. Nothing was installed." }
+        $subject = if ($signature.SignerCertificate) { [string]$signature.SignerCertificate.Subject } else { '' }
+        if ($subject -cne $signer) { throw "The pinned Podman MSI is signed by '$subject', not the SSOT signer '$signer'. Nothing was installed." }
+        $code = Invoke-MiosMsiInstall -Path $msi
+        if ($code -notin @(0, 3010)) { throw "msiexec could not install the verified Podman MSI (exit $code); $have is unchanged." }
+    } finally { Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue }
+    $after = Get-MiosMachinePodmanVersion -Signer $signer
+    if (-not $after -or (New-Object Version $after.Major, $after.Minor) -lt $required) {
+        $now = if ($after) { "Podman $after" } else { 'no Podman client' }
+        throw "After installing the verified MSI, $now is still older than machine-os $required."
+    }
+    Write-Good "Podman client $after installed from the verified MSI"
+    return 'installed'
+}
+
 function Ensure-PodmanDesktop {
+    # An elevated machine preparation may have just installed the pinned client; see it before deciding anything.
+    $env:PATH = [Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('PATH', 'User') + ';' + $env:PATH
     if (Get-Command podman -ErrorAction SilentlyContinue) {
         Write-Good "Podman already installed ($((podman --version) 2>&1))"
         return
@@ -5277,36 +5397,10 @@ function Ensure-PodmanDesktop {
         }
     }
 
-    # Direct MSI download and silent installation fallback if winget failed/is missing
-    if (-not (Get-Command podman -ErrorAction SilentlyContinue)) {
-        Write-Info "winget install failed or unavailable. Attempting direct MSI download and install of Podman CLI..."
-        $podmanVersion = "6.0.0"
-        try {
-            $podmanUrl = [string](Get-MiosTomlValue -Section 'bootstrap.prereqs' -Key 'podman_url' -Default 'https://api.github.com/repos/containers/podman/releases/latest')
-            $latestRelease = Invoke-RestMethod -Uri $podmanUrl -UseBasicParsing -ErrorAction Stop
-            if ($latestRelease.tag_name -match '^v?([0-9\.]+)$') {
-                $podmanVersion = $Matches[1]
-            }
-        } catch {
-            Write-Info "Failed to query latest version from GitHub API (offline or rate-limited). Using default fallback version v6.0.0"
-        }
-        $msiUrl = "https://github.com/containers/podman/releases/download/v$podmanVersion/podman-v$podmanVersion.msi"
-        $msiPath = Join-Path $env:TEMP "podman-installer.msi"
-        Write-Info "Downloading Podman CLI MSI from $msiUrl ..."
-        try {
-            $webClient = New-Object System.Net.WebClient
-            $webClient.DownloadFile($msiUrl, $msiPath)
-            Write-Info "Installing Podman CLI silently via msiexec..."
-            $proc = Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait -NoNewWindow -PassThru
-            if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
-                Write-Err "msiexec exited with non-zero code: $($proc.ExitCode)"
-            }
-            Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
-        } catch {
-            Write-Err "Direct MSI installation failed: $_"
-            Write-Err "  Please download and install Podman CLI manually via the setup/MSI from the official release page:"
-            Write-Err "  https://github.com/containers/podman/releases"
-        }
+    # No unverified download: the only MSI path is the pinned, hash- and signature-checked install in elevated machine preparation.
+    if (-not (Get-Command podman -ErrorAction SilentlyContinue) -and -not (Resolve-MiosPodmanExe)) {
+        Write-Err "No Podman client is installed. The elevated machine preparation installs the pinned Podman MSI from the system SSOT"
+        Write-Err "  ([bootstrap.prereqs] podman_cli_msi_url/sha256/signer); re-run the installer and approve its UAC prompt."
     }
 
     # Refresh PATH from registry so the just-installed podman.exe is
@@ -5911,6 +6005,8 @@ function Invoke-MiosMachinePreparationCore {
     if (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName 'MiOS-Resume-Bootstrap' -Confirm:$false -ErrorAction SilentlyContinue
     }
+    # The Podman client must match the machine-os MiOS-DEV is provisioned from; this elevated stage is the only install path.
+    $null = Install-MiosPodmanClient
     Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -Value 1 -Type DWord -Force -ErrorAction Stop
     return $_platform
 }

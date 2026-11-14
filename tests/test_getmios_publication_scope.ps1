@@ -92,6 +92,7 @@ function global:Invoke-MiosMachineBoundaryRecovery {
 function global:Initialize-MiosMachineStorage { param($Context) $script:events.Add('storage') }
 function global:Add-MiosDefenderExclusions {}
 function global:Invoke-MiosPlatformGate { [pscustomobject]@{ Status = 'ready' } }
+function global:Install-MiosPodmanClient { param($DownloadDirectory) $script:events.Add('podman-client'); return 'current' }
 function global:Unregister-ScheduledTask { [CmdletBinding()]param($TaskName, [switch]$Confirm) }
 function global:Set-ItemProperty { [CmdletBinding()]param($Path, $Name, $Value, $Type, [switch]$Force) }
 function Reset-Calls {

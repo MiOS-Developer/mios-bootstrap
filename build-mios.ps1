@@ -1881,6 +1881,28 @@ function Set-PodmanMachineStorageOn {
     }
 }
 
+function Assert-MiosPodmanInitSupport {
+    # `podman machine init --update-connection` exists from Podman 6.0. An older client would fail only after the machine-os
+    # image is staged, so refuse first, with the installed version, the required one and the remedy.
+    param([Parameter(Mandatory)][string]$RequiredTag)
+    # Resolve once and run exactly that command; name it, so a stale podman earlier on PATH than the machine install shows.
+    $version = 'an unknown Podman client'
+    $where = 'no podman on PATH'
+    $help = ''
+    try {
+        $cmd = Get-Command podman -ErrorAction Stop | Select-Object -First 1
+        $where = if ($cmd.CommandType -eq 'Application') { [string]$cmd.Source } else { "$($cmd.CommandType) $($cmd.Name)" }
+        $version = (((& $cmd --version 2>&1) | Out-String).Trim())
+        $help = ((& $cmd machine init --help 2>&1) | Out-String)
+    } catch { $version = "no usable Podman client ($($_.Exception.Message))" }
+    if ($help -match '(?m)^\s*(?:-\w,\s*)?--update-connection\b') { return }
+    $message = "Installed '$version' ($where) has no 'podman machine init --update-connection'; MiOS-DEV needs Podman $RequiredTag or newer " +
+        "(machine-os $RequiredTag). Remedy: re-run the MiOS installer and approve its UAC prompt; its elevated preparation installs the " +
+        "pinned, verified Podman MSI from [bootstrap.prereqs]. No machine or connection was created."
+    Log-Fail $message
+    throw $message
+}
+
 function Get-PodmanMachineOsImage {
     [CmdletBinding()]
     param(
@@ -2135,6 +2157,9 @@ function New-BuilderDistro([hashtable]$HW) {
             throw "machine-os:latest is unavailable and the installed Podman version could not be resolved"
         }
     }
+    # Before any machine-os download or init: a client that cannot take the init flags below stops here, so no machine or
+    # connection is ever half-created.
+    Assert-MiosPodmanInitSupport -RequiredTag $machineTag
     if (-not $MachineImage) {
         $machineCacheDir = Join-Path $script:MiosInstallDir 'machine-os'
         $MachineImage = $null

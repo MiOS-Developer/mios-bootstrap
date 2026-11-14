@@ -28,6 +28,18 @@ function Definition($Ast, [string]$Name) {
     if ($found.Count -ne 1) { throw ('Missing or duplicate fixture function: ' + $Name) }
     return $found[0]
 }
+function Get-FixtureFieldProfile($FieldAst, [string]$WindowsRefreshBlock) {
+    # The actual renderer evaluates install-time scalar lookups while expanding its template.
+    # Import only that Field helper and resolve its configuration entirely inside this scope.
+    . ([scriptblock]::Create((Definition $FieldAst 'Get-MiosTomlValue').Extent.Text))
+    $resolvedFixtureText = "[ports]`nagent_pipe = 17440`n"
+    function Resolve-MiosTomlText { return $resolvedFixtureText }
+    $miosBuildRefLiteral = "'main'"; $_miosCols = 80; $_miosRows = 40; $_miosScroll = 9000
+    $_miosFrameH = 18; $_miosFrameW = 80; $_miosRightMargin = 2; $_themeFontFace = 'monospace'; $_themeFontSize = 12
+    $ompBlobBase64 = ''; $Script:MiosBootstrapRaw = 'https://fixture.invalid/bootstrap'
+    # Expand only the actual profile string; never invoke its initialization or applications.
+    return [string](& ([scriptblock]::Create((Get-HereString $FieldAst 'miosScriptBody'))))
+}
 function Invoke-CloneFailureFixture([string]$Source) {
     & {
         param($Program, $Target)
@@ -247,12 +259,26 @@ try {
     $canonicalHelper = (Definition $canonicalAst 'Update-MiosWindowsBuildCheckout').Extent.Text
     $profileHelper = (Definition $profileHelperAst 'Update-MiosWindowsBuildCheckout').Extent.Text
     Check ($profileHelper.Replace("`r`n", "`n") -ceq $canonicalHelper) 'Field embeds the canonical lossless refresh function verbatim'
-    # Expand only the actual profile template string. Never invoke its initialization or applications.
-    $miosBuildRefLiteral = "'main'"; $_miosCols = 80; $_miosRows = 40; $_miosScroll = 9000
-    $_miosFrameH = 18; $_miosFrameW = 80; $_miosRightMargin = 2; $_themeFontFace = 'monospace'; $_themeFontSize = 12
-    $ompBlobBase64 = ''; $Script:MiosBootstrapRaw = 'https://fixture.invalid/bootstrap'
-    $profile = [string](& ([scriptblock]::Create((Get-HereString $fieldAst 'miosScriptBody'))))
+    $profile = Get-FixtureFieldProfile -FieldAst $fieldAst -WindowsRefreshBlock $windowsRefreshBlock
     $profileAst = Read-Ast $profile
+    $agentCells = @($profileAst.FindAll({ param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq '_ServiceCell'
+    }, $true) | Where-Object {
+        @($_.CommandElements | Where-Object {
+            $_ -is [Management.Automation.Language.ConstantExpressionAst] -and $_.Value -eq 'Agent-Pipe'
+        }).Count -eq 1
+    })
+    $configuredPort = $null
+    if ($agentCells.Count -eq 1) {
+        $elements = $agentCells[0].CommandElements
+        for ($index = 0; $index -lt $elements.Count - 1; $index++) {
+            if ($elements[$index] -is [Management.Automation.Language.CommandParameterAst] -and $elements[$index].ParameterName -eq 'Port') {
+                $configuredPort = $elements[$index + 1]
+            }
+        }
+    }
+    Check ($agentCells.Count -eq 1 -and $configuredPort -is [Management.Automation.Language.ConstantExpressionAst] -and
+        $configuredPort.Value -eq 17440) 'the full generated Field profile keeps the configured service port from the actual scalar resolver'
     $pull = Definition $profileAst 'mios-pull'
     $calls = @($pull.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true))
     Check (@($calls | Where-Object { $_.GetCommandName() -eq 'Update-MiosWindowsBuildCheckout' }).Count -eq 1 -and

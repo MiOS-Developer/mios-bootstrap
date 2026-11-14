@@ -28,6 +28,11 @@ jobs:
         run: |
           ./tests/test_getmios_web_entry.ps1 -BootstrapRoot $PWD.Path
 
+      - name: Verify early bootstrap failure diagnostics
+        shell: pwsh
+        run: |
+          ./tests/test_getmios_failure_diagnostics.ps1
+
       - name: Install Windows ADK (oscdimg)
         shell: powershell
         run: |

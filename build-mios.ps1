@@ -2671,6 +2671,116 @@ if sudo git -C / rev-parse --verify HEAD >/dev/null 2>&1; then
     fi
 fi
 
+# >>> mios-root-checkout (exercised by tests/test_build_quadlet_overlay.ps1)
+# machine-os ships these paths and mios.git tracks them. MiOS owns them (MiOS-DEV == MiOS: identity, time sync, the
+# bound-image store, the WSL boot/user/automount config), so each one git would refuse to overwrite is backed up, moved
+# aside and replaced by the checkout. os-release and the rpc_pipefs unit stay rpm-owned: `rpm -V` reports them and a
+# dnf update could rewrite them; MiOS-DEV is replaced through machine-os, never dnf-updated. Any other path refuses.
+MIOS_ROOT_OVERLAP=(etc/chrony.conf etc/wsl.conf usr/lib/os-release
+    usr/lib/systemd/system/var-lib-nfs-rpc_pipefs.mount usr/share/containers/storage.conf)
+
+# 0 when a container store under root $1 already holds images or layers: they would then mount under MiOS's
+# storage.conf (overlay metacopy=on,userxattr) instead of the trusted.* xattrs they were written with.
+mios_store_has_content() {
+    local base="${1%/}" store first
+    for store in "$base/var/lib/containers/storage" "$base"/home/*/.local/share/containers/storage "$base/root/.local/share/containers/storage"; do
+        [[ -d "$store" ]] || continue
+        # Layers are 64-hex directories; `l` (short links) and dotfiles such as .has-mount-program are bookkeeping.
+        first=$(find "$store/overlay" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9a-f]{64}' -print -quit 2>/dev/null)
+        [[ -n "$first" ]] && return 0
+        if [[ -s "$store/overlay-images/images.json" && "$(tr -d '[:space:]' < "$store/overlay-images/images.json")" != "[]" ]]; then
+            return 0
+        fi
+    done
+    if [[ -z "$base" ]] && command -v podman >/dev/null 2>&1; then
+        [[ -n "$(timeout 30 podman images -q 2>/dev/null)" ]] && return 0
+    fi
+    return 1
+}
+
+# Puts every path in "$@" back from backup $2 under root $1; a path that exists again keeps its original in the backup.
+mios_root_restore() {
+    local base="$1" backup="$2" p
+    shift 2
+    for p in "$@"; do
+        if [[ -e "$base/$p" || -L "$base/$p" ]]; then
+            echo "[overlay] WARN: $p exists again; its original stays at $backup/files/$p"
+        else
+            sudo mkdir -p "$(dirname "$base/$p")" && sudo mv "$backup/files/$p" "$base/$p" && echo "[overlay] restored $p"
+        fi
+    done
+}
+
+# Checks out $2 (FETCH_HEAD) into root $1, or fast-forwards an existing checkout. It fails closed: a path off the
+# known list, or a populated container store, refuses with nothing moved; a failed checkout restores what it moved.
+mios_root_checkout() {
+    local root="$1" ref="$2" base="${1%/}" p k known rc stamp backup meta
+    local -a conflicts=() unknown=() moved=()
+    local -A tracked=()
+    if ! sudo git -C "$root" rev-parse --verify -q "$ref^{commit}" >/dev/null; then
+        echo "[overlay] ERROR: $ref is not a commit in $root; nothing was moved"
+        return 6
+    fi
+    # Exactly what git would refuse: paths the target tracks that exist on disk and are not tracked yet.
+    while IFS= read -r -d '' p; do tracked["$p"]=1; done < <(sudo git -C "$root" ls-files -z 2>/dev/null)
+    while IFS= read -r -d '' p; do
+        [[ -n "${tracked[$p]:-}" ]] && continue
+        if [[ -e "$base/$p" || -L "$base/$p" ]]; then conflicts+=("$p"); fi
+    done < <(sudo git -C "$root" ls-tree -r -z --name-only "$ref")
+    for p in "${conflicts[@]}"; do
+        known=0
+        for k in "${MIOS_ROOT_OVERLAP[@]}"; do if [[ "$p" == "$k" ]]; then known=1; break; fi; done
+        (( known )) || unknown+=("$p")
+    done
+    if (( ${#unknown[@]} )); then
+        echo "[overlay] ERROR: the checkout would overwrite files that are not on the known machine-os overlap list; nothing was moved:"
+        printf '[overlay]   %s\n' "${unknown[@]}"
+        echo "[overlay] REMEDY: ${MIOS_DEV_MACHINE:-MiOS-DEV} holds files from an earlier incomplete overlay; re-provision it (podman machine rm ${MIOS_DEV_MACHINE:-MiOS-DEV}, then re-run the installer)"
+        return 4
+    fi
+    for p in "${conflicts[@]}"; do
+        if [[ "$p" == usr/share/containers/storage.conf ]] && mios_store_has_content "$root"; then
+            echo "[overlay] ERROR: the container store already holds images or layers; MiOS's storage.conf (overlay metacopy=on,userxattr) would change how they mount. Nothing was moved."
+            return 5
+        fi
+    done
+    if (( ${#conflicts[@]} )); then
+        stamp=$(date -u +%Y%m%dT%H%M%SZ)
+        backup="$base/var/lib/mios/overlay-backup/$stamp-$$"
+        if ! sudo install -d -m 0700 "$backup/files"; then
+            echo "[overlay] ERROR: cannot create the private backup $backup; nothing was moved"
+            return 6
+        fi
+        for p in "${conflicts[@]}"; do
+            meta="$(sudo stat -c '%U:%G %a %s' "$base/$p") $(sudo sha256sum "$base/$p" | cut -d' ' -f1)"
+            if sudo mkdir -p "$backup/files/$(dirname "$p")" && sudo mv "$base/$p" "$backup/files/$p"; then
+                moved+=("$p")
+                printf '%s %s\n' "$meta" "$p" | sudo tee -a "$backup/MANIFEST" >/dev/null
+                echo "[overlay] moved machine-os $p aside to $backup ($meta)"
+            else
+                echo "[overlay] ERROR: cannot move $p aside; restoring"
+                mios_root_restore "$base" "$backup" "${moved[@]}"
+                return 6
+            fi
+        done
+    fi
+    if sudo git -C "$root" rev-parse --verify -q HEAD >/dev/null; then
+        sudo git -C "$root" merge --ff-only "$ref"
+        rc=$?
+    else
+        echo "[overlay] $root has no checkout yet; checking out $ref"
+        sudo git -C "$root" checkout --detach "$ref"
+        rc=$?
+    fi
+    if (( rc != 0 )); then
+        echo "[overlay] ERROR: checkout of $ref into $root failed (rc=$rc)"
+        if (( ${#moved[@]} )); then mios_root_restore "$base" "$backup" "${moved[@]}"; fi
+        return "$rc"
+    fi
+    return 0
+}
+# <<< mios-root-checkout
+
 # -- Phase B: ensure / is a git working tree pointing at the native cache -----
 echo "[overlay] making / a git working tree of mios.git ($CACHE_DIR)"
 sudo git -C / init -b "$ORIGIN_BRANCH" 2>&1 | head -1 || true
@@ -2689,11 +2799,9 @@ if [[ $fetch_rc -ne 0 ]]; then
     echo "[overlay] ERROR: git fetch failed (rc=$fetch_rc)"
 fi
 if [[ $fetch_rc -ne 0 ]]; then exit "$fetch_rc"; fi
-if sudo git -C / rev-parse --verify HEAD >/dev/null 2>&1; then
-    sudo git -C / merge --ff-only FETCH_HEAD || exit 1
-else
-    sudo git -C / checkout --detach FETCH_HEAD || exit 1
-fi
+# A root left at "git init, no HEAD" by an earlier failed run resumes here: nothing is tracked, so the guard above
+# had nothing to preserve, and the checkout picks up where it stopped.
+mios_root_checkout / FETCH_HEAD || exit $?
 
 count=$(sudo git -C / ls-tree -r --name-only HEAD 2>/dev/null | wc -l)
 echo "[quadlet-overlay] / now contains $count tracked mios.git files"
@@ -3388,15 +3496,24 @@ echo "[quadlet-overlay] Ollama:         set MIOS_DEV_ENABLE_AI=1 then re-run for
     $stagedDrive = $stagedPath.Substring(0,1).ToLower()
     $stagedWsl   = "/mnt/$stagedDrive" + ($stagedPath.Substring(2) -replace '\\','/')
 
-    $stage = "set -e; export MIOS_DEV_ENABLE_AI='$enableAi' MIOS_DEV_ENABLE_RUNNER='$enableRunner'; " +
+    $stage = "set -e; export MIOS_DEV_ENABLE_AI='$enableAi' MIOS_DEV_ENABLE_RUNNER='$enableRunner' MIOS_DEV_MACHINE='$DevDistro'; " +
              "bash '$stagedWsl' '$miosRootWsl'"
-    & wsl.exe -d $wslDistro --exec bash -c $stage 2>&1 | ForEach-Object { Write-Log "quadlet-overlay: $_" }
-    if ($LASTEXITCODE -eq 3) { Log-Fail "Quadlet placeholders did not render; no unit was started"; throw "Quadlet overlay failed: 34-render-quadlets.sh" }
-    if ($LASTEXITCODE -ne 0) {
-        Log-Warn "Quadlet overlay rc=$LASTEXITCODE -- partial overlay possible (units may still be present; rerun safe)"
-    } else {
-        Log-Ok "MiOS Quadlet overlay applied to $DevDistro"
+    $seedLines = New-Object System.Collections.Generic.List[string]
+    & wsl.exe -d $wslDistro --exec bash -c $stage 2>&1 | ForEach-Object { $seedLines.Add([string]$_); Write-Log "quadlet-overlay: $_" }
+    $overlayRc = $LASTEXITCODE
+    if ($overlayRc -eq 3) { Log-Fail "Quadlet placeholders did not render; no unit was started"; throw "Quadlet overlay failed: 34-render-quadlets.sh" }
+    # Any other non-zero exit means / in MiOS-DEV is not a complete mios.git checkout, so nothing later may assume it.
+    if ($overlayRc -ne 0) {
+        $detail = ''
+        if ($overlayRc -eq 4) {
+            # The operator sees this line, not the log: name the paths and the remedy.
+            $unknownPaths = @($seedLines | Where-Object { $_ -match '^\[overlay\]   \S' } | ForEach-Object { $_.Substring(12).Trim() })
+            $detail = " Unknown paths: $($unknownPaths -join ', '). $DevDistro holds files from an earlier incomplete overlay; re-provision it (podman machine rm $DevDistro, then re-run the installer)."
+        }
+        Log-Fail "Quadlet overlay failed (rc=$overlayRc): / in $DevDistro is not a complete mios.git checkout; see the quadlet-overlay lines above.$detail"
+        throw "Quadlet overlay failed (rc=$overlayRc)"
     }
+    Log-Ok "MiOS Quadlet overlay applied to $DevDistro"
 }
 
 function Invoke-GhcrLogin([string]$Token) {

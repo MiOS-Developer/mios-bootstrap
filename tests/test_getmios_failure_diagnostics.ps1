@@ -102,6 +102,8 @@ try {
     if ($script:failures.Count) { throw ('Diagnostic fixture failures: ' + ($script:failures -join '; ')) }
     Write-Host 'FAILURE_DIAGNOSTIC_PLANTS PASS (1/1)'
     Write-Host 'RESULT: PASS (failure trap source fixtures; no installer, network, UAC, provisioning or machine writes)'
+    # Expected child failures are fixture data; report this script's successful result to its caller.
+    exit 0
 } finally {
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 }

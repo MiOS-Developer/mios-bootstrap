@@ -5393,7 +5393,7 @@ function Initialize-DataDisk {
     if ($existing) {
         Write-Err "Drive ${DriveLetter}: exists with label '$($existing.FileSystemLabel)' (not '$VolumeLabel')."
         Write-Err "Either remove the volume manually or pass -DriveLetter <other> to Get-MiOS.ps1."
-        exit 1
+        throw "Initialize-DataDisk: drive ${DriveLetter}: already exists with another label; no disk changes were made."
     }
     $_displayGb = Get-MiosTomlValue -Section 'bootstrap.host_storage' -Key 'display_size_gb' -Default 256
     Write-Info "Provisioning ${DriveLetter}:\ at $ShrinkMB MB (target $_displayGb GB visible in Explorer) ..."
@@ -5421,7 +5421,7 @@ function Initialize-DataDisk {
     $disk = Get-Disk -Number $cPart.DiskNumber
     if ($disk.PartitionStyle -notin @('GPT','MBR')) {
         Write-Err "Disk $($disk.Number) has unsupported partition style '$($disk.PartitionStyle)'"
-        exit 1
+        throw "Initialize-DataDisk: disk $($disk.Number) has an unsupported partition style; no disk changes were made."
     }
     Write-Info "  shrinking ${sysLetter}: $([math]::Round($cPart.Size/1GB,1)) GB -> $([math]::Round($newCSize/1GB,1)) GB ..."
     Resize-Partition -DriveLetter $sysLetter -Size $newCSize -ErrorAction Stop
@@ -5742,23 +5742,23 @@ function Initialize-MiosMachineStorage {
     # Install-robustness (B2): hardware-virtualization preflight. WSL2 +
     # `podman machine init` cannot start without VT-x/AMD-V (SVM) enabled in BIOS/
     # UEFI. Fail fast before Initialize-DataDisk (reboot/disk changes).
-    try {
-        $_virtFw = $true; $_hyperv = $true
-        try { $_virtFw = [bool](Get-CimInstance Win32_Processor -EA Stop | Select-Object -First 1 -Expand VirtualizationFirmwareEnabled) } catch {}
-        try { $_hyperv = [bool](Get-CimInstance Win32_ComputerSystem -EA Stop).HypervisorPresent } catch {}
-        if (-not $_virtFw -and -not $_hyperv) {
-            Write-Err "Hardware virtualization is DISABLED -- WSL2 + podman machine cannot start."
-            Write-Err "  -> Enable Intel VT-x / AMD-V (SVM) in BIOS/UEFI, then re-run the bootstrap."
-            exit 1
-        }
-    } catch {}
+    # A failure here throws its public reason back through the worker pipe to the operator. It never exits the worker silently
+    # and never reaps or cleans anything: existing distributions, persistent state, sources and models stay as they are.
+    $_virtFw = $true; $_hyperv = $true
+    try { $_virtFw = [bool](Get-CimInstance Win32_Processor -EA Stop | Select-Object -First 1 -Expand VirtualizationFirmwareEnabled) } catch {}
+    try { $_hyperv = [bool](Get-CimInstance Win32_ComputerSystem -EA Stop).HypervisorPresent } catch {}
+    if (-not $_virtFw -and -not $_hyperv) {
+        Write-Err "Hardware virtualization is DISABLED -- WSL2 + podman machine cannot start."
+        Write-Err "  -> Enable Intel VT-x / AMD-V (SVM) in BIOS/UEFI, then re-run the bootstrap."
+        throw 'Hardware virtualization is disabled: enable Intel VT-x / AMD-V (SVM) in BIOS/UEFI, then re-run. No storage changes were made.'
+    }
 
     Write-Host ''
     Write-Host "  $_msgStep0" -ForegroundColor Cyan
-    $_dataOk = $true
-    try { Initialize-DataDisk } catch { $_dataOk = $false; Write-Host ('  ' + ($_msgStep0Failed -f $_.Exception.Message)) -ForegroundColor Yellow }
+    $_dataOk = $true; $_dataReason = ''
+    try { Initialize-DataDisk } catch { $_dataOk = $false; $_dataReason = $_.Exception.Message; Write-Host ('  ' + ($_msgStep0Failed -f $_.Exception.Message)) -ForegroundColor Yellow }
     $_dataDrive = [string](Get-MiosTomlValue -Section 'bootstrap.host_storage' -Key 'drive_letter' -Default 'C')
-    if ($_dataOk -and -not (Get-Volume -DriveLetter $_dataDrive -ErrorAction SilentlyContinue)) { $_dataOk = $false }
+    if ($_dataOk -and -not (Get-Volume -DriveLetter $_dataDrive -ErrorAction SilentlyContinue)) { $_dataOk = $false; $_dataReason = "configured volume ${_dataDrive}: was not returned by storage discovery" }
     if (-not $_dataOk) {
         Write-Err "Could not provision the ${_dataDrive}:\ data partition -- MiOS stores its containers,"
         Write-Err "  packages, config and repos there, so the install cannot continue without it."
@@ -5766,8 +5766,7 @@ function Initialize-MiosMachineStorage {
         Write-Err "    - Under ~64 GB free on C:  (free some space / empty the Recycle Bin, then re-run)."
         Write-Err "    - C: is BitLocker-locked or non-shrinkable  (suspend it, then re-run the one-liner:"
         Write-Err "        manage-bde -protectors -disable C: -RebootCount 1)."
-        try { Invoke-MiOSFullReap } catch {}
-        exit 1
+        throw "Could not provision the ${_dataDrive}:\ data partition ($_dataReason); existing distributions, persistent state and source checkouts are preserved."
     }
 }
 

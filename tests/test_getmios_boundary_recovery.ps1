@@ -257,8 +257,29 @@ function Invoke-ElevatedChecks([string]$Root) {
     $owners = @{}; foreach ($p in $targets) { $owners[$p.Substring($tree.Length + 1)] = (Read-MiosBoundaryObject $p).Owner }
     Check ($owners['usr'] -eq 'S-1-5-32-544' -and $owners['etc'] -eq 'S-1-5-18' -and $owners['usr\share'] -eq 'S-1-5-32-544' -and $owners['usr\share\mios'] -eq 'S-1-5-32-544' -and
            $owners['etc\mios'] -eq 'S-1-5-32-544') 'trusted owners are kept and only the operator owners are replaced'
-    $usr = (Read-MiosBoundaryObject (Join-Path $tree 'usr')).Sddl
-    Check ($usr -clike "O:BAD:P$self*" -and $usr -match '\(A;OICIIO;0x1301bf;;;AU\)') 'a shared prefix gets trusted self access and keeps its child templates as InheritOnly'
+    # Windows stores a protected DACL set by handle as D:PAI (auto-inherited); compare what the descriptor grants, not its SDDL prefix.
+    $templates = { param($raw) (@(@($raw.DiscretionaryAcl) | Where-Object { [int]$_.AceFlags -band 0x03 } |
+        ForEach-Object { '{0}|{1}|{2}' -f $_.SecurityIdentifier.Value, $_.AccessMask, ([int]$_.AceFlags -band 0x03) }) -join ';') }
+    $sharedOk = $true
+    foreach ($p in 'usr', 'usr\share', 'etc') {
+        $now = New-Object Security.AccessControl.RawSecurityDescriptor (Read-MiosBoundaryObject (Join-Path $tree $p)).Sddl
+        $was = New-Object Security.AccessControl.RawSecurityDescriptor $orig[(Join-Path $tree $p)].Sddl
+        $selfAces = (@(@($now.DiscretionaryAcl) | Where-Object { -not ([int]$_.AceFlags -band 0x08) } |
+            ForEach-Object { '{0}|{1}|{2}' -f $_.SecurityIdentifier.Value, $_.AccessMask, [int]$_.AceFlags }) -join ';')
+        $templatesOnly = @(@($now.DiscretionaryAcl) | Where-Object { ([int]$_.AceFlags -band 0x03) -and -not ([int]$_.AceFlags -band 0x08) }).Count -eq 0
+        if (-not ([int]$now.ControlFlags -band 0x1000) -or $selfAces -cne 'S-1-5-18|2032127|0;S-1-5-32-544|2032127|0;S-1-5-32-545|1179817|0' -or
+            -not $templatesOnly -or (& $templates $now) -cne (& $templates $was)) { $sharedOk = $false; Write-Host "    shared $p now $($now.GetSddlForm('Owner, Access'))" }
+    }
+    Check $sharedOk 'a shared prefix gets trusted self access and keeps its child templates as InheritOnly'
+    $leafOk = $true
+    foreach ($p in 'usr\share\mios', 'usr\share\mios\mios.toml', 'etc\mios') {
+        $record = Read-MiosBoundaryObject (Join-Path $tree $p)
+        $now = New-Object Security.AccessControl.RawSecurityDescriptor $record.Sddl
+        $want = New-Object Security.AccessControl.RawSecurityDescriptor (New-MiosLeafSddl -Directory ($record.Kind -eq 'directory') -Owner 'S-1-5-32-544')
+        $aces = { param($raw) (@(@($raw.DiscretionaryAcl) | ForEach-Object { '{0}|{1}|{2}' -f $_.SecurityIdentifier.Value, $_.AccessMask, [int]$_.AceFlags }) -join ';') }
+        if (-not ([int]$now.ControlFlags -band 0x1000) -or (& $aces $now) -cne (& $aces $want)) { $leafOk = $false; Write-Host "    leaf $p now $($record.Sddl)" }
+    }
+    Check $leafOk 'a namespaced leaf gets exactly the protected canonical creation ACEs'
     $sibOk = $true
     foreach ($p in $siblings) { $now = Read-MiosBoundaryObject $p -Lenient; foreach ($f in 'Sddl', 'Owner', 'Index', 'Written', 'Sha256') { if ($now.$f -cne $orig[$p].$f) { $sibOk = $false; Write-Host "    sibling $p $f changed" } } }
     Check $sibOk 'siblings under shared prefixes keep their descriptor, identity and bytes'

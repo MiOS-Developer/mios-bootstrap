@@ -169,7 +169,7 @@ function Run-Checks([string]$Text) {
     $script:recoverySids = New-Object System.Collections.Generic.List[string]
     function global:Get-MiosMachineTomlRoots { return 'C:' }
     function global:Invoke-MiosMachineBoundaryRecovery { param($OriginSid, $Root, $BackupDirectory) $script:recoverySids.Add([string]$OriginSid); return $null }
-    function global:Publish-MiosMachineToml { param($Context) }
+    function global:Publish-MiosMachineToml { param($Context, [string[]]$AdmittedRoots) }
     function global:Initialize-MiosMachineStorage { param($Context) }
     function global:Add-MiosDefenderExclusions {}
     function global:Register-MiosBootstrapResume { param($Context) $script:pendingSid = $Context.Sid }

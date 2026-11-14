@@ -77,6 +77,10 @@ function global:Invoke-MiosMachineBoundaryRecovery {
     param($OriginSid, $Root, $BackupDirectory)
     if (-not $script:validated -or $OriginSid -cne $script:origin.Sid) { throw 'Recovery ran without the validated origin.' }
     $script:recovered.Add([string]$Root); $script:events.Add('recover|' + $Root)
+    if ($script:appearDuringRecovery -and $Root -ceq 'C:') {
+        [IO.Directory]::CreateDirectory($script:driveMap['D']) | Out-Null
+        $script:appearedDuringRecovery = $true
+    }
 }
 function global:Initialize-MiosMachineStorage { param($Context) $script:events.Add('storage') }
 function global:Add-MiosDefenderExclusions {}
@@ -89,6 +93,7 @@ function Reset-Calls {
     $script:events = New-Object System.Collections.Generic.List[string]
     $script:recovered = New-Object System.Collections.Generic.List[string]
     $script:dropSystemVendor = $false; $script:validated = $false; $script:elevated = $true
+    $script:appearDuringRecovery = $false; $script:appearedDuringRecovery = $false
 }
 function Set-Selection([string]$Drive) {
     $script:operator = "[bootstrap.host_storage]`ndrive_letter = '$Drive'`n[identity]`nusername = 'fixture'`n"
@@ -144,6 +149,22 @@ function Invoke-Checks([string]$Text) {
     Check (($script:recovered -join ',') -ceq 'C:' -and $script:repairs.Count -eq 1 -and $script:writes.Count -eq 2) 'an absent selected secondary drive waits for storage provisioning'
     Check ($script:events.Contains('storage')) 'an absent secondary drive still reaches the existing storage stage'
 
+    # The selected D drive appears only AFTER Core has admitted C and entered recovery.
+    # Publication must consume that same snapshot; the next dispatch can admit D after recovering it.
+    Reset-Calls; $script:appearDuringRecovery = $true
+    $null = Invoke-MiosMachinePreparationCore -Context $script:origin
+    Check ($script:appearedDuringRecovery -and [IO.Directory]::Exists($script:driveMap['D'])) 'the fixture materializes the selected drive between admission and publication'
+    Check (($script:recovered -join ',') -ceq 'C:' -and $script:repairs.Count -eq 1 -and $script:writes.Count -eq 2 -and
+           -not [IO.File]::Exists((Join-Path 'D:' 'usr\share\mios\mios.toml'))) 'a drive appearing during recovery receives no publication without prior recovery'
+    Check (M-SentinelsIntact) 'the admission-race dispatch preserves unselected M sentinels'
+    Reset-Calls
+    $null = Invoke-MiosMachinePreparationCore -Context $script:origin
+    Check (($script:recovered -join ',') -ceq 'C:,D:' -and $script:repairs.Count -eq 2 -and $script:writes.Count -eq 4) 'the next dispatch recovers and publishes the newly present selected drive'
+
+    Set-Selection 'C'; Reset-Calls; $caught = $false
+    try { $null = Publish-MiosMachineToml -Context $script:origin -AdmittedRoots @('C:', 'M:') } catch { $caught = $true }
+    Check ($caught -and $script:repairs.Count -eq 0 -and $script:writes.Count -eq 0 -and (M-SentinelsIntact)) 'a supplied snapshot cannot opt an unselected drive into publication'
+
     Set-Selection 'M:\..\C'; Reset-Calls
     $caught = $false
     try { $null = Publish-MiosMachineToml -Context $script:origin } catch { $caught = $true }
@@ -173,13 +194,16 @@ try {
     if (-not $PlantDefect) { Write-Host 'RESULT: PASS (real publication and core dispatch, selected-root sentinels)'; exit 0 }
     $plants = @(
         @{ Name = 'presence-based M root'; Expected = 'real C publication preserves both existing M TOML sentinels';
-           From = "    `$_systemDrive`n    `$_dataRoot ="; To = "    `$_systemDrive`n    'M:'`n    `$_dataRoot =" },
+           From = '} else { $_roots = @(Get-MiosMachineTomlRoots) }'; To = '} else { $_roots = @(Get-MiosMachineTomlRoots) + @(''M:'') }' },
         @{ Name = 'M verification fallback'; Expected = 'missing C vendor cannot pass with a readable M copy';
            From = "        `$_checkDst = Join-Path `$_root 'usr\share\mios\mios.toml'";
            To = "        `$_checkDst = Join-Path `$_root 'usr\share\mios\mios.toml'; if (-not (Test-Path -LiteralPath `$_checkDst)) { `$_checkDst = Join-Path 'M:' 'usr\share\mios\mios.toml' }" },
         @{ Name = 'secondary recovery omitted'; Expected = 'real secondary-drive core dispatch recovers both publication roots';
-           From = 'foreach ($_tomlRoot in @(Get-MiosMachineTomlRoots)) {';
-           To = 'foreach ($_tomlRoot in @(Get-MiosMachineTomlRoots | Select-Object -First 1)) {' },
+           From = 'foreach ($_tomlRoot in $_tomlRoots) {';
+           To = 'foreach ($_tomlRoot in @($_tomlRoots | Select-Object -First 1)) {' },
+        @{ Name = 'publication recomputes admitted roots'; Expected = 'a drive appearing during recovery receives no publication without prior recovery';
+           From = 'Publish-MiosMachineToml -Context $Context -AdmittedRoots $_tomlRoots';
+           To = 'Publish-MiosMachineToml -Context $Context' },
         @{ Name = 'worker helper omitted'; Expected = 'the elevated worker carries the shared root admission helper';
            From = "'Get-MiosTomlValue', 'Get-MiosMachineTomlRoots',"; To = "'Get-MiosTomlValue'," }
     )

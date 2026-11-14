@@ -5703,9 +5703,20 @@ function Get-MiosMachineTomlRoots {
 }
 
 function Publish-MiosMachineToml {
-    param([Parameter(Mandatory)]$Context)
-    # The same validated in-memory TOML selects roots for recovery and publication.
-    $_roots = @(Get-MiosMachineTomlRoots)
+    param([Parameter(Mandatory)]$Context, [string[]]$AdmittedRoots)
+    # Core supplies its one admitted-root snapshot. Standalone callers resolve once here.
+    # Validate a supplied snapshot against the same in-memory selection without adding newly appeared drives.
+    if ($PSBoundParameters.ContainsKey('AdmittedRoots')) {
+        $_roots = @($AdmittedRoots)
+        $_systemRoot = $(if ($env:SystemDrive) { [string]$env:SystemDrive } else { 'C:' }).Trim().TrimEnd('\').ToUpperInvariant()
+        $_selectedDrive = ([string](Get-MiosTomlValue -Section 'bootstrap.host_storage' -Key 'drive_letter' -Default $_systemRoot.Substring(0, 1))).Trim().ToUpperInvariant()
+        if ($_roots.Count -lt 1 -or $_roots.Count -gt 2 -or
+            @($_roots | Where-Object { $_ -cnotmatch '^[A-Z]:$' }).Count -or $_roots[0] -cne $_systemRoot -or
+            $_selectedDrive -notmatch '^[A-Z]:?$' -or
+            ($_roots.Count -eq 2 -and ($_roots[1] -ceq $_roots[0] -or $_roots[1] -cne ($_selectedDrive.Substring(0, 1) + ':')))) {
+            throw 'Machine TOML publication received an invalid admitted-root snapshot.'
+        }
+    } else { $_roots = @(Get-MiosMachineTomlRoots) }
     # Restrict/repair old readable credential copies only inside those admitted roots.
     $null = Repair-MiosHostTierCredentials -Paths @($_roots | ForEach-Object { Join-Path $_ 'etc\mios\mios.toml' })
     try {
@@ -5800,10 +5811,11 @@ function Invoke-MiosMachinePreparationCore {
     Assert-MiosOriginContext $Context
     $script:MiosMachineOrigin = $Context
     # Recover exactly the TOML-selected existing roots, after origin validation and before any publication or repair.
-    foreach ($_tomlRoot in @(Get-MiosMachineTomlRoots)) {
+    $_tomlRoots = @(Get-MiosMachineTomlRoots)
+    foreach ($_tomlRoot in $_tomlRoots) {
         $null = Invoke-MiosMachineBoundaryRecovery -OriginSid ([string]$Context.Sid) -Root $_tomlRoot
     }
-    Publish-MiosMachineToml -Context $Context
+    Publish-MiosMachineToml -Context $Context -AdmittedRoots $_tomlRoots
     Initialize-MiosMachineStorage -Context $Context
     Add-MiosDefenderExclusions
     # The readiness gate remains mandatory and outside a warning-only catch.

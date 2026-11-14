@@ -2315,7 +2315,7 @@ function Get-MiosMachineWorkerScript {
     $ast = [Management.Automation.Language.Parser]::ParseInput($Source, [ref]$tokens, [ref]$errors)
     if ($errors.Count) { throw 'Cannot prepare an invalid installer source.' }
     $names = @('Assert-MiosNoReparsePath', 'Get-MiosTomlAssignments', 'Split-MiosTomlKeyLine', 'Get-MiosTomlCredentialKeys',
-        'ConvertTo-MiosCredentialFreeToml', 'Resolve-MiosTomlText', 'Resolve-MiosVendorTomlText', 'Get-MiosTomlValue',
+        'ConvertTo-MiosCredentialFreeToml', 'Resolve-MiosTomlText', 'Resolve-MiosVendorTomlText', 'Get-MiosTomlValue', 'Get-MiosMachineTomlRoots',
         'Set-MiosHostTierAcl', 'Initialize-MiosHostTierDirectory', 'Write-MiosHostToml', 'Repair-MiosHostTierCredentials',
         'Assert-MiosMachineWriteBoundary', 'Initialize-MiosVendorTierDirectory', 'Write-MiosVendorToml',
         'New-MiosMachineCreationAcl', 'New-MiosProtectedMachineDirectory', 'Write-MiosPrivateMachineFile',
@@ -5690,31 +5690,37 @@ function Initialize-MiosMachineStorage {
     }
 }
 
+function Get-MiosMachineTomlRoots {
+    # The system root and an explicitly selected, already provisioned secondary drive only.
+    # A drive merely being present never opts it in. An absent selected drive waits for storage provisioning.
+    $_systemDrive = $(if ($env:SystemDrive) { [string]$env:SystemDrive } else { 'C:' }).Trim().TrimEnd('\').ToUpperInvariant()
+    if ($_systemDrive -notmatch '^[A-Z]:$') { throw 'The Windows system drive must be one absolute drive root.' }
+    $_selectedDrive = ([string](Get-MiosTomlValue -Section 'bootstrap.host_storage' -Key 'drive_letter' -Default $_systemDrive.Substring(0, 1))).Trim().ToUpperInvariant()
+    if ($_selectedDrive -notmatch '^[A-Z]:?$') { throw 'The configured host storage drive must be one Windows drive letter.' }
+    $_systemDrive
+    $_dataRoot = $_selectedDrive.Substring(0, 1) + ':'
+    if ($_dataRoot -cne $_systemDrive -and (Test-Path -LiteralPath ($_dataRoot + '\') -PathType Container)) { $_dataRoot }
+}
+
 function Publish-MiosMachineToml {
     param([Parameter(Mandatory)]$Context)
-    # Restrict/repair old readable credential copies before network fetching or any later provisioning can fail.
-    $_hostSecurityDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
-    $null = Repair-MiosHostTierCredentials -Paths @((Join-Path $_hostSecurityDrive 'etc\mios\mios.toml'), 'M:\etc\mios\mios.toml')
-
-
+    # The same validated in-memory TOML selects roots for recovery and publication.
+    $_roots = @(Get-MiosMachineTomlRoots)
+    # Restrict/repair old readable credential copies only inside those admitted roots.
+    $null = Repair-MiosHostTierCredentials -Paths @($_roots | ForEach-Object { Join-Path $_ 'etc\mios\mios.toml' })
     try {
         $_miosVendorToml = Resolve-MiosVendorTomlText
         $_miosHostToml = Resolve-MiosTomlText
-        $_sysLetter = if ($env:SystemDrive) { $env:SystemDrive.TrimEnd(':') } else { 'C' }
-        $_sysDrive  = "${_sysLetter}:"
         if ($_miosVendorToml) {
-            $_vendorDst = Join-Path $_sysDrive 'usr\share\mios\mios.toml'
-            Write-MiosVendorToml -Path $_vendorDst -Text $_miosVendorToml
-            if (Test-Path 'M:\') { Write-MiosVendorToml -Path 'M:\usr\share\mios\mios.toml' -Text $_miosVendorToml }
-            if ($_miosHostToml) {
-                # The operator layer stays in the user tier (~\.config\mios); the host tier gets its credential-free projection.
-                Write-MiosHostToml -Path (Join-Path $_sysDrive 'etc\mios\mios.toml') -Text $_miosHostToml
-                if (Test-Path 'M:\') {
-                    Write-MiosHostToml -Path 'M:\etc\mios\mios.toml' -Text $_miosHostToml
+            foreach ($_root in $_roots) {
+                Write-MiosVendorToml -Path (Join-Path $_root 'usr\share\mios\mios.toml') -Text $_miosVendorToml
+                if ($_miosHostToml) {
+                    # The operator layer stays in the user tier; the host tier gets its credential-free projection.
+                    Write-MiosHostToml -Path (Join-Path $_root 'etc\mios\mios.toml') -Text $_miosHostToml
+                    Write-Host "  [+] Full vendor mios.toml -> $_root\usr\share\mios; operator profile (credential-free) -> $_root\etc\mios" -ForegroundColor DarkGray
+                } else {
+                    Write-Host "  [+] Full vendor mios.toml -> $_root\usr\share\mios (no host override found)" -ForegroundColor DarkGray
                 }
-                Write-Host "  [+] Full vendor mios.toml -> $_sysDrive\usr\share\mios; operator profile (credential-free) -> $_sysDrive\etc\mios" -ForegroundColor DarkGray
-            } else {
-                Write-Host "  [+] Full vendor mios.toml -> $_sysDrive\usr\share\mios (no host override found)" -ForegroundColor DarkGray
             }
         } else {
             Write-Host "  [!] Full vendor mios.toml could not be loaded -- mios.toml was not overwritten" -ForegroundColor Yellow
@@ -5722,12 +5728,13 @@ function Publish-MiosMachineToml {
     } catch {
         throw 'Host TOML security/promotion failed; provisioning stopped. Check host-tier ACLs before retrying.'
     }
-    $_checkDst = if (Test-Path (Join-Path $_sysDrive 'usr\share\mios\mios.toml')) { Join-Path $_sysDrive 'usr\share\mios\mios.toml' } else { 'M:\usr\share\mios\mios.toml' }
-    if (-not (Test-Path -LiteralPath $_checkDst -PathType Leaf) -or
-        [IO.File]::ReadAllText($_checkDst, (New-Object System.Text.UTF8Encoding($false))) -cne $_miosVendorToml) {
-        throw "Full fetched system mios.toml was not staged exactly on $_checkDst; refusing to continue the installer."
+    foreach ($_root in $_roots) {
+        $_checkDst = Join-Path $_root 'usr\share\mios\mios.toml'
+        if (-not (Test-Path -LiteralPath $_checkDst -PathType Leaf) -or
+            [IO.File]::ReadAllText($_checkDst, (New-Object System.Text.UTF8Encoding($false))) -cne $_miosVendorToml) {
+            throw "Full fetched system mios.toml was not staged exactly on $_checkDst; refusing to continue the installer."
+        }
     }
-
 }
 
 function Register-MiosBootstrapResume {
@@ -5792,8 +5799,10 @@ function Invoke-MiosMachinePreparationCore {
     if (-not (Test-MiosElevated)) { throw 'Machine preparation requires an elevated token.' }
     Assert-MiosOriginContext $Context
     $script:MiosMachineOrigin = $Context
-    # Explicit, backed-up boundary recovery on the system drive, only after the origin is validated and before any TOML write.
-    $null = Invoke-MiosMachineBoundaryRecovery -OriginSid ([string]$Context.Sid)
+    # Recover exactly the TOML-selected existing roots, after origin validation and before any publication or repair.
+    foreach ($_tomlRoot in @(Get-MiosMachineTomlRoots)) {
+        $null = Invoke-MiosMachineBoundaryRecovery -OriginSid ([string]$Context.Sid) -Root $_tomlRoot
+    }
     Publish-MiosMachineToml -Context $Context
     Initialize-MiosMachineStorage -Context $Context
     Add-MiosDefenderExclusions

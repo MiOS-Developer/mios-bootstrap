@@ -167,6 +167,7 @@ function Run-Checks([string]$Text) {
     Import-Functions $ast @('Invoke-MiosMachinePreparationCore')
     function global:Test-MiosElevated { return $true }
     $script:recoverySids = New-Object System.Collections.Generic.List[string]
+    function global:Get-MiosMachineTomlRoots { return 'C:' }
     function global:Invoke-MiosMachineBoundaryRecovery { param($OriginSid, $Root, $BackupDirectory) $script:recoverySids.Add([string]$OriginSid); return $null }
     function global:Publish-MiosMachineToml { param($Context) }
     function global:Initialize-MiosMachineStorage { param($Context) }

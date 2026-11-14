@@ -90,6 +90,14 @@ function Install-MiosNativeWindowsArtifact([string]$Root, [string]$Machine, [str
     return $Destination
 }
 
+function Get-MiosDistroStepVerdict([int]$Exit, [string]$Script) {
+    # A script run inside the distro succeeds only on exit 0. 127 is bash's "No such file or directory" for the script
+    # itself: it is not in the distro yet (for example when the mios.git checkout of / did not land).
+    if ($Exit -eq 0) { return [pscustomobject]@{ Ok = $true; Detail = '' } }
+    if ($Exit -eq 127) { return [pscustomobject]@{ Ok = $false; Detail = "exit 127: $Script is missing in the distro" } }
+    return [pscustomobject]@{ Ok = $false; Detail = "exit $Exit from $Script" }
+}
+
 function Ensure-MiosBuilder([string]$Machine, [hashtable]$Hardware) {
     $registered = @(& wsl.exe --list --quiet 2>$null) |
         ForEach-Object { ($_ -replace [char]0, '').Trim() } | Where-Object { $_ }
@@ -2512,11 +2520,13 @@ echo "[mios-overlay] manual refresh: sudo mios-dev-seed"
              "cp '$tomlWslPath' /tmp/mios.toml; " +
              "/tmp/mios-overlay.sh"
     & wsl.exe -d $wslDistro --exec bash -c $stage 2>&1 | ForEach-Object { Write-Log "overlay-seed: $_" }
-    if ($LASTEXITCODE -ne 0) {
-        Log-Warn "overlay seed exited rc=$LASTEXITCODE -- partial install possible (packages may still be present; rerun safe)"
-    } else {
-        Log-Ok "MiOS package overlay seeded into $DevDistro"
+    $seedRc = $LASTEXITCODE
+    # A non-zero exit is a failure: the package layer MiOS-DEV builds with is incomplete, whatever a rerun might do.
+    if ($seedRc -ne 0) {
+        Log-Fail "MiOS package overlay failed (rc=$seedRc) in $DevDistro; see the overlay-seed lines above."
+        throw "MiOS package overlay failed (rc=$seedRc)"
     }
+    Log-Ok "MiOS package overlay seeded into $DevDistro"
 }
 
 function Invoke-MiosQuadletOverlay {
@@ -7296,14 +7306,16 @@ $miosRepo = $MiosRepoDir
         if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
             $PSNativeCommandUseErrorActionPreference = $false
         }
-        $_nvOut = & wsl.exe -d $_wslDistroForTerm --user root -- bash /usr/libexec/mios/install-nvidia-wsl-userland.sh 2>&1
-        $_nvExit = $LASTEXITCODE
-        if ($_nvExit -eq 0) {
+        $_nvScript = '/usr/libexec/mios/install-nvidia-wsl-userland.sh'
+        $_nvOut = & wsl.exe -d $_wslDistroForTerm --user root -- bash $_nvScript 2>&1
+        $_nvVerdict = Get-MiosDistroStepVerdict -Exit $LASTEXITCODE -Script $_nvScript
+        $_nvOut | ForEach-Object { Write-Log "nvidia-wsl: $_" }
+        if ($_nvVerdict.Ok) {
             $_nvSummary = ($_nvOut | Where-Object { $_ -match '^\s*\[(ok|skip|warn)\]' } | Select-Object -Last 3) -join ' / '
             if (-not $_nvSummary) { $_nvSummary = '(silent - see install log if needed)' }
             Log-Ok "NVIDIA WSL userland: $_nvSummary"
         } else {
-            Log-Warn "NVIDIA WSL userland install exit=$_nvExit; GUI apps may fall back to dzn-only Vulkan path"
+            Log-Warn "NVIDIA WSL userland not installed ($($_nvVerdict.Detail)); GUI apps may fall back to dzn-only Vulkan path"
         }
     }
 
@@ -7580,10 +7592,13 @@ exit 0
         if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
             $PSNativeCommandUseErrorActionPreference = $false
         }
-        $_aiOut = & wsl.exe -d $_wslDistroForTerm --user root -- bash /usr/libexec/mios/install-ai-clis.sh 2>&1
+        $_aiScript = '/usr/libexec/mios/install-ai-clis.sh'
+        $_aiOut = & wsl.exe -d $_wslDistroForTerm --user root -- bash $_aiScript 2>&1
+        $_aiVerdict = Get-MiosDistroStepVerdict -Exit $LASTEXITCODE -Script $_aiScript
         $_aiOut | ForEach-Object { Write-Log "mios-ai-cli: $_" }
+        if ($_aiVerdict.Ok) { Log-Ok "MiOS AI CLIs installed (claude + gemini available on PATH)" }
+        else { Log-Warn "MiOS AI CLIs not installed ($($_aiVerdict.Detail))" }
     }
-    Log-Ok "MiOS AI CLIs installed (claude + gemini available on PATH)"
 
     Set-Step "Reconciling mios home ownership + locale in $_wslDistroForTerm..."
     & {

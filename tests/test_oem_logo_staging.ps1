@@ -1,7 +1,7 @@
 # Source-only fixtures: AST-extracted functions, mocked vendor fetches, scratch writes only.
 # No entry script runs; registry cmdlets are always shadowed.
 [CmdletBinding()]
-param([switch]$PlantDefect, [switch]$SkipWindows)
+param([switch]$PlantDefect, [switch]$SkipWindows, [switch]$Elevated)
 $ErrorActionPreference = 'Stop'
 if ($env:OS -ne 'Windows_NT' -and -not $SkipWindows) { throw 'Use -SkipWindows for portable source fixtures; Windows API and command-parser checks will remain UNRUN.' }
 Write-Host 'SOURCE_FIXTURE_UNRUN LIVE_REGISTRY LIVE_ELEVATION LIVE_FETCH OEM_LIVE_ACL_WRITE'
@@ -199,7 +199,7 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     $script:fail = 0; $script:checks = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
     $libAst = Import-MiosFunctions $LibPath @('Find-MiosTomlMultilineEnd', 'ConvertFrom-MiosTomlFile', 'Get-MiOSVendorBytes', 'Invoke-MiOSVendorFetch',
         'Get-MiOSVendorSource', 'Resolve-MiOSVendorCommit', 'Get-MiOSOemLogoTargetGap', 'Assert-MiOSOemLogoBitmap', 'Install-MiOSOemLogo',
-        'Get-MiOSOemLogoSystemRoot', 'Assert-MiOSOemLogoAcl', 'Assert-MiOSOemLogoWritePath', 'Set-MiOSOemLogoStreamAcl',
+        'Get-MiOSOemLogoSystemRoot', 'Assert-MiOSOemLogoAcl', 'Assert-MiOSOemLogoWritePath', 'Set-MiOSOemLogoStreamAcl', 'Open-MiOSOemLogoTempStream',
         'Get-MiOSOemLogoBinding', 'Test-MiOSOemLogoEvidence', 'New-MiOSOemLogoCommands', 'New-MiOSBrandingCommands', 'New-MiOSProvisionCommands', 'Invoke-MiOSHostCommands')
     $null = Import-MiosFunctions $realUnattend @('ConvertTo-UnattendPassword', 'New-MiOSAutounattendXml') -OnlyRequired
     # The spec-driven preference group is out of scope here and needs keys this fixture does not carry.
@@ -377,9 +377,16 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     $stageText = $stageAst.Extent.Text
     Check ($stageText.Contains('ConvertFrom-MiosTomlFile -ContentBytes $vendorBytes -ProjectedCredentials') -and -not $stageText.Contains('mios-vendor-')) 'vendor parsing consumes fetched bytes without a shared temporary path'
     $writeCalls = @($stageAst.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Assert-MiOSOemLogoWritePath' }, $true))
-    Check ($writeCalls.Count -eq 2 -and $writeCalls[0].Extent.StartOffset -lt $stageText.IndexOf('[IO.FileStream]::new') + $stageAst.Extent.StartOffset) 'staging checks its write boundary before temp creation and again before commit'
+    $tempAt = $stageText.IndexOf('$stream = Open-MiOSOemLogoTempStream -Path $tmp')
+    Check ($writeCalls.Count -eq 2 -and $tempAt -ge 0 -and $writeCalls[0].Extent.StartOffset -lt $tempAt + $stageAst.Extent.StartOffset) 'staging checks its write boundary before temp creation and again before commit'
     $aclCall = $stageText.IndexOf('Set-MiOSOemLogoStreamAcl -Stream $stream'); $writeCall = $stageText.IndexOf('$stream.Write($bmp')
     Check ($aclCall -ge 0 -and $aclCall -lt $writeCall) 'live staging protects the temp handle ACL before writing bytes'
+    # A descriptor set through a handle needs WRITE_DAC and READ_CONTROL on it (WRITE_OWNER for the live owner); a FileAccess.Write
+    # handle has neither, so every Windows staging attempt would warn and skip, elevated or not.
+    $tempOpen = @($libAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Open-MiOSOemLogoTempStream' }, $true))[0].Extent.Text
+    Check ($stageText.Contains('$stream = Open-MiOSOemLogoTempStream -Path $tmp -Owner:(-not $DestinationPath)') -and -not $stageText.Contains('[IO.FileAccess]::Write') -and
+           $tempOpen.Contains('[Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::ReadPermissions') -and
+           $tempOpen.Contains('if ($Owner) { $rights = $rights -bor [Security.AccessControl.FileSystemRights]::TakeOwnership }')) 'the staging temp handle carries the rights its descriptor needs'
 
     # --- Branding emits Logo only from evidence; otherwise the guarded removal ---------
     $view = New-View
@@ -514,7 +521,40 @@ function Invoke-Checks([string]$LibPath, [string]$ProvisionPath, [switch]$SkipNa
     return $script:fail
 }
 
+function Invoke-ElevatedStreamChecks {
+    # Live-shape descriptor proof, scratch only (never C:\Windows): elevation does not let a FileAccess.Write handle carry the
+    # live descriptor, while the staging handle writes the bytes under exactly the protected live descriptor.
+    $script:fail = 0; $script:checks = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
+    if ($env:OS -ne 'Windows_NT' -or -not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw '-Elevated must run in an elevated Windows session.'
+    }
+    $null = Import-MiosFunctions $realLib @('Set-MiOSOemLogoStreamAcl', 'Open-MiOSOemLogoTempStream', 'Assert-MiOSOemLogoAcl') -OnlyRequired
+    $bytes = New-FixtureBmp -Seed 7
+    $old = Join-Path $scratch 'old-shape.tmp'; $refused = $false
+    $s = [IO.FileStream]::new($old, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { Set-MiOSOemLogoStreamAcl -Stream $s } catch { $refused = $true; Write-Host "    (old shape: $($_.Exception.Message))" } finally { $s.Dispose() }
+    Check $refused 'an elevated FileAccess.Write handle cannot carry the live logo descriptor'
+    $new = Join-Path $scratch 'live-shape.tmp'
+    $s = Open-MiOSOemLogoTempStream -Path $new -Owner
+    try { Set-MiOSOemLogoStreamAcl -Stream $s; $s.Write($bytes, 0, $bytes.Length); $s.Flush($true) } finally { $s.Dispose() }
+    $raw = [Security.AccessControl.RawSecurityDescriptor]::new((Get-Acl -LiteralPath $new).GetSecurityDescriptorBinaryForm(), 0)
+    $aces = @(@($raw.DiscretionaryAcl) | ForEach-Object { '{0}|0x{1:x}|{2}' -f $_.SecurityIdentifier.Value, $_.AccessMask, [int]$_.AceFlags } | Sort-Object)
+    $want = @('S-1-5-18|0x1f01ff|0', 'S-1-5-32-544|0x1f01ff|0', 'S-1-5-32-545|0x1200a9|0') | Sort-Object
+    Write-Host "    (live shape: $($raw.GetSddlForm([Security.AccessControl.AccessControlSections]'Owner, Access')))"
+    Check ($raw.Owner.Value -eq 'S-1-5-32-544' -and ([int]$raw.ControlFlags -band 0x1000) -and ($aces -join ';') -ceq ($want -join ';')) 'the staging handle sets exactly the protected live descriptor, owned by Administrators'
+    Check (Test-SameBytes ([IO.File]::ReadAllBytes($new)) $bytes) 'the staged bytes are written after the descriptor'
+    $policy = ''; try { Assert-MiOSOemLogoAcl -Path $new } catch { $policy = $_.Exception.Message }
+    Check ($policy -eq '') 'the staged file passes the live destination ACL policy'
+    Write-Host "OEM_ELEVATED_ASSERTIONS $($script:checks)"
+    return $script:fail
+}
+
 try {
+    if ($Elevated) {
+        $failures = Invoke-ElevatedStreamChecks
+        if ($failures) { Write-Host "RESULT: FAIL ($failures checks)"; exit 1 }
+        Write-Host 'RESULT: PASS (elevated live-shape staging descriptor, scratch only)'; exit 0
+    }
     if (-not $PlantDefect) {
         $failures = Invoke-Checks $realLib $realProvision -SkipWindows:$SkipWindows
         if ($failures) { Write-Host "RESULT: FAIL ($failures checks)"; exit 1 }
@@ -526,6 +566,9 @@ try {
     $baseline = Invoke-Checks $realLib $realProvision -SkipWindows:$SkipWindows
     if ($baseline) { Write-Host 'SOURCE_DEFECT_BASELINE_FAILED'; exit 1 }
     $plants = @(
+        @{ Name = 'staging temp opened write-only'; File = 'lib'; Expected = 'the staging temp handle carries the rights its descriptor needs'; From = '$stream = Open-MiOSOemLogoTempStream -Path $tmp -Owner:(-not $DestinationPath)'; To = '$stream = [IO.FileStream]::new($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)' },
+        @{ Name = 'staging handle without descriptor rights'; File = 'lib'; Expected = 'the staging temp handle carries the rights its descriptor needs'; From = ' -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::ReadPermissions'; To = '' },
+        @{ Name = 'live staging handle without owner right'; File = 'lib'; Expected = 'the staging temp handle carries the rights its descriptor needs'; From = 'if ($Owner) { $rights = $rights -bor [Security.AccessControl.FileSystemRights]::TakeOwnership }'; To = '' },
         @{ Name = 'sha256 check removed'; File = 'lib'; Expected = 'refuses a sidecar sha256 that does not match the bitmap'; From = 'if ($actual -cne [string]$sidecar.sha256)'; To = 'if ($false)' },
         @{ Name = 'size check removed'; File = 'lib'; Expected = 'refuses a sidecar size that does not match the bitmap'; From = ' -or $sidecar.size -ne $bmp.Length)'; To = ')' },
         @{ Name = '32bpp header check removed'; File = 'lib'; Expected = 'refuses a non-32bpp bitmap'; From = '[BitConverter]::ToUInt16($Bytes, 28) -ne 32'; To = '[BitConverter]::ToUInt16($Bytes, 28) -eq 0' },

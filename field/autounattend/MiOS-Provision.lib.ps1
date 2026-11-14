@@ -973,6 +973,24 @@ function Set-MiOSOemLogoStreamAcl {
     if ($Stream.PSObject.Methods.Name -contains 'SetAccessControl') { $Stream.SetAccessControl($acl) }
     else { [IO.FileSystemAclExtensions]::SetAccessControl($Stream, $acl) }
 }
+function Open-MiOSOemLogoTempStream {
+    # Exclusive CreateNew handle for the staging temp file. Its descriptor is set through this handle before any byte is written,
+    # and setting a descriptor through a handle needs WRITE_DAC and READ_CONTROL on it (WRITE_OWNER to set the live owner).
+    # A FileAccess.Write handle has neither, so SetAccessControl through it is refused even in an elevated session.
+    param([Parameter(Mandatory)][string]$Path, [switch]$Owner)
+    $ErrorActionPreference = 'Stop'
+    if ($env:OS -ne 'Windows_NT') { return [IO.FileStream]::new($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None) }
+    [Security.AccessControl.FileSystemRights]$rights = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::ReadPermissions
+    if ($Owner) { $rights = $rights -bor [Security.AccessControl.FileSystemRights]::TakeOwnership }
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        return [IO.FileStream]::new($Path, [IO.FileMode]::CreateNew, $rights, [IO.FileShare]::None, 4096, [IO.FileOptions]::None)
+    }
+    $method = @([IO.FileSystemAclExtensions].GetMethods() | Where-Object { $_.Name -eq 'Create' -and $_.GetParameters().Count -eq 7 -and
+        $_.GetParameters()[0].ParameterType -eq [IO.FileInfo] -and $_.GetParameters()[6].ParameterType -eq [Security.AccessControl.FileSecurity] }) | Select-Object -First 1
+    if (-not $method) { throw 'an exclusive staging handle with descriptor access is unavailable' }
+    return $method.Invoke($null, [object[]]@(([IO.FileInfo]::new($Path)).psobject.BaseObject, [IO.FileMode]::CreateNew, $rights,
+        [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $null))
+}
 function Get-MiOSOemLogoBinding {
     # Length-prefixed fields bind an in-process receipt to the effective inputs used when staging.
     param($Toml, [string]$BackgroundKey)
@@ -1075,7 +1093,7 @@ function Install-MiOSOemLogo {
         Assert-MiOSOemLogoWritePath -Path $dest -Fixture:([bool]$DestinationPath)
         $dir = [IO.Path]::GetDirectoryName($dest)
         $tmp = [IO.Path]::Combine($dir, '.mios-oem-logo-' + [Guid]::NewGuid().ToString('N') + '.tmp')
-        $stream = [IO.FileStream]::new($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $stream = Open-MiOSOemLogoTempStream -Path $tmp -Owner:(-not $DestinationPath)
         try {
             if (-not $DestinationPath) { Set-MiOSOemLogoStreamAcl -Stream $stream }
             else { Set-MiOSPrivateStream -Stream $stream }

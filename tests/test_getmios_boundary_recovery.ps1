@@ -103,6 +103,20 @@ function Invoke-SourceChecks([string]$Path) {
     Check ($inherit.Count -eq 1 -and $inherit[0].Extent.StartOffset -gt $set[0].Extent.StartOffset) 'leaf descendants are re-inherited after the descriptor change'
     $descend = Get-Calls $invoke 'Get-MiosBoundaryDescendants'
     Check ($descend.Count -eq 1 -and $descend[0].Parent.Extent.Text -match '\|\s*Where-Object\s*\{\s*\$_\s+-notin\s+\$planned\s*\}') 'a planned target below a leaf is its own step, not a leaf descendant'
+    $tomlBackup = Get-Function $ast 'Save-MiosTomlBackup'
+    Check ($tomlBackup.Extent.Text.Contains('Owner = $record.Owner; Sddl = $record.Sddl') -and
+        -not $invoke.Extent.Text.Contains('if (-not $plan.Count) { return $null }')) 'every TOML backup retains owner and descriptor and compliant runs write private metadata'
+    $restore = Get-Function $ast 'Restore-MiosMachineBoundary'
+    $restorePins = Get-Calls $restore 'Open-MiosBoundaryAncestors'
+    $restoreMembers = @($restore.FindAll({ param($n) $n -is [Management.Automation.Language.InvokeMemberExpressionAst] }, $true))
+    $restoreHashes = @($restoreMembers | Where-Object { $_.Member.Extent.Text -eq 'Sha256' })
+    $restoreSets = @($restoreMembers | Where-Object { $_.Member.Extent.Text -eq 'SetSddl' })
+    Check ($restorePins.Count -eq 1 -and $restoreHashes.Count -eq 2 -and $restoreSets.Count -eq 1 -and
+        $restoreHashes[1].Extent.StartOffset -lt $restoreSets[0].Extent.StartOffset -and
+        $restore.Extent.Text.Contains('$handle = $target.Handle') -and
+        $restore.Extent.Text.Contains('foreach ($target in $targets) { $target.Handle.Dispose() }')) 'restore retains ancestor and target handles and hashes through the apply handle'
+    Check ((Get-Function $ast 'Read-MiosBoundaryObject').Extent.Text.Contains('[MiosMachineBoundaryNative]::ReadBytes($handle)') -and
+        -not (Get-Function $ast 'Read-MiosBoundaryObject').Extent.Text.Contains('[IO.File]::ReadAllBytes')) 'boundary byte snapshots use their validated data handle'
     $worker = ''; try { $worker = Get-MiosMachineWorkerScript -Source $text } catch { }
     $missing = @($recoveryHelpers | Where-Object { $worker -notmatch ('(?m)^function ' + [regex]::Escape($_) + ' \{') })
     Check ($worker -and $missing.Count -eq 0) 'the elevated worker carries every recovery helper'
@@ -185,14 +199,17 @@ public static class MiosBoundaryFixtureOpen {
         }
         $tree = Join-Path $work 'tree'; New-Tree $tree
         $script:saves = 0; $script:tomlSaves = New-Object System.Collections.Generic.List[string]
-        function global:Save-MiosBoundaryBackup { $script:saves++; throw 'Fixture: no backup may be written in an unelevated check.' }
-        function global:Save-MiosTomlBackup { param($Path, $Role, $Directory) $script:tomlSaves.Add($Role); [pscustomobject]@{ Role = $Role } }
+        $script:compliantObjects = @()
+        function global:Save-MiosBoundaryBackup { param($Objects, $Tomls, $Directory, $Reason) $script:saves++; $script:compliantObjects = @($Objects); return 'fixture-private-run.json' }
+        function global:Save-MiosTomlBackup { param($Path, $Role, $Directory) $script:tomlSaves.Add($Role); Read-MiosBoundaryObject $Path }
         function global:Get-MiosMachineBoundaryGap { return '' }
         function global:Test-MiosElevated { return $true }
         $result = 'threw'; try { $result = Invoke-MiosMachineBoundaryRecovery -OriginSid $me -Root $tree } catch { Write-Host "    compliant run threw: $($_.Exception.Message)" }
-        Check ($null -eq $result -and $script:saves -eq 0) 'a run where every path already passes admission changes nothing'
+        Check ($result -eq 'fixture-private-run.json' -and $script:saves -eq 1 -and $script:compliantObjects.Count -eq 2 -and
+            @($script:compliantObjects | Where-Object { -not $_.Owner -or -not $_.Sddl }).Count -eq 0) 'a compliant run records both original descriptors before publication without ACL recovery'
         Check (($script:tomlSaves -join ',') -eq 'vendor,host') 'a compliant run still preserves both TOML files before any writer'
         $null = Import-Product $Path
+        $script:saves = 0
         $script:tomlSaves.Clear()
         function global:Save-MiosBoundaryBackup { $script:saves++; throw 'Fixture: no backup may be written in an unelevated check.' }
         function global:Save-MiosTomlBackup { param($Path, $Role, $Directory) $script:tomlSaves.Add($Role); throw 'Fixture: no TOML backup may be written in an unelevated check.' }
@@ -366,7 +383,8 @@ function Invoke-ElevatedChecks([string]$Root) {
     foreach ($t in @($doc.tomls)) {
         $leafOkToml = $false
         try { $null = Assert-MiosPrivateBackupLeaf ([string]$t.Backup); $leafOkToml = $true } catch { Write-Host "    toml leaf $($t.Backup): $($_.Exception.Message)" }
-        if (-not $leafOkToml -or [Convert]::ToBase64String([IO.File]::ReadAllBytes([string]$t.Backup)) -cne $tomlBytes[[string]$t.Path] -or
+        if (-not $leafOkToml -or $t.Owner -cne $orig[[string]$t.Path].Owner -or $t.Sddl -cne $orig[[string]$t.Path].Sddl -or
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes([string]$t.Backup)) -cne $tomlBytes[[string]$t.Path] -or
             (Split-Path -Leaf ([string]$t.Backup)) -cne ('{0}-{1}.toml' -f $t.Role, $t.Sha256) -or (Split-Path -Parent ([string]$t.Backup)) -ine $backupDir) { $tomlOk = $false }
     }
     Check ($tomlOk -and (@($doc.tomls | ForEach-Object { $_.Role }) -join ',') -eq 'vendor,host') 'both TOML files are preserved byte-exact in private content-addressed leaves'
@@ -374,8 +392,18 @@ function Invoke-ElevatedChecks([string]$Root) {
     $sids = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value })
     Check ($acl.AreAccessRulesProtected -and $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-32-544' -and
            @($sids | Where-Object { $_ -notin @('S-1-5-18', 'S-1-5-32-544') }).Count -eq 0) 'the backup leaf is private to SYSTEM and Administrators'
+    $compliantBefore = @{}; foreach ($p in $targets + $leafKids) { $compliantBefore[$p] = Read-MiosBoundaryObject $p }
     $again = Invoke-MiosMachineBoundaryRecovery -OriginSid $op -Root $tree -BackupDirectory $backupDir
-    Check ($null -eq $again -and @(Get-ChildItem -LiteralPath $backupDir -Filter '*.json').Count -eq 1 -and @(Get-ChildItem -LiteralPath $backupDir -Filter '*.toml').Count -eq 2) 'a second run changes nothing and writes no new backup'
+    $againDoc = [IO.File]::ReadAllText($again) | ConvertFrom-Json
+    $compliantUnchanged = $true
+    foreach ($p in $targets + $leafKids) {
+        $now = Read-MiosBoundaryObject $p
+        foreach ($field in 'Owner', 'Sddl', 'Volume', 'Index', 'Written', 'Size', 'Sha256') { if ($now.$field -cne $compliantBefore[$p].$field) { $compliantUnchanged = $false } }
+    }
+    Check ($again -ne $backup -and @(Get-ChildItem -LiteralPath $backupDir -Filter '*.json').Count -eq 2 -and
+        @(Get-ChildItem -LiteralPath $backupDir -Filter '*.toml').Count -eq 2 -and $compliantUnchanged) 'a compliant second run writes a private metadata record and reuses byte blobs without changing originals'
+    Check (@($againDoc.objects).Count -eq 2 -and @($againDoc.tomls).Count -eq 2 -and
+        @($againDoc.tomls | Where-Object { $_.Owner -cne $compliantBefore[[string]$_.Path].Owner -or $_.Sddl -cne $compliantBefore[[string]$_.Path].Sddl }).Count -eq 0) 'a compliant run preserves each TOML current original owner and descriptor'
     # Restore validates the backup leaf and every object before it changes anything.
     $usrRecovered = (Read-MiosBoundaryObject (Join-Path $tree 'usr')).Sddl
     $copied = Join-Path $Root 'copied-backup.json'; [IO.File]::Copy($backup, $copied)
@@ -388,6 +416,25 @@ function Invoke-ElevatedChecks([string]$Root) {
     Expect-ThrowMatch { Restore-MiosMachineBoundary -BackupPath $backup -BackupDirectory $backupDir } 'content changed since the backup' 'restore refuses to put an old descriptor on rewritten content'
     Check ((Read-MiosBoundaryObject (Join-Path $tree 'usr')).Sddl -ceq $usrRecovered) 'a refused restore changes no descriptor'
     [IO.File]::WriteAllBytes($vendorToml, $vendorBytes)
+    # Reproduce a write after the old preflight has accepted every file, before apply handles are acquired.
+    $script:restoreRacePath = $vendorToml; $script:restoreRaceInjected = $false
+    $script:restoreRaceAncestors = (Get-Command Open-MiosBoundaryAncestors).ScriptBlock
+    $beforeRace = @{}; foreach ($p in $targets + $leafKids) { $beforeRace[$p] = (Read-MiosBoundaryObject $p).Sddl }
+    function global:Open-MiosBoundaryAncestors {
+        param([string]$Path)
+        $held = @(& $script:restoreRaceAncestors $Path)
+        if (-not $script:restoreRaceInjected) {
+            [IO.File]::AppendAllText($script:restoreRacePath, "# written between restore validation and apply`n")
+            $script:restoreRaceInjected = $true
+        }
+        return $held
+    }
+    try {
+        Expect-ThrowMatch { Restore-MiosMachineBoundary -BackupPath $backup -BackupDirectory $backupDir } 'content changed since the backup' 'restore refuses an in-place mutation after initial validation before any ACL apply'
+        $raceUnchanged = $script:restoreRaceInjected
+        foreach ($p in $targets + $leafKids) { if ((Read-MiosBoundaryObject $p).Sddl -cne $beforeRace[$p]) { $raceUnchanged = $false } }
+        Check $raceUnchanged 'a mid-validation restore mutation changes no original descriptor'
+    } finally { $null = Import-Product $ProductPath; [IO.File]::WriteAllBytes($vendorToml, $vendorBytes) }
     Restore-MiosMachineBoundary -BackupPath $backup -BackupDirectory $backupDir
     $mismatch = @($targets + $leafKids | Where-Object { (Read-MiosBoundaryObject $_).Sddl -cne $orig[$_].Sddl })
     if ($mismatch.Count) { $mismatch | ForEach-Object { Write-Host "    restore mismatch $_`n      was $($orig[$_].Sddl)`n      now $((Read-MiosBoundaryObject $_).Sddl)" } }
@@ -431,6 +478,9 @@ if (-not $PlantDefect) {
 }
 $baseline = Invoke-SourceChecks $ProductPath
 if ($baseline) { throw 'BOUNDARY_RECOVERY_BASELINE_FAILED' }
+# Match the complete production call with or without an explicitly validated root; never leave trailing arguments in a plant.
+$recoveryPreparationCall = @([IO.File]::ReadAllLines($ProductPath) | Where-Object { $_ -match '^\s*\$null = Invoke-MiosMachineBoundaryRecovery -OriginSid' })
+if ($recoveryPreparationCall.Count -ne 1) { throw 'Missing or ambiguous preparation recovery call.' }
 $plants = @(
     @{ Name = 'shared self access writable'; Expected = 'a shared prefix keeps only trusted self access and every inheritable ACE as an InheritOnly template'; From = "@('S-1-5-32-545', 0x1200A9)"; To = "@('S-1-5-32-545', 0x1301BF)" },
     @{ Name = 'templates not InheritOnly'; Expected = 'a shared prefix keeps only trusted self access and every inheritable ACE as an InheritOnly template'; From = '(($flags -bor 0x08) -band (-bnot 0x10))'; To = '($flags -band (-bnot 0x10))' },
@@ -438,12 +488,12 @@ $plants = @(
     @{ Name = 'trusted owner replaced'; Expected = 'a SYSTEM or Administrators owner is kept'; From = "if (`$Owner -in @('S-1-5-18', 'S-1-5-32-544')) { return `$Owner }"; To = "if (`$Owner -in @('S-1-5-18', 'S-1-5-32-544')) { return 'S-1-5-32-544' }" },
     @{ Name = 'deny ACE accepted'; Expected = 'an explicit deny ACE is refused'; From = "-or [string]`$ace.AceQualifier -ne 'AccessAllowed' -or `$ace.IsCallback"; To = '-or $ace.IsCallback' },
     @{ Name = 'M: default scope'; Expected = 'recovery defaults to the system drive and never names M:'; From = "if (-not `$Root) { `$Root = if (`$env:SystemDrive) { `$env:SystemDrive } else { 'C:' } }"; To = "if (-not `$Root) { `$Root = 'M:' }" },
-    @{ Name = 'recovery removed from preparation'; Expected = 'recovery runs after origin validation and before TOML publication, with the origin SID'; From = '    $null = Invoke-MiosMachineBoundaryRecovery -OriginSid ([string]$Context.Sid)'; To = '    $null = [string]$Context.Sid' },
+    @{ Name = 'recovery removed from preparation'; Expected = 'recovery runs after origin validation and before TOML publication, with the origin SID'; From = $recoveryPreparationCall[0]; To = '    $null = [string]$Context.Sid' },
     @{ Name = 'host tier rewrites existing parents'; Expected = 'host-tier directories use strict admission or atomic protected creation'; From = 'if (Test-Path -LiteralPath $d) { Assert-MiosMachineWriteBoundary $d } else { New-MiosProtectedMachineDirectory $d }'; To = 'if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -ErrorAction Stop | Out-Null }; Set-MiosHostTierAcl $d' },
     @{ Name = 'backup skipped'; Expected = 'recovery validates policy and owners and backs up TOML bytes and descriptors before changing any descriptor'; From = '$backup = Save-MiosBoundaryBackup -Objects'; To = '$backup = Write-Output -InputObject' },
     @{ Name = 'ancestors not pinned'; Expected = 'every repair pins its ancestors first'; From = '$pins = @(Open-MiosBoundaryAncestors $step.Path)'; To = '$pins = @()' },
     @{ Name = 'write handle shares write'; Expected = 'a recovery write handle denies a concurrent data write'; From = 'write ? 1u : 7u'; To = '7u'; Native = $true },
-    @{ Name = 'write handle without data access'; Expected = 'a recovery write handle denies a concurrent data write'; From = '(write ? (0x1u | 0x40000u | 0x80000u) : 0u)'; To = '(write ? (0x40000u | 0x80000u) : 0u)'; Native = $true },
+    @{ Name = 'write handle without data access'; Expected = 'a recovery write handle denies a concurrent data write'; From = '(write ? (0x1u | 0x40000u | 0x80000u) : 0x1u)'; To = '(write ? (0x40000u | 0x80000u) : 0x1u)'; Native = $true },
     @{ Name = 'ancestor pin shares delete'; Expected = 'pinned ancestors deny a concurrent delete open'; From = 'CreateFileW(path, 0x1u | 0x20000u | 0x80u, 1u,'; To = 'CreateFileW(path, 0x1u | 0x20000u | 0x80u, 5u,'; Native = $true },
     @{ Name = 'ancestor pin without data access'; Expected = 'pinned ancestors cannot be renamed during a repair'; From = 'CreateFileW(path, 0x1u | 0x20000u | 0x80u, 1u,'; To = 'CreateFileW(path, 0x20000u | 0x80u, 1u,'; Native = $true },
     @{ Name = 'ancestor pin shares write'; Expected = 'pinned ancestors deny a concurrent writer and release it afterwards'; From = 'CreateFileW(path, 0x1u | 0x20000u | 0x80u, 1u,'; To = 'CreateFileW(path, 0x1u | 0x20000u | 0x80u, 3u,'; Native = $true },
@@ -460,7 +510,9 @@ $plants = @(
     @{ Name = 'descendant reparse check removed'; Expected = 'a junction below a leaf is refused'; From = 'if ($attributes -band [IO.FileAttributes]::ReparsePoint) { throw'; To = 'if ($false) { throw' },
     @{ Name = 'descendant bound removed'; Expected = 'the descendant guard is bounded'; From = 'if ($found.Count -ge $Limit) {'; To = 'if ($false) {' },
     @{ Name = 'elevation check removed'; Expected = 'an unelevated run refuses recovery'; From = 'if (-not (Test-MiosElevated)) { throw "Boundary recovery requires'; To = 'if ($false) { throw "Boundary recovery requires' },
-    @{ Name = 'compliant run not skipped'; Expected = 'a run where every path already passes admission changes nothing'; From = 'if (-not $plan.Count) { return $null }'; To = '' },
+    @{ Name = 'compliant run JSON skipped'; Expected = 'every TOML backup retains owner and descriptor and compliant runs write private metadata'; From = '$reason = if ($plan.Count)'; To = 'if (-not $plan.Count) { return $null }; $reason = if ($plan.Count)' },
+    @{ Name = 'TOML original descriptor dropped'; Expected = 'every TOML backup retains owner and descriptor and compliant runs write private metadata'; From = 'Owner = $record.Owner; Sddl = $record.Sddl'; To = 'Owner = $record.Owner; Sddl = $null' },
+    @{ Name = 'restore apply hash omitted'; Expected = 'restore retains ancestor and target handles and hashes through the apply handle'; From = "if (`$object.Kind -eq 'file' -and [MiosMachineBoundaryNative]::Sha256(`$handle) -cne [string]`$object.Sha256)"; To = 'if ($false)' },
     @{ Name = 'admission weakened'; Expected = 'admission helper Assert-MiosMachineWriteBoundary is unchanged from its reviewed source'; From = "if (`$owner -notin `$trusted) { throw 'An existing machine TOML path has an untrusted owner.' }"; To = '' },
     @{ Name = 'worker lacks a helper'; Expected = 'worker extraction resolves every helper the recovery calls'; From = "'Assert-MiosBoundaryAcePolicy', 'New-MiosSharedPrefixSddl', 'New-MiosLeafSddl', 'Open-MiosBoundaryAncestors',"; To = "'Assert-MiosBoundaryAcePolicy', 'New-MiosSharedPrefixSddl', 'New-MiosLeafSddl'," },
     @{ Name = 'planned target kept as a leaf descendant'; Expected = 'a planned target below a leaf is its own step, not a leaf descendant'; From = 'Get-MiosBoundaryDescendants $step.Path | Where-Object { $_ -notin $planned } |'; To = 'Get-MiosBoundaryDescendants $step.Path |' },

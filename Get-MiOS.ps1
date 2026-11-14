@@ -894,6 +894,9 @@ public static class MiosMachineBoundaryNative {
     static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TOKEN_PRIVILEGES state, uint length, IntPtr previous, IntPtr returnLength);
     [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool DuplicateHandle(IntPtr sourceProcess, SafeFileHandle source, IntPtr targetProcess, out SafeFileHandle target,
+        uint access, bool inherit, uint options);
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct FINDSTREAM { public long Size; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 296)] public string Name; }
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr FindFirstStreamW(string path, int level, out FINDSTREAM data, uint flags);
@@ -943,14 +946,39 @@ public static class MiosMachineBoundaryNative {
             if (result != 0) { throw new Win32Exception((int)result); }
         } finally { LocalFree(descriptor); }
     }
-    // READ_CONTROL | FILE_READ_ATTRIBUTES (+ FILE_READ_DATA | WRITE_DAC | WRITE_OWNER); OPEN_EXISTING; BACKUP_SEMANTICS | OPEN_REPARSE_POINT.
+    // READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_READ_DATA (+ WRITE_DAC | WRITE_OWNER); OPEN_EXISTING; BACKUP_SEMANTICS | OPEN_REPARSE_POINT.
     // A write handle shares read only, so no one else may write or delete the object while it is held. Windows enforces
     // share modes only for handles with data access, so the write handle carries FILE_READ_DATA (FILE_LIST_DIRECTORY).
     public static SafeFileHandle Open(string path, bool write) {
-        uint access = 0x20000u | 0x80u | (write ? (0x1u | 0x40000u | 0x80000u) : 0u);
+        uint access = 0x20000u | 0x80u | (write ? (0x1u | 0x40000u | 0x80000u) : 0x1u);
         SafeFileHandle handle = CreateFileW(path, access, write ? 1u : 7u, IntPtr.Zero, 3u, 0x02000000u | 0x00200000u, IntPtr.Zero);
         if (handle.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot open " + path); }
         return handle;
+    }
+    // Duplicate the already-validated data handle; never reopen a file by path. Disposing the stream closes only the duplicate,
+    // so the caller retains the original share-read-only handle through validation and SetSecurityInfo.
+    static System.IO.FileStream DataStream(SafeFileHandle handle) {
+        SafeFileHandle copy;
+        IntPtr process = GetCurrentProcess();
+        if (!DuplicateHandle(process, handle, process, out copy, 0u, false, 0x2u)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        System.IO.FileStream stream = null;
+        try {
+            stream = new System.IO.FileStream(copy, System.IO.FileAccess.Read);
+            stream.Position = 0;
+            return stream;
+        } catch { if (stream != null) { stream.Dispose(); } else { copy.Dispose(); } throw; }
+    }
+    public static byte[] ReadBytes(SafeFileHandle handle) {
+        using (System.IO.FileStream stream = DataStream(handle)) {
+            using (System.IO.MemoryStream bytes = new System.IO.MemoryStream()) { stream.CopyTo(bytes); return bytes.ToArray(); }
+        }
+    }
+    public static string Sha256(SafeFileHandle handle) {
+        using (System.IO.FileStream stream = DataStream(handle)) {
+            using (System.Security.Cryptography.SHA256 hash = System.Security.Cryptography.SHA256.Create()) {
+                return BitConverter.ToString(hash.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+            }
+        }
     }
     // An ancestor pin (FILE_LIST_DIRECTORY, so its share mode is enforced) shares read only: while it is held no one
     // else may open the directory to write, rename or remove it.
@@ -1020,6 +1048,7 @@ function Read-MiosBoundaryObject {
     param([Parameter(Mandatory)][string]$Path, [switch]$WithBytes, [switch]$Lenient)
     $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
     $handle = [MiosMachineBoundaryNative]::Open($full, $false)
+    $sha = ''; $bytes = $null
     try {
         $info = [MiosMachineBoundaryNative]::Info($handle)
         $isReparse = [bool]($info.Attributes -band 0x400)
@@ -1031,14 +1060,18 @@ function Read-MiosBoundaryObject {
             if (-not $isDirectory -and $info.Links -ne 1) { throw "Boundary recovery refuses a hard-linked file: $full" }
         }
         $sddl = [MiosMachineBoundaryNative]::GetSddl($handle)
+        if (-not $isDirectory -and -not $isReparse) {
+            $content = [MiosMachineBoundaryNative]::ReadBytes($handle)
+            $hasher = [Security.Cryptography.SHA256]::Create()
+            try { $sha = [BitConverter]::ToString($hasher.ComputeHash($content)).Replace('-', '').ToLowerInvariant() } finally { $hasher.Dispose() }
+            if ($WithBytes) { $bytes = [Convert]::ToBase64String($content) }
+            $afterRead = [MiosMachineBoundaryNative]::Info($handle)
+            foreach ($field in 'Attributes', 'Links', 'Volume', 'Index', 'Created', 'Written', 'Size') {
+                if ($afterRead.$field -ne $info.$field) { throw "Boundary recovery object changed while its bytes were read: $full" }
+            }
+            if ([MiosMachineBoundaryNative]::GetSddl($handle) -cne $sddl) { throw "Boundary recovery descriptor changed while its bytes were read: $full" }
+        }
     } finally { $handle.Dispose() }
-    $sha = ''; $bytes = $null
-    if (-not $isDirectory -and -not $isReparse) {
-        $content = [IO.File]::ReadAllBytes($full)
-        $hasher = [Security.Cryptography.SHA256]::Create()
-        try { $sha = [BitConverter]::ToString($hasher.ComputeHash($content)).Replace('-', '').ToLowerInvariant() } finally { $hasher.Dispose() }
-        if ($WithBytes) { $bytes = [Convert]::ToBase64String($content) }
-    }
     $record = [ordered]@{
         Path = $full; Kind = $(if ($isDirectory) { 'directory' } else { 'file' })
         Owner = (New-Object Security.AccessControl.RawSecurityDescriptor $sddl).Owner.Value; Sddl = $sddl
@@ -1240,8 +1273,15 @@ function Save-MiosTomlBackup {
         if ((Assert-MiosPrivateBackupLeaf $leaf).Sha256 -ne $record.Sha256) { throw "A MiOS TOML backup does not hold the bytes its name records: $leaf" }
     } else { Write-MiosPrivateMachineFile -Path $leaf -Bytes ([Convert]::FromBase64String([string]$record.Bytes)) }
     $now = Read-MiosBoundaryObject $Path
-    if ($now.Sha256 -ne $record.Sha256 -or $now.Index -ne $record.Index -or $now.Volume -ne $record.Volume) { throw "Boundary recovery TOML changed while it was backed up: $Path" }
-    return [pscustomobject][ordered]@{ Path = $record.Path; Role = $Role; Sha256 = $record.Sha256; Size = $record.Size; Volume = $record.Volume; Index = $record.Index; Backup = $leaf }
+    foreach ($field in 'Owner', 'Sddl', 'Volume', 'Index', 'Sha256', 'Size', 'Written') {
+        if ($now.$field -cne $record.$field) { throw "Boundary recovery TOML changed while it was backed up: $Path" }
+    }
+    # Per-run descriptor provenance is independent of deduplicated content leaves: a compliant file can still be rewritten next.
+    return [pscustomobject][ordered]@{
+        Path = $record.Path; Role = $Role; Kind = $record.Kind; Owner = $record.Owner; Sddl = $record.Sddl
+        Attributes = $record.Attributes; Links = $record.Links; Volume = $record.Volume; Index = $record.Index
+        Created = $record.Created; Written = $record.Written; Sha256 = $record.Sha256; Size = $record.Size; Backup = $leaf
+    }
 }
 
 function Save-MiosBoundaryBackup {
@@ -1257,8 +1297,9 @@ function Save-MiosBoundaryBackup {
 }
 
 function Invoke-MiosMachineBoundaryRecovery {
-    # Explicit recovery of the existing MiOS boundary on the system drive only, after origin validation and before any TOML write.
-    # Both TOML files are first preserved byte-exact in private leaves on every run, even when every path already passes admission.
+    # Explicit recovery after origin validation and before any TOML write. Production orchestration supplies only the system root
+    # and an explicitly selected existing host-storage root; direct use defaults to SystemDrive. There is no drive discovery.
+    # Both TOML files' bytes and original descriptors are preserved privately on every run, even when admission already passes.
     # Admission (Assert-MiosMachineWriteBoundary) is unchanged and decides afterwards; no descriptor changes when every path passes.
     param([Parameter(Mandatory)][string]$OriginSid, [string]$Root, [string]$BackupDirectory)
     if (-not $Root) { $Root = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' } }
@@ -1347,9 +1388,17 @@ function Invoke-MiosMachineBoundaryRecovery {
         foreach ($o in @($record) + $children) { if (-not @($objects | Where-Object { $_.Path -eq $o.Path }).Count) { $objects.Add($o) } }
     }
     $tomls = @(foreach ($t in $tomlItems) { Save-MiosTomlBackup -Path (Join-Path $Root $t[0]) -Role $t[1] -Directory $BackupDirectory })
-    if (-not $plan.Count) { return $null }
+    foreach ($toml in $tomls) {
+        $existing = @($objects | Where-Object { $_.Path -eq $toml.Path })
+        if ($existing.Count) {
+            foreach ($field in 'Owner', 'Sddl', 'Volume', 'Index', 'Sha256') {
+                if ($existing[0].$field -cne $toml.$field) { throw "Boundary recovery TOML changed between planning and its backup: $($toml.Path)" }
+            }
+        } else { $objects.Add($toml) }
+    }
+    $reason = if ($plan.Count) { ($plan | ForEach-Object { "$($_.Path) [$($_.Policy)]: $($_.Gap)" }) -join '; ' } else { 'Preserve original TOMLs before publication; no ACL recovery required' }
     $backup = Save-MiosBoundaryBackup -Objects $objects.ToArray() -Tomls $tomls -Directory $BackupDirectory `
-        -Reason (($plan | ForEach-Object { "$($_.Path) [$($_.Policy)]: $($_.Gap)" }) -join '; ')
+        -Reason $reason
     foreach ($step in $plan) {
         $pins = @(Open-MiosBoundaryAncestors $step.Path)
         try {
@@ -1393,7 +1442,8 @@ function Invoke-MiosMachineBoundaryRecovery {
         }
     }
     if ($problems.Count) { throw "Boundary recovery could not be verified ($($problems -join '; ')); original descriptors are in $backup and TOML bytes in $BackupDirectory" }
-    Write-Host "  [+] Recovered the MiOS machine boundary ($($plan.Count) path(s)); originals: $backup" -ForegroundColor DarkGray
+    if ($plan.Count) { Write-Host "  [+] Recovered the MiOS machine boundary ($($plan.Count) path(s)); originals: $backup" -ForegroundColor DarkGray }
+    else { Write-Host "  [+] Preserved the original MiOS TOMLs before publication; originals: $backup" -ForegroundColor DarkGray }
     return $backup
 }
 
@@ -1424,17 +1474,48 @@ function Restore-MiosMachineBoundary {
         }
     }
     [MiosMachineBoundaryNative]::EnablePrivilege('SeRestorePrivilege')
-    # Parents before children (stable by depth): an unprotected object recomputes its inherited ACEs from its already-restored parent.
-    $ordered = @(for ($i = 0; $i -lt $objects.Count; $i++) { [pscustomobject]@{ Depth = ([string]$objects[$i].Path).Split('\').Count; Order = $i; Object = $objects[$i] } }) |
-        Sort-Object Depth, Order | ForEach-Object { $_.Object }
-    foreach ($object in $ordered) {
-        $handle = [MiosMachineBoundaryNative]::Open([string]$object.Path, $true)
-        try {
+    # Retain every ancestor and target before restoring any parent ACL. Target handles have data access and share read only:
+    # no writer may enter between the content check and SetSddl, including while old writable parent descriptors are restored.
+    $pins = New-Object System.Collections.Generic.List[object]
+    $targets = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($object in $objects) {
+            foreach ($pin in @(Open-MiosBoundaryAncestors ([string]$object.Path))) { $pins.Add($pin) }
+            $handle = [MiosMachineBoundaryNative]::Open([string]$object.Path, $true)
+            $targets.Add([pscustomobject]@{ Object = $object; Handle = $handle })
             $now = [MiosMachineBoundaryNative]::Info($handle)
-            if ([string]$now.Volume -ne [string]$object.Volume -or ('{0:x16}' -f $now.Index) -ne [string]$object.Index -or ($now.Attributes -band 0x400) -or
+            $kind = if ($now.Attributes -band 0x10) { 'directory' } else { 'file' }
+            if ([string]$now.Volume -ne [string]$object.Volume -or ('{0:x16}' -f $now.Index) -ne [string]$object.Index -or
+                $kind -cne [string]$object.Kind -or ($now.Attributes -band 0x400) -or ($kind -eq 'file' -and $now.Links -ne 1) -or
                 [MiosMachineBoundaryNative]::FinalPath($handle).TrimEnd('\') -ine [string]$object.Path) { throw "Boundary restore target is not the recorded object: $($object.Path)" }
+            if ($kind -eq 'file' -and [MiosMachineBoundaryNative]::Sha256($handle) -cne [string]$object.Sha256) {
+                throw "Boundary restore refuses $($object.Path): its content changed since the backup, so its old descriptor is not re-applied"
+            }
+        }
+        foreach ($pin in $pins) {
+            $now = [MiosMachineBoundaryNative]::Info($pin.Handle)
+            if ([string]$now.Volume -ne $pin.Volume -or ('{0:x16}' -f $now.Index) -ne $pin.Index -or
+                -not ($now.Attributes -band 0x10) -or ($now.Attributes -band 0x400) -or
+                [MiosMachineBoundaryNative]::FinalPath($pin.Handle).TrimEnd('\') -ine $pin.Path.TrimEnd('\')) { throw "Boundary restore ancestor changed: $($pin.Path)" }
+        }
+        # Parents before children (stable by depth); every handle and its ancestor pins stay held until all writes finish.
+        $ordered = @(for ($i = 0; $i -lt $targets.Count; $i++) {
+            [pscustomobject]@{ Depth = ([string]$targets[$i].Object.Path).Split('\').Count; Order = $i; Target = $targets[$i] }
+        }) | Sort-Object Depth, Order | ForEach-Object { $_.Target }
+        foreach ($target in $ordered) {
+            $object = $target.Object; $handle = $target.Handle
+            $now = [MiosMachineBoundaryNative]::Info($handle)
+            if ([string]$now.Volume -ne [string]$object.Volume -or ('{0:x16}' -f $now.Index) -ne [string]$object.Index -or
+                ($now.Attributes -band 0x400) -or ($object.Kind -eq 'file' -and $now.Links -ne 1) -or
+                [MiosMachineBoundaryNative]::FinalPath($handle).TrimEnd('\') -ine [string]$object.Path) { throw "Boundary restore target changed before apply: $($object.Path)" }
+            if ($object.Kind -eq 'file' -and [MiosMachineBoundaryNative]::Sha256($handle) -cne [string]$object.Sha256) {
+                throw "Boundary restore refuses $($object.Path): its content changed since the backup, so its old descriptor is not re-applied"
+            }
             [MiosMachineBoundaryNative]::SetSddl($handle, [string]$object.Sddl)
-        } finally { $handle.Dispose() }
+        }
+    } finally {
+        foreach ($target in $targets) { $target.Handle.Dispose() }
+        foreach ($pin in $pins) { $pin.Handle.Dispose() }
     }
 }
 

@@ -1,8 +1,10 @@
 # AI-hint: Exercise the real bootstrap failure trap with synthetic early failures; never execute installer or machine-preparation code.
 # AI-related: Get-MiOS.ps1, tests/test_getmios_web_entry.ps1
 [CmdletBinding()]
-param([string]$SourcePath = (Join-Path (Split-Path $PSScriptRoot -Parent) 'Get-MiOS.ps1'))
+param([string]$SourcePath)
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty inside param defaults; resolve the default after binding.
+if (-not $SourcePath) { $SourcePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Get-MiOS.ps1' }
 $source = [IO.File]::ReadAllText($SourcePath)
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)

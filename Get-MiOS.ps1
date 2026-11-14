@@ -894,7 +894,29 @@ public static class MiosMachineBoundaryNative {
     static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TOKEN_PRIVILEGES state, uint length, IntPtr previous, IntPtr returnLength);
     [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct FINDSTREAM { public long Size; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 296)] public string Name; }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr FindFirstStreamW(string path, int level, out FINDSTREAM data, uint flags);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool FindNextStreamW(IntPtr find, out FINDSTREAM data);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool FindClose(IntPtr find);
     const uint OwnerInfo = 0x1, DaclInfo = 0x4, ProtectedDacl = 0x80000000, UnprotectedDacl = 0x20000000;
+    // Every data stream of a file, the unnamed "::$DATA" included; ERROR_HANDLE_EOF (38) ends the list.
+    public static string[] Streams(string path) {
+        System.Collections.Generic.List<string> names = new System.Collections.Generic.List<string>();
+        FINDSTREAM data;
+        IntPtr find = FindFirstStreamW(path, 0, out data, 0u);
+        if (find == new IntPtr(-1)) {
+            int error = Marshal.GetLastWin32Error();
+            if (error == 38) { return names.ToArray(); }
+            throw new Win32Exception(error, "Cannot list the streams of " + path);
+        }
+        try {
+            do { names.Add(data.Name); } while (FindNextStreamW(find, out data));
+            int last = Marshal.GetLastWin32Error();
+            if (last != 38) { throw new Win32Exception(last, "Cannot list the streams of " + path); }
+        } finally { FindClose(find); }
+        return names.ToArray();
+    }
     // Restoring another account as owner needs SeRestorePrivilege; an elevated token holds it disabled.
     public static void EnablePrivilege(string name) {
         IntPtr token;
@@ -930,10 +952,10 @@ public static class MiosMachineBoundaryNative {
         if (handle.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot open " + path); }
         return handle;
     }
-    // An ancestor pin (FILE_LIST_DIRECTORY, so its share mode is enforced) shares read and write but not delete,
-    // so the directory cannot be renamed or removed while held.
+    // An ancestor pin (FILE_LIST_DIRECTORY, so its share mode is enforced) shares read only: while it is held no one
+    // else may open the directory to write, rename or remove it.
     public static SafeFileHandle Pin(string path) {
-        SafeFileHandle handle = CreateFileW(path, 0x1u | 0x20000u | 0x80u, 3u, IntPtr.Zero, 3u, 0x02000000u | 0x00200000u, IntPtr.Zero);
+        SafeFileHandle handle = CreateFileW(path, 0x1u | 0x20000u | 0x80u, 1u, IntPtr.Zero, 3u, 0x02000000u | 0x00200000u, IntPtr.Zero);
         if (handle.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot pin " + path); }
         return handle;
     }
@@ -1111,9 +1133,9 @@ function New-MiosSharedPrefixSddl {
 }
 
 function New-MiosLeafSddl {
-    # MiOS-namespaced leaf: exactly the descriptor fresh creation uses, with the owner the recovery policy decided.
-    param([Parameter(Mandatory)][bool]$Directory, [Parameter(Mandatory)][string]$Owner)
-    $raw = New-Object Security.AccessControl.RawSecurityDescriptor ((New-MiosMachineCreationAcl -Directory:$Directory).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]'Owner, Access'))
+    # MiOS-namespaced leaf: exactly the descriptor fresh creation uses (-Private: SYSTEM/Administrators only), with the decided owner.
+    param([Parameter(Mandatory)][bool]$Directory, [Parameter(Mandatory)][string]$Owner, [switch]$Private)
+    $raw = New-Object Security.AccessControl.RawSecurityDescriptor ((New-MiosMachineCreationAcl -Directory:$Directory -Private:$Private).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]'Owner, Access'))
     $raw.Owner = New-Object Security.Principal.SecurityIdentifier $Owner
     return $raw.GetSddlForm([Security.AccessControl.AccessControlSections]'Owner, Access')
 }
@@ -1161,13 +1183,72 @@ function Update-MiosBoundaryInheritance {
     } finally { $handle.Dispose() }
 }
 
+function Get-MiosNamedStreams {
+    # Alternate data streams of a file: every stream except the unnamed ::$DATA.
+    param([Parameter(Mandatory)][string]$Path)
+    return @([MiosMachineBoundaryNative]::Streams([IO.Path]::GetFullPath($Path)) | Where-Object { $_ -ne '::$DATA' })
+}
+
+function Get-MiosNewReaders {
+    # Accounts outside SYSTEM/Administrators that $After lets read an object although $Before did not. An earlier
+    # Authenticated Users read covers BUILTIN\Users (its members are authenticated); an earlier Everyone read covers anyone.
+    param([Parameter(Mandatory)][string]$Before, [Parameter(Mandatory)][string]$After)
+    $readers = {
+        param([string]$Sddl)
+        $raw = New-Object Security.AccessControl.RawSecurityDescriptor $Sddl
+        if ($null -eq $raw.DiscretionaryAcl) { return @('S-1-1-0') }
+        # FILE_READ_DATA / FILE_LIST_DIRECTORY, GENERIC_READ, GENERIC_ALL on the object itself (not InheritOnly).
+        return @(@($raw.DiscretionaryAcl) | Where-Object { -not ([int]$_.AceFlags -band 0x08) -and [string]$_.AceQualifier -eq 'AccessAllowed' -and
+            ($_.AccessMask -band (0x1 -bor 0x80000000 -bor 0x10000000)) } | ForEach-Object { $_.SecurityIdentifier.Value })
+    }
+    $old = @(& $readers $Before)
+    if ($old -contains 'S-1-1-0') { return @() }
+    return @(@(& $readers $After) | Where-Object { $_ -notin @('S-1-5-18', 'S-1-5-32-544') -and $_ -notin $old -and
+        -not ($_ -eq 'S-1-5-32-545' -and $old -contains 'S-1-5-11') } | Sort-Object -Unique)
+}
+
+function Initialize-MiosBoundaryBackupDirectory {
+    param([Parameter(Mandatory)][string]$Directory)
+    foreach ($level in @((Split-Path -Parent $Directory), $Directory)) {
+        if (Test-Path -LiteralPath $level) { Assert-MiosMachineWriteBoundary $level } else { New-MiosProtectedMachineDirectory $level }
+    }
+}
+
+function Assert-MiosPrivateBackupLeaf {
+    # A backup leaf is a plain, single-link file owned by and accessible only to SYSTEM and Administrators, under a protected DACL.
+    param([Parameter(Mandatory)][string]$Path, [switch]$WithBytes)
+    $record = Read-MiosBoundaryObject $Path -WithBytes:$WithBytes
+    $raw = New-Object Security.AccessControl.RawSecurityDescriptor $record.Sddl
+    if ($record.Kind -ne 'file' -or $record.Owner -notin @('S-1-5-18', 'S-1-5-32-544') -or $null -eq $raw.DiscretionaryAcl -or
+        -not ([int]$raw.ControlFlags -band 0x1000) -or @(@($raw.DiscretionaryAcl) | Where-Object { $_.SecurityIdentifier.Value -notin @('S-1-5-18', 'S-1-5-32-544') }).Count) {
+        throw "Not a private MiOS boundary backup: $Path"
+    }
+    return $record
+}
+
+function Save-MiosTomlBackup {
+    # Exact original TOML bytes as one private, content-addressed leaf, before any TOML writer runs, even when every path passes
+    # admission. An existing leaf is verified, never replaced. A TOML with alternate data streams is refused: they cannot be preserved.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][ValidateSet('vendor', 'host')][string]$Role, [Parameter(Mandatory)][string]$Directory)
+    $record = Read-MiosBoundaryObject $Path -WithBytes
+    if ($record.Kind -ne 'file') { throw "Boundary recovery refuses a TOML path that is not a file: $Path" }
+    $streams = @(Get-MiosNamedStreams $Path)
+    if ($streams.Count) { throw "Boundary recovery refuses ${Path}: it has $($streams.Count) alternate data stream(s) that the TOML backup cannot preserve" }
+    Initialize-MiosBoundaryBackupDirectory $Directory
+    $leaf = Join-Path $Directory ('{0}-{1}.toml' -f $Role, $record.Sha256)
+    if (Test-Path -LiteralPath $leaf) {
+        if ((Assert-MiosPrivateBackupLeaf $leaf).Sha256 -ne $record.Sha256) { throw "A MiOS TOML backup does not hold the bytes its name records: $leaf" }
+    } else { Write-MiosPrivateMachineFile -Path $leaf -Bytes ([Convert]::FromBase64String([string]$record.Bytes)) }
+    $now = Read-MiosBoundaryObject $Path
+    if ($now.Sha256 -ne $record.Sha256 -or $now.Index -ne $record.Index -or $now.Volume -ne $record.Volume) { throw "Boundary recovery TOML changed while it was backed up: $Path" }
+    return [pscustomobject][ordered]@{ Path = $record.Path; Role = $Role; Sha256 = $record.Sha256; Size = $record.Size; Volume = $record.Volume; Index = $record.Index; Backup = $leaf }
+}
+
 function Save-MiosBoundaryBackup {
     # One new private file per recovery run (CreateNew, SYSTEM/Administrators only), never overwriting an earlier backup.
     param([Parameter(Mandatory)][object[]]$Objects, [object[]]$Tomls = @(), [Parameter(Mandatory)][string]$Reason, [string]$Directory)
     if (-not $Directory) { $Directory = Join-Path $env:ProgramData 'MiOS\boundary-recovery' }
-    foreach ($level in @((Split-Path -Parent $Directory), $Directory)) {
-        if (Test-Path -LiteralPath $level) { Assert-MiosMachineWriteBoundary $level } else { New-MiosProtectedMachineDirectory $level }
-    }
+    Initialize-MiosBoundaryBackupDirectory $Directory
     $file = Join-Path $Directory ((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ') + '-' + [guid]::NewGuid().ToString('N') + '.json')
     $document = [ordered]@{ schema = 'mios-boundary-recovery/2'; created = (Get-Date).ToUniversalTime().ToString('o'); reason = $Reason
         objects = @($Objects); tomls = @($Tomls) }
@@ -1177,59 +1258,113 @@ function Save-MiosBoundaryBackup {
 
 function Invoke-MiosMachineBoundaryRecovery {
     # Explicit recovery of the existing MiOS boundary on the system drive only, after origin validation and before any TOML write.
-    # Admission (Assert-MiosMachineWriteBoundary) is unchanged and decides afterwards; nothing changes when every path already passes.
+    # Both TOML files are first preserved byte-exact in private leaves on every run, even when every path already passes admission.
+    # Admission (Assert-MiosMachineWriteBoundary) is unchanged and decides afterwards; no descriptor changes when every path passes.
     param([Parameter(Mandatory)][string]$OriginSid, [string]$Root, [string]$BackupDirectory)
     if (-not $Root) { $Root = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' } }
     $Root = [IO.Path]::GetFullPath($Root.TrimEnd('\') + '\')
+    if (-not $BackupDirectory) { $BackupDirectory = Join-Path $env:ProgramData 'MiOS\boundary-recovery' }
     if ($OriginSid -notmatch '^S-1-[0-9]+(-[0-9]+)+$') { throw 'Boundary recovery needs the validated origin SID.' }
-    $plan = New-Object System.Collections.Generic.List[object]
-    foreach ($item in @(@('usr', 'shared'), @('usr\share', 'shared'), @('usr\share\mios', 'leaf'), @('usr\share\mios\mios.toml', 'leaf'),
-                        @('etc', 'shared'), @('etc\mios', 'leaf'))) {
-        $path = (Join-Path $Root $item[0]).TrimEnd('\')
+    Initialize-MiosMachineBoundaryApi
+    # Each known TOML file comes before its namespace directory, so it is protected before that directory's inheritance changes.
+    $items = @(
+        @{ Rel = 'usr'; Policy = 'shared' }, @{ Rel = 'usr\share'; Policy = 'shared' },
+        @{ Rel = 'usr\share\mios\mios.toml'; Policy = 'vendor-toml'; Parent = 'usr\share\mios' }, @{ Rel = 'usr\share\mios'; Policy = 'leaf' },
+        @{ Rel = 'etc'; Policy = 'shared' },
+        @{ Rel = 'etc\mios\mios.toml'; Policy = 'host-toml'; Parent = 'etc\mios' }, @{ Rel = 'etc\mios'; Policy = 'leaf' })
+    $gaps = @{}
+    foreach ($item in $items) {
+        $path = (Join-Path $Root $item.Rel).TrimEnd('\')
         if (-not (Test-Path -LiteralPath $path)) { continue }
         Assert-MiosNoReparsePath $path
-        $gap = Get-MiosMachineBoundaryGap $path
-        if ($gap) { $plan.Add([pscustomobject]@{ Path = $path; Policy = $item[1]; Gap = $gap }) }
+        $gaps[$item.Rel] = Get-MiosMachineBoundaryGap $path
     }
-    if (-not $plan.Count) { return $null }
-    if (-not (Test-MiosElevated)) { throw "Boundary recovery requires an elevated token ($($plan[0].Path): $($plan[0].Gap))" }
-    Initialize-MiosMachineBoundaryApi
+    $plan = New-Object System.Collections.Generic.List[object]
+    foreach ($item in $items) {
+        if (-not $gaps.ContainsKey($item.Rel)) { continue }
+        $path = (Join-Path $Root $item.Rel).TrimEnd('\')
+        $gap = $gaps[$item.Rel]
+        if (-not $gap -and $item.Parent -and $gaps[$item.Parent] -and
+            -not ([int](New-Object Security.AccessControl.RawSecurityDescriptor (Read-MiosBoundaryObject $path).Sddl).ControlFlags -band 0x1000)) {
+            $gap = 'it inherits from a namespace directory that is being recovered'
+        }
+        if ($gap) { $plan.Add([pscustomobject]@{ Path = $path; Policy = $item.Policy; Gap = $gap }) }
+    }
+    $tomlItems = @(@(@('usr\share\mios\mios.toml', 'vendor'), @('etc\mios\mios.toml', 'host')) | Where-Object { Test-Path -LiteralPath (Join-Path $Root $_[0]) -PathType Leaf })
+    if (-not $plan.Count -and -not $tomlItems.Count) { return $null }
+    $why = if ($plan.Count) { "$($plan[0].Path): $($plan[0].Gap)" } else { 'TOML backup' }
+    if (-not (Test-MiosElevated)) { throw "Boundary recovery requires an elevated token ($why)" }
+    # Plan and validate everything before anything is written.
     $planned = @($plan | ForEach-Object { $_.Path })
     $objects = New-Object System.Collections.Generic.List[object]
     foreach ($step in $plan) {
         $record = Read-MiosBoundaryObject $step.Path
         Assert-MiosBoundaryAcePolicy -Sddl $record.Sddl -Path $step.Path
+        $owner = Get-MiosBoundaryOwnerAction -Owner $record.Owner -OriginSid $OriginSid -Path $step.Path
+        $isDirectory = $record.Kind -eq 'directory'
+        $target = switch ($step.Policy) {
+            'shared' { New-MiosSharedPrefixSddl -Sddl $record.Sddl -Owner $owner }
+            'host-toml' { New-MiosLeafSddl -Directory $false -Owner $owner -Private }
+            default { New-MiosLeafSddl -Directory $isDirectory -Owner $owner }
+        }
+        foreach ($sid in @(Get-MiosNewReaders -Before $record.Sddl -After $target)) { throw "Boundary recovery refuses $($step.Path): its recovered descriptor would let $sid read it" }
         $children = @(); $siblings = @()
-        # A planned target below a leaf (usr\share\mios\mios.toml) is its own step, so it is not also a descendant to keep unchanged.
-        if ($step.Policy -eq 'leaf' -and $record.Kind -eq 'directory') {
+        if ($step.Policy -eq 'leaf' -and $isDirectory) {
+            # A planned target below a leaf (a known TOML file) is its own step, so it is not also a descendant to keep unchanged.
             $children = @(Get-MiosBoundaryDescendants $step.Path | Where-Object { $_ -notin $planned } | ForEach-Object { Read-MiosBoundaryObject $_ })
+            # Re-inheriting from the hardened leaf must not let anyone read a descendant that cannot read it now.
+            $byPath = @{}; foreach ($c in $children) { $byPath[$c.Path] = $c }
+            $leafAces = @((New-Object Security.AccessControl.RawSecurityDescriptor $target).DiscretionaryAcl)
+            foreach ($c in $children) {
+                $raw = New-Object Security.AccessControl.RawSecurityDescriptor $c.Sddl
+                $inherits = -not ([int]$raw.ControlFlags -band 0x1000)
+                for ($p = Split-Path -Parent $c.Path; $inherits -and $p -and $p -ine $step.Path; $p = Split-Path -Parent $p) {
+                    if ($byPath.ContainsKey($p) -and ([int](New-Object Security.AccessControl.RawSecurityDescriptor $byPath[$p].Sddl).ControlFlags -band 0x1000)) { $inherits = $false }
+                }
+                if (-not $inherits) { continue }
+                $future = New-Object Security.AccessControl.RawAcl -ArgumentList ([byte]2), 0
+                foreach ($ace in @($raw.DiscretionaryAcl)) { if (-not ([int]$ace.AceFlags -band 0x10)) { $future.InsertAce($future.Count, $ace.Copy()) } }
+                $applies = if ($c.Kind -eq 'directory') { 0x02 } else { 0x01 }   # CONTAINER_INHERIT reaches directories, OBJECT_INHERIT files
+                foreach ($ace in $leafAces) {
+                    if ([int]$ace.AceFlags -band $applies) { $copy = $ace.Copy(); $copy.AceFlags = [Security.AccessControl.AceFlags]::Inherited; $future.InsertAce($future.Count, $copy) }
+                }
+                $after = (New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList ([Security.AccessControl.ControlFlags]'DiscretionaryAclPresent, SelfRelative'),
+                    $null, $null, $null, $future).GetSddlForm([Security.AccessControl.AccessControlSections]::Access)
+                foreach ($sid in @(Get-MiosNewReaders -Before $c.Sddl -After $after)) { throw "Boundary recovery refuses $($c.Path): re-inheriting from the recovered $($step.Path) would let $sid read it" }
+            }
         }
         if ($step.Policy -eq 'shared') {
             $siblings = @([IO.Directory]::EnumerateFileSystemEntries($step.Path) | Where-Object { $_ -notin $planned } | ForEach-Object { Read-MiosBoundaryObject $_ -Lenient })
         }
-        $step | Add-Member -NotePropertyName Owner -NotePropertyValue (Get-MiosBoundaryOwnerAction -Owner $record.Owner -OriginSid $OriginSid -Path $step.Path)
+        $chain = @(Open-MiosBoundaryAncestors $step.Path)
+        try { $chainIds = @($chain | ForEach-Object { "$($_.Path)|$($_.Volume)|$($_.Index)" }) } finally { foreach ($pin in $chain) { $pin.Handle.Dispose() } }
+        $step | Add-Member -NotePropertyName Owner -NotePropertyValue $owner
         $step | Add-Member -NotePropertyName Record -NotePropertyValue $record
+        $step | Add-Member -NotePropertyName Target -NotePropertyValue $target
         $step | Add-Member -NotePropertyName Children -NotePropertyValue $children
         $step | Add-Member -NotePropertyName Siblings -NotePropertyValue $siblings
+        $step | Add-Member -NotePropertyName Chain -NotePropertyValue $chainIds
         foreach ($o in @($record) + $children) { if (-not @($objects | Where-Object { $_.Path -eq $o.Path }).Count) { $objects.Add($o) } }
     }
-    $tomls = @(@('usr\share\mios\mios.toml', 'etc\mios\mios.toml') | ForEach-Object { Join-Path $Root $_ } |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | ForEach-Object { Read-MiosBoundaryObject $_ -WithBytes })
+    $tomls = @(foreach ($t in $tomlItems) { Save-MiosTomlBackup -Path (Join-Path $Root $t[0]) -Role $t[1] -Directory $BackupDirectory })
+    if (-not $plan.Count) { return $null }
     $backup = Save-MiosBoundaryBackup -Objects $objects.ToArray() -Tomls $tomls -Directory $BackupDirectory `
         -Reason (($plan | ForEach-Object { "$($_.Path) [$($_.Policy)]: $($_.Gap)" }) -join '; ')
     foreach ($step in $plan) {
         $pins = @(Open-MiosBoundaryAncestors $step.Path)
         try {
+            if ((@($pins | ForEach-Object { "$($_.Path)|$($_.Volume)|$($_.Index)" }) -join ';') -cne ($step.Chain -join ';')) {
+                throw "Boundary recovery ancestor chain changed after planning: $($step.Path); backup $backup"
+            }
             $handle = [MiosMachineBoundaryNative]::Open($step.Path, $true)
             try {
                 $now = [MiosMachineBoundaryNative]::Info($handle)
                 $sddlNow = [MiosMachineBoundaryNative]::GetSddl($handle)
                 if ([string]$now.Volume -ne $step.Record.Volume -or ('{0:x16}' -f $now.Index) -ne $step.Record.Index -or ($now.Attributes -band 0x400) -or
-                    [MiosMachineBoundaryNative]::FinalPath($handle).TrimEnd('\') -ine $step.Path -or
+                    (-not ($now.Attributes -band 0x10) -and $now.Links -ne 1) -or [MiosMachineBoundaryNative]::FinalPath($handle).TrimEnd('\') -ine $step.Path -or
                     (New-Object Security.AccessControl.RawSecurityDescriptor $sddlNow).Owner.Value -ne $step.Record.Owner -or
                     -not (Test-MiosSameExplicitAces -Before $step.Record.Sddl -After $sddlNow)) { throw "Boundary recovery target changed after its backup: $($step.Path); backup $backup" }
-                $target = if ($step.Policy -eq 'shared') { New-MiosSharedPrefixSddl -Sddl $sddlNow -Owner $step.Owner }
-                          else { New-MiosLeafSddl -Directory ($step.Record.Kind -eq 'directory') -Owner $step.Owner }
+                $target = if ($step.Policy -eq 'shared') { New-MiosSharedPrefixSddl -Sddl $sddlNow -Owner $step.Owner } else { $step.Target }
                 [MiosMachineBoundaryNative]::SetSddl($handle, $target)
             } finally { $handle.Dispose() }
             foreach ($child in $step.Children) { Update-MiosBoundaryInheritance -Object $child -Backup $backup }
@@ -1250,26 +1385,49 @@ function Invoke-MiosMachineBoundaryRecovery {
             foreach ($field in 'Volume', 'Index', 'Created', 'Written', 'Size', 'Sha256', 'Owner') { if ($new.$field -ne $old.$field) { $problems.Add("$($old.Path) $field changed") } }
             if (-not (Test-MiosSameExplicitAces -Before $old.Sddl -After $new.Sddl)) { $problems.Add("$($old.Path) explicit ACEs changed") }
             foreach ($sid in (Get-MiosInheritedWriteGrants $new.Sddl)) { $problems.Add("$($old.Path) still inherits write access for $sid") }
+            foreach ($sid in @(Get-MiosNewReaders -Before $old.Sddl -After $new.Sddl)) { $problems.Add("$($old.Path) became readable by $sid") }
         }
         foreach ($old in $step.Siblings) {
             $new = Read-MiosBoundaryObject $old.Path -Lenient
             foreach ($field in 'Sddl', 'Owner', 'Volume', 'Index', 'Written', 'Size', 'Sha256') { if ($new.$field -cne $old.$field) { $problems.Add("sibling $($old.Path) $field changed") } }
         }
     }
-    if ($problems.Count) { throw "Boundary recovery could not be verified ($($problems -join '; ')); original descriptors and TOML bytes are in $backup" }
+    if ($problems.Count) { throw "Boundary recovery could not be verified ($($problems -join '; ')); original descriptors are in $backup and TOML bytes in $BackupDirectory" }
     Write-Host "  [+] Recovered the MiOS machine boundary ($($plan.Count) path(s)); originals: $backup" -ForegroundColor DarkGray
     return $backup
 }
 
 function Restore-MiosMachineBoundary {
-    # Rollback: re-applies one backup's recorded descriptors by handle, top-down as recorded. TOML bytes stay in the backup for manual use.
-    param([Parameter(Mandatory)][string]$BackupPath)
+    # Rollback of one recovery run: re-applies its recorded descriptors by handle, top-down as recorded, only after the backup leaf
+    # and every object validate. It refuses rather than put an old descriptor on content that changed since (a rewritten or scrubbed
+    # TOML). TOML bytes stay in their private backup leaves for manual use.
+    param([Parameter(Mandatory)][string]$BackupPath, [string]$BackupDirectory)
     if (-not (Test-MiosElevated)) { throw 'Boundary restore requires an elevated token.' }
     Initialize-MiosMachineBoundaryApi
-    [MiosMachineBoundaryNative]::EnablePrivilege('SeRestorePrivilege')
-    $document = [IO.File]::ReadAllText($BackupPath) | ConvertFrom-Json
+    if (-not $BackupDirectory) { $BackupDirectory = Join-Path $env:ProgramData 'MiOS\boundary-recovery' }
+    $full = [IO.Path]::GetFullPath($BackupPath)
+    if ((Split-Path -Parent $full) -ine [IO.Path]::GetFullPath($BackupDirectory).TrimEnd('\') -or $full -notmatch '\.json$') {
+        throw "Boundary restore accepts only a recovery backup in ${BackupDirectory}: $BackupPath"
+    }
+    Assert-MiosMachineWriteBoundary $BackupDirectory
+    $leaf = Assert-MiosPrivateBackupLeaf $full -WithBytes
+    $document = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$leaf.Bytes)) | ConvertFrom-Json
     if ($document.schema -cne 'mios-boundary-recovery/2') { throw "Not a MiOS boundary backup: $BackupPath" }
-    foreach ($object in @($document.objects)) {
+    $objects = @($document.objects)
+    foreach ($object in $objects) {
+        $now = Read-MiosBoundaryObject ([string]$object.Path)
+        if ($now.Volume -ne [string]$object.Volume -or $now.Index -ne [string]$object.Index -or $now.Kind -ne [string]$object.Kind) {
+            throw "Boundary restore target is not the recorded object: $($object.Path)"
+        }
+        if ($now.Kind -eq 'file' -and $now.Sha256 -ne [string]$object.Sha256) {
+            throw "Boundary restore refuses $($object.Path): its content changed since the backup, so its old descriptor is not re-applied"
+        }
+    }
+    [MiosMachineBoundaryNative]::EnablePrivilege('SeRestorePrivilege')
+    # Parents before children (stable by depth): an unprotected object recomputes its inherited ACEs from its already-restored parent.
+    $ordered = @(for ($i = 0; $i -lt $objects.Count; $i++) { [pscustomobject]@{ Depth = ([string]$objects[$i].Path).Split('\').Count; Order = $i; Object = $objects[$i] } }) |
+        Sort-Object Depth, Order | ForEach-Object { $_.Object }
+    foreach ($object in $ordered) {
         $handle = [MiosMachineBoundaryNative]::Open([string]$object.Path, $true)
         try {
             $now = [MiosMachineBoundaryNative]::Info($handle)
@@ -2164,7 +2322,8 @@ function Get-MiosMachineWorkerScript {
         'Initialize-MiosMachineBoundaryApi', 'Get-MiosMachineBoundaryGap', 'Read-MiosBoundaryObject', 'Get-MiosBoundaryDescendants',
         'Get-MiosExplicitAces', 'Test-MiosSameExplicitAces', 'Get-MiosInheritedWriteGrants', 'Get-MiosBoundaryOwnerAction',
         'Assert-MiosBoundaryAcePolicy', 'New-MiosSharedPrefixSddl', 'New-MiosLeafSddl', 'Open-MiosBoundaryAncestors',
-        'Update-MiosBoundaryInheritance', 'Save-MiosBoundaryBackup', 'Invoke-MiosMachineBoundaryRecovery',
+        'Update-MiosBoundaryInheritance', 'Get-MiosNamedStreams', 'Get-MiosNewReaders', 'Initialize-MiosBoundaryBackupDirectory',
+        'Assert-MiosPrivateBackupLeaf', 'Save-MiosTomlBackup', 'Save-MiosBoundaryBackup', 'Invoke-MiosMachineBoundaryRecovery',
         'Write-Info', 'Write-Good', 'Write-Err', 'Initialize-DataDisk',
         'Test-MiosElevated', 'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Enable-MiOSWindowsFeatures',
         'Get-MiosTomlTableArray', 'ConvertTo-MiosWindowsPath', 'Test-MiosDefenderExclusionRefused', 'Get-MiosDefenderExclusionPlan',

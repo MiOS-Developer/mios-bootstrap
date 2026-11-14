@@ -23,6 +23,11 @@ jobs:
               $null = [System.Management.Automation.Language.Parser]::ParseInput($contents, [ref]$null, [ref]$null)
           }
 
+      - name: Verify fetched PowerShell web entry bytes
+        shell: pwsh
+        run: |
+          ./tests/test_getmios_web_entry.ps1 -BootstrapRoot $PWD.Path
+
       - name: Install Windows ADK (oscdimg)
         shell: powershell
         run: |

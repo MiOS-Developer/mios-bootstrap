@@ -6869,7 +6869,10 @@ function Invoke-GitFetchWithRetry {
 }
 
 function Update-MiosCheckout([string]$RepoPath, [string]$Ref) {
-    $changes = @(& git -C $RepoPath status --porcelain --untracked-files=all)
+    # Only tracked changes are local contributions. The mios-bootstrap overlay below copies untracked files into the
+    # mios.git work tree on every run; counting them deferred every later update forever. A fast-forward that would
+    # overwrite an untracked file still refuses (merge --ff-only), so nothing untracked is ever lost.
+    $changes = @(& git -C $RepoPath status --porcelain --untracked-files=no)
     if ($LASTEXITCODE -ne 0) { throw "Cannot inspect checkout $RepoPath; refusing to update it." }
     if ($changes.Count) {
         Log-Warn "Preserving local contributions at $RepoPath; remote update deferred."
@@ -6878,7 +6881,22 @@ function Update-MiosCheckout([string]$RepoPath, [string]$Ref) {
     $fetchExit = Invoke-GitFetchWithRetry -RepoPath $RepoPath -Ref $Ref
     if ($fetchExit -ne 0) { throw "Cannot fetch $Ref at $RepoPath (exit $fetchExit)" }
     & git -C $RepoPath merge --ff-only FETCH_HEAD | ForEach-Object { Write-Log "git-update: $_" }
-    if ($LASTEXITCODE -ne 0) { throw "Cannot fast-forward $RepoPath to $Ref; local commits are preserved." }
+    if ($LASTEXITCODE -ne 0) { throw "Cannot fast-forward $RepoPath to $Ref; local commits and untracked files are preserved." }
+}
+
+function Publish-MiosEntryScripts([string]$ShadowDir, [string]$BinDir) {
+    # Entry scripts come from the mios-bootstrap shadow checkout, the published bytes. The mios.git work tree also tracks
+    # older root copies of Get-MiOS.ps1 and build-mios.ps1 that the missing-files-only overlay never refreshes, so it is
+    # never the source. Each staged copy must hash equal to its shadow source.
+    foreach ($script in @('Get-MiOS.ps1', 'build-mios.ps1', 'build-mios.sh', 'bootstrap.ps1', 'bootstrap.sh')) {
+        $srcFile = Join-Path $ShadowDir $script
+        if (-not (Test-Path -LiteralPath $srcFile -PathType Leaf)) { continue }
+        $destFile = Join-Path $BinDir $script
+        Copy-Item -LiteralPath $srcFile -Destination $destFile -Force
+        $want = (Get-FileHash -LiteralPath $srcFile -Algorithm SHA256).Hash
+        $have = (Get-FileHash -LiteralPath $destFile -Algorithm SHA256).Hash
+        if ($have -ne $want) { throw "Staged $destFile (sha256 $have) does not match the mios-bootstrap shadow $srcFile (sha256 $want)." }
+    }
 }
 
 # -- Phase 1 -- Detecting existing build environment --------------------------
@@ -6976,14 +6994,9 @@ $miosRepo = $MiosRepoDir
     Set-Content -Path (Join-Path $MiosInstallDir "VERSION") -Value $MiosVersion -Encoding ASCII -Force
 
     # Stage entry-point scripts under $MiosBinDir for Start Menu shortcuts /
-    # PATH integration that target a stable non-git location. Files come
-    # from M:\ (overlay) since both repos' contents are now there.
-    foreach ($script in @("Get-MiOS.ps1","build-mios.ps1","build-mios.sh","bootstrap.ps1","bootstrap.sh")) {
-        $srcFile = Join-Path $MiosRepoDir $script
-        if (Test-Path $srcFile) {
-            Copy-Item -Path $srcFile -Destination (Join-Path $MiosBinDir $script) -Force
-        }
-    }
+    # PATH integration that target a stable non-git location, from the
+    # mios-bootstrap shadow (never the mios.git work tree's stale root copies).
+    Publish-MiosEntryScripts -ShadowDir $MiosBootstrapShadow -BinDir $MiosBinDir
     Log-Ok (Get-MiosTomlValue -Section 'messages.steps' -Key 'entry_scripts_staged' -Default "Entry scripts staged at $MiosBinDir")
     End-Phase 2
 

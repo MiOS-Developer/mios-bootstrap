@@ -1200,7 +1200,10 @@ function Invoke-MiosMachineBoundaryRecovery {
         $record = Read-MiosBoundaryObject $step.Path
         Assert-MiosBoundaryAcePolicy -Sddl $record.Sddl -Path $step.Path
         $children = @(); $siblings = @()
-        if ($step.Policy -eq 'leaf' -and $record.Kind -eq 'directory') { $children = @(Get-MiosBoundaryDescendants $step.Path | ForEach-Object { Read-MiosBoundaryObject $_ }) }
+        # A planned target below a leaf (usr\share\mios\mios.toml) is its own step, so it is not also a descendant to keep unchanged.
+        if ($step.Policy -eq 'leaf' -and $record.Kind -eq 'directory') {
+            $children = @(Get-MiosBoundaryDescendants $step.Path | Where-Object { $_ -notin $planned } | ForEach-Object { Read-MiosBoundaryObject $_ })
+        }
         if ($step.Policy -eq 'shared') {
             $siblings = @([IO.Directory]::EnumerateFileSystemEntries($step.Path) | Where-Object { $_ -notin $planned } | ForEach-Object { Read-MiosBoundaryObject $_ -Lenient })
         }

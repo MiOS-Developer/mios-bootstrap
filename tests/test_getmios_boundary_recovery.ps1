@@ -92,6 +92,8 @@ function Invoke-SourceChecks([string]$Path) {
            $policy[0].Extent.StartOffset -lt $save[0].Extent.StartOffset -and $save[0].Extent.StartOffset -lt $set[0].Extent.StartOffset) 'recovery validates policy and owners and backs up before changing any descriptor'
     Check ($pin.Count -eq 1 -and $pin[0].Extent.StartOffset -lt $set[0].Extent.StartOffset) 'every repair pins its ancestors first'
     Check ($inherit.Count -eq 1 -and $inherit[0].Extent.StartOffset -gt $set[0].Extent.StartOffset) 'leaf descendants are re-inherited after the descriptor change'
+    $descend = Get-Calls $invoke 'Get-MiosBoundaryDescendants'
+    Check ($descend.Count -eq 1 -and $descend[0].Parent.Extent.Text -match '\|\s*Where-Object\s*\{\s*\$_\s+-notin\s+\$planned\s*\}') 'a planned target below a leaf is its own step, not a leaf descendant'
     $worker = ''; try { $worker = Get-MiosMachineWorkerScript -Source $text } catch { }
     $missing = @($recoveryHelpers | Where-Object { $worker -notmatch ('(?m)^function ' + [regex]::Escape($_) + ' \{') })
     Check ($worker -and $missing.Count -eq 0) 'the elevated worker carries every recovery helper'
@@ -339,6 +341,7 @@ $plants = @(
     @{ Name = 'compliant run not skipped'; Expected = 'a run where every path already passes admission changes nothing'; From = 'if (-not $plan.Count) { return $null }'; To = '' },
     @{ Name = 'admission weakened'; Expected = 'admission helper Assert-MiosMachineWriteBoundary is unchanged from its reviewed source'; From = "if (`$owner -notin `$trusted) { throw 'An existing machine TOML path has an untrusted owner.' }"; To = '' },
     @{ Name = 'worker lacks a helper'; Expected = 'worker extraction resolves every helper the recovery calls'; From = "'Assert-MiosBoundaryAcePolicy', 'New-MiosSharedPrefixSddl', 'New-MiosLeafSddl', 'Open-MiosBoundaryAncestors',"; To = "'Assert-MiosBoundaryAcePolicy', 'New-MiosSharedPrefixSddl', 'New-MiosLeafSddl'," },
+    @{ Name = 'planned target kept as a leaf descendant'; Expected = 'a planned target below a leaf is its own step, not a leaf descendant'; From = 'Get-MiosBoundaryDescendants $step.Path | Where-Object { $_ -notin $planned } |'; To = 'Get-MiosBoundaryDescendants $step.Path |' },
     @{ Name = 'inheritance update skipped'; Expected = 'leaf descendants are re-inherited after the descriptor change'; From = 'Update-MiosBoundaryInheritance -Object $child -Backup $backup'; To = '$null = $child' },
     @{ Name = 'inheritance update drops explicit ACEs'; Expected = 'an inheritance update keeps explicit ACEs and takes inherited ACEs from the parent'; From = 'if (-not ([int]$ace.AceFlags -band 0x10)) { $explicit.InsertAce'; To = 'if ([int]$ace.AceFlags -band 0x10) { $explicit.InsertAce' },
     @{ Name = 'explicit ACE comparison precedence'; Expected = 'explicit ACE comparison ignores inherited changes and detects explicit ones'; From = "return [bool](((Get-MiosExplicitAces `$Before) -join ';') -ceq ((Get-MiosExplicitAces `$After) -join ';'))"; To = "return (Get-MiosExplicitAces `$Before) -join ';' -ceq (Get-MiosExplicitAces `$After) -join ';'" },

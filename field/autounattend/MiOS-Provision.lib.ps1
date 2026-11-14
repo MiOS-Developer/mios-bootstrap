@@ -247,7 +247,10 @@ function Write-MiOSPrivateText {
     $stream = $null
     try {
         $stream = Open-MiOSPrivateFileStream -Path $tmp
-        Set-MiOSPrivateStream -Stream $stream
+        # Windows creation already applies the final protected descriptor atomically.
+        # Read it back before secret bytes; POSIX still needs its explicit mode change.
+        if ($env:OS -eq 'Windows_NT') { Assert-MiOSPrivateFile -Path $tmp }
+        else { Set-MiOSPrivateStream -Stream $stream }
         $bytes = $Encoding.GetBytes($Text); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true); $stream.Dispose(); $stream = $null
         if ([IO.File]::Exists($target) -or [IO.Directory]::Exists($target)) {
             $alreadyPrivate = $false

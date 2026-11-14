@@ -25,6 +25,13 @@ function Import-Product([string]$Text) {
     }
 }
 function global:ConvertTo-FixturePath([string]$Path) {
+    # On Windows the scratch tree itself sits under a drive letter: a path already mapped into it (for example the result of
+    # the mocked Join-Path) is returned as is, never mapped a second time under the fixture drive.
+    $sep = [string][IO.Path]::DirectorySeparatorChar
+    if ([IO.Path]::IsPathRooted($Path) -and $Path -notmatch '^[A-Za-z]:$') {
+        $mapped = [IO.Path]::GetFullPath($Path)
+        if ($mapped -ieq $script:runRoot -or $mapped.StartsWith(($script:runRoot + $sep), [StringComparison]::OrdinalIgnoreCase)) { return $mapped }
+    }
     if ($Path -match '^([A-Za-z]):(?:[\\/](.*))?$') {
         $letter = $Matches[1].ToUpperInvariant(); $tail = [string]$Matches[2]
         if (-not $script:driveMap.ContainsKey($letter)) { throw 'Unexpected fixture drive.' }

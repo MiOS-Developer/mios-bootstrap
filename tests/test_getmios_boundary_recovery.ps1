@@ -101,6 +101,12 @@ function Invoke-SourceChecks([string]$Path) {
     Check ($vendorAt -ge 0 -and $vendorAt -lt $leafAt -and $hostAt -ge 0 -and $hostAt -lt $etcLeafAt -and
            $invoke.Extent.Text.Contains("'host-toml' { New-MiosLeafSddl -Directory `$false -Owner `$owner -Private }")) 'both TOML files are protected before their namespace directory, the host TOML privately'
     Check ($inherit.Count -eq 1 -and $inherit[0].Extent.StartOffset -gt $set[0].Extent.StartOffset) 'leaf descendants are re-inherited after the descriptor change'
+    # The elevated worker holds SeRestorePrivilege disabled: an administrator cannot assign SYSTEM as owner, so a kept owner
+    # (SYSTEM on C:\etc) must never be rewritten. Only the protected DACL changes; a replaced owner is always Administrators.
+    $daclSet = @($members | Where-Object { $_.Member.Extent.Text -eq 'SetDacl' })
+    Check ($daclSet.Count -eq 1 -and $set.Count -eq 1 -and $daclSet[0].Extent.StartOffset -lt $set[0].Extent.StartOffset -and
+           $invoke.Extent.Text.Contains('if ($step.Owner -eq $step.Record.Owner) { [MiosMachineBoundaryNative]::SetDacl($handle, $target, $true) }') -and
+           -not $invoke.Extent.Text.Contains('EnablePrivilege')) 'a kept owner is never rewritten, so recovery needs no SeRestorePrivilege'
     $descend = Get-Calls $invoke 'Get-MiosBoundaryDescendants'
     Check ($descend.Count -eq 1 -and $descend[0].Parent.Extent.Text -match '\|\s*Where-Object\s*\{\s*\$_\s+-notin\s+\$planned\s*\}') 'a planned target below a leaf is its own step, not a leaf descendant'
     $tomlBackup = Get-Function $ast 'Save-MiosTomlBackup'
@@ -309,12 +315,16 @@ function Invoke-Prepare([string]$Root) {
 }
 
 function Set-FixtureOwner([string]$Path, [string]$Sid) {
-    $h = [MiosMachineBoundaryNative]::Open($Path, $true)
-    try {
-        $raw = New-Object Security.AccessControl.RawSecurityDescriptor ([MiosMachineBoundaryNative]::GetSddl($h))
-        $raw.Owner = New-Object Security.Principal.SecurityIdentifier $Sid
-        [MiosMachineBoundaryNative]::SetSddl($h, $raw.GetSddlForm([Security.AccessControl.AccessControlSections]'Owner, Access'))
-    } finally { $h.Dispose() }
+    # A separate process plants the owner (icacls enables SeRestorePrivilege only for itself), so this process keeps the
+    # production worker's token: elevated, with SeRestorePrivilege held but disabled.
+    $out = & "$env:SystemRoot\System32\icacls.exe" $Path /setowner "*$Sid" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "icacls could not plant owner $Sid on ${Path}: $($out -join ' ')" }
+    if ((Read-MiosBoundaryObject $Path -Lenient).Owner -ne $Sid) { throw "Planted owner $Sid is not on $Path" }
+}
+function Test-RestorePrivilegeEnabled {
+    # A child process starts with a copy of this token, including which privileges are enabled.
+    $row = @(& "$env:SystemRoot\System32\whoami.exe" /priv /fo csv /nh | ConvertFrom-Csv -Header 'Name', 'Description', 'State' | Where-Object { $_.Name -eq 'SeRestorePrivilege' })
+    return ($row.Count -eq 1 -and $row[0].State -eq 'Enabled')
 }
 
 function Invoke-ElevatedChecks([string]$Root) {
@@ -322,7 +332,6 @@ function Invoke-ElevatedChecks([string]$Root) {
     $null = Import-Product $ProductPath
     if (-not (Test-MiosElevated)) { throw '-Elevated must run in an elevated session.' }
     Initialize-MiosMachineBoundaryApi
-    [MiosMachineBoundaryNative]::EnablePrivilege('SeRestorePrivilege')
     $op = if ($OriginSid) { $OriginSid } else { [IO.File]::ReadAllText((Join-Path $Root 'origin.sid')).Trim() }
     $tree = Join-Path $Root 'tree'
     # Shape the real machine: usr owned by Administrators, etc by SYSTEM, the MiOS leaves and usr\share by the operator.
@@ -336,6 +345,7 @@ function Invoke-ElevatedChecks([string]$Root) {
     $tomlBytes = @{}; foreach ($t in 'usr\share\mios\mios.toml', 'etc\mios\mios.toml') { $tomlBytes[(Join-Path $tree $t)] = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $tree $t))) }
     $vault = Join-Path $Root 'vault'; New-MiosProtectedMachineDirectory $vault
     $backupDir = Join-Path $vault 'boundary-recovery'
+    Check (-not (Test-RestorePrivilegeEnabled)) 'the first recovery runs with SeRestorePrivilege disabled, like the production worker'
     $backup = Invoke-MiosMachineBoundaryRecovery -OriginSid $op -Root $tree -BackupDirectory $backupDir
     Check (@($targets | Where-Object { Get-MiosMachineBoundaryGap $_ }).Count -eq 0) 'every boundary object passes the unchanged admission after recovery'
     $owners = @{}; foreach ($p in $targets) { $owners[$p.Substring($tree.Length + 1)] = (Read-MiosBoundaryObject $p).Owner }
@@ -520,7 +530,9 @@ $plants = @(
     @{ Name = 'inheritance update drops explicit ACEs'; Expected = 'an inheritance update keeps explicit ACEs and takes inherited ACEs from the parent'; From = 'if (-not ([int]$ace.AceFlags -band 0x10)) { $explicit.InsertAce'; To = 'if ([int]$ace.AceFlags -band 0x10) { $explicit.InsertAce' },
     @{ Name = 'explicit ACE comparison precedence'; Expected = 'explicit ACE comparison ignores inherited changes and detects explicit ones'; From = "return [bool](((Get-MiosExplicitAces `$Before) -join ';') -ceq ((Get-MiosExplicitAces `$After) -join ';'))"; To = "return (Get-MiosExplicitAces `$Before) -join ';' -ceq (Get-MiosExplicitAces `$After) -join ';'" },
     @{ Name = 'inherited write grants ignored'; Expected = 'inherited write grants are found only where they apply to the object'; From = "[string]`$_.AceQualifier -eq 'AccessAllowed' -and (`$_.AccessMask"; To = "[string]`$_.AceQualifier -eq 'Never' -and (`$_.AccessMask" },
-    @{ Name = 'leaf descriptor private'; Expected = 'a leaf gets exactly the descriptor fresh creation uses, with the decided owner'; From = '(New-MiosMachineCreationAcl -Directory:$Directory -Private:$Private)'; To = '(New-MiosMachineCreationAcl -Directory:$Directory -Private)' }
+    @{ Name = 'leaf descriptor private'; Expected = 'a leaf gets exactly the descriptor fresh creation uses, with the decided owner'; From = '(New-MiosMachineCreationAcl -Directory:$Directory -Private:$Private)'; To = '(New-MiosMachineCreationAcl -Directory:$Directory -Private)' },
+    @{ Name = 'kept owner rewritten'; Expected = 'a kept owner is never rewritten, so recovery needs no SeRestorePrivilege'; From = 'if ($step.Owner -eq $step.Record.Owner) { [MiosMachineBoundaryNative]::SetDacl($handle, $target, $true) }'; To = 'if ($false) { [MiosMachineBoundaryNative]::SetDacl($handle, $target, $true) }' },
+    @{ Name = 'recovery enables restore privilege'; Expected = 'a kept owner is never rewritten, so recovery needs no SeRestorePrivilege'; From = 'if ($step.Owner -eq $step.Record.Owner) { [MiosMachineBoundaryNative]::SetDacl('; To = '[MiosMachineBoundaryNative]::EnablePrivilege(''SeRestorePrivilege''); if ($step.Owner -eq $step.Record.Owner) { [MiosMachineBoundaryNative]::SetDacl(' }
 )
 $caught = 0
 $copyDir = Join-Path ([IO.Path]::GetTempPath()) ('mios-boundary-plants-' + [guid]::NewGuid().ToString('N'))

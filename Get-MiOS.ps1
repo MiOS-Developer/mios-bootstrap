@@ -1414,7 +1414,11 @@ function Invoke-MiosMachineBoundaryRecovery {
                     (New-Object Security.AccessControl.RawSecurityDescriptor $sddlNow).Owner.Value -ne $step.Record.Owner -or
                     -not (Test-MiosSameExplicitAces -Before $step.Record.Sddl -After $sddlNow)) { throw "Boundary recovery target changed after its backup: $($step.Path); backup $backup" }
                 $target = if ($step.Policy -eq 'shared') { New-MiosSharedPrefixSddl -Sddl $sddlNow -Owner $step.Owner } else { $step.Target }
-                [MiosMachineBoundaryNative]::SetSddl($handle, $target)
+                # An elevated administrator may assign as owner only itself or Administrators; assigning SYSTEM needs SeRestorePrivilege,
+                # which recovery never enables. A kept owner (SYSTEM on C:\etc) is therefore not rewritten: only the protected DACL changes.
+                # A replaced owner is always Administrators (Get-MiosBoundaryOwnerAction).
+                if ($step.Owner -eq $step.Record.Owner) { [MiosMachineBoundaryNative]::SetDacl($handle, $target, $true) }
+                else { [MiosMachineBoundaryNative]::SetSddl($handle, $target) }
             } finally { $handle.Dispose() }
             foreach ($child in $step.Children) { Update-MiosBoundaryInheritance -Object $child -Backup $backup }
             foreach ($pin in $pins) {

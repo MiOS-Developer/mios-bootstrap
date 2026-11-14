@@ -167,8 +167,9 @@ function Run-Checks([string]$Text) {
     Import-Functions $ast @('Invoke-MiosMachinePreparationCore')
     function global:Test-MiosElevated { return $true }
     $script:recoverySids = New-Object System.Collections.Generic.List[string]
-    function global:Invoke-MiosMachineBoundaryRecovery { param($OriginSid, $Root, $BackupDirectory) $script:recoverySids.Add([string]$OriginSid); return $null }
-    function global:Publish-MiosMachineToml { param($Context) }
+    $script:machineRoots = New-Object System.Collections.Generic.List[string]
+    function global:Invoke-MiosMachineBoundaryRecovery { param($OriginSid, $Root, $BackupDirectory) $script:recoverySids.Add([string]$OriginSid); $script:machineRoots.Add("recover|$Root"); return $null }
+    function global:Publish-MiosMachineToml { param($Context, $Root) $script:machineRoots.Add("publish|$Root") }
     function global:Initialize-MiosMachineStorage { param($Context) }
     function global:Add-MiosDefenderExclusions {}
     function global:Register-MiosBootstrapResume { param($Context) $script:pendingSid = $Context.Sid }
@@ -190,6 +191,8 @@ function Run-Checks([string]$Text) {
         Check (($mode -eq 'error' -and $failed) -or ($mode -ne 'error' -and -not $failed -and $result.Status -eq $mode)) ('actual machine orchestration preserves ' + $mode + ' readiness')
     }
     Check ($script:recoverySids.Count -eq 3 -and @($script:recoverySids | Where-Object { $_ -ne $origin.Sid }).Count -eq 0) 'actual machine orchestration runs boundary recovery once per dispatch with the validated operator SID'
+    $expectedRoot = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
+    Check (($script:machineRoots -join ';') -ceq ((1..3 | ForEach-Object { "recover|$expectedRoot;publish|$expectedRoot" }) -join ';')) 'recovery and publication receive the same explicit system-drive root on every dispatch'
     $defaultResolution = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.IfStatementAst] -and
         $n.Clauses[0].Item1.Extent.Text -eq '[string]::IsNullOrWhiteSpace($RepoDir)' }, $true))
     foreach ($elevated in @($false, $true)) {

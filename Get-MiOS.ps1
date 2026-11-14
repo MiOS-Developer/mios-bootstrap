@@ -5312,7 +5312,7 @@ function Initialize-DataDisk {
     if ($existing) {
         Write-Err "Drive ${DriveLetter}: exists with label '$($existing.FileSystemLabel)' (not '$VolumeLabel')."
         Write-Err "Either remove the volume manually or pass -DriveLetter <other> to Get-MiOS.ps1."
-        exit 1
+        throw "Initialize-DataDisk: drive ${DriveLetter}: already exists with another label; nothing was changed."
     }
     $_displayGb = Get-MiosTomlValue -Section 'bootstrap.host_storage' -Key 'display_size_gb' -Default 256
     Write-Info "Provisioning ${DriveLetter}:\ at $ShrinkMB MB (target $_displayGb GB visible in Explorer) ..."
@@ -5340,7 +5340,7 @@ function Initialize-DataDisk {
     $disk = Get-Disk -Number $cPart.DiskNumber
     if ($disk.PartitionStyle -notin @('GPT','MBR')) {
         Write-Err "Disk $($disk.Number) has unsupported partition style '$($disk.PartitionStyle)'"
-        exit 1
+        throw "Initialize-DataDisk: disk $($disk.Number) has an unsupported partition style; nothing was changed."
     }
     Write-Info "  shrinking ${sysLetter}: $([math]::Round($cPart.Size/1GB,1)) GB -> $([math]::Round($newCSize/1GB,1)) GB ..."
     Resize-Partition -DriveLetter $sysLetter -Size $newCSize -ErrorAction Stop
@@ -5661,23 +5661,23 @@ function Initialize-MiosMachineStorage {
     # Install-robustness (B2): hardware-virtualization preflight. WSL2 +
     # `podman machine init` cannot start without VT-x/AMD-V (SVM) enabled in BIOS/
     # UEFI. Fail fast before Initialize-DataDisk (reboot/disk changes).
-    try {
-        $_virtFw = $true; $_hyperv = $true
-        try { $_virtFw = [bool](Get-CimInstance Win32_Processor -EA Stop | Select-Object -First 1 -Expand VirtualizationFirmwareEnabled) } catch {}
-        try { $_hyperv = [bool](Get-CimInstance Win32_ComputerSystem -EA Stop).HypervisorPresent } catch {}
-        if (-not $_virtFw -and -not $_hyperv) {
-            Write-Err "Hardware virtualization is DISABLED -- WSL2 + podman machine cannot start."
-            Write-Err "  -> Enable Intel VT-x / AMD-V (SVM) in BIOS/UEFI, then re-run the bootstrap."
-            exit 1
-        }
-    } catch {}
+    # A failure here throws its public reason back through the worker pipe to the operator. It never exits the worker silently
+    # and never reaps or cleans anything: existing distributions, persistent state, sources and models stay as they are.
+    $_virtFw = $true; $_hyperv = $true
+    try { $_virtFw = [bool](Get-CimInstance Win32_Processor -EA Stop | Select-Object -First 1 -Expand VirtualizationFirmwareEnabled) } catch {}
+    try { $_hyperv = [bool](Get-CimInstance Win32_ComputerSystem -EA Stop).HypervisorPresent } catch {}
+    if (-not $_virtFw -and -not $_hyperv) {
+        Write-Err "Hardware virtualization is DISABLED -- WSL2 + podman machine cannot start."
+        Write-Err "  -> Enable Intel VT-x / AMD-V (SVM) in BIOS/UEFI, then re-run the bootstrap."
+        throw 'Hardware virtualization is disabled: enable Intel VT-x / AMD-V (SVM) in BIOS/UEFI, then re-run. Nothing was changed.'
+    }
 
     Write-Host ''
     Write-Host "  $_msgStep0" -ForegroundColor Cyan
-    $_dataOk = $true
-    try { Initialize-DataDisk } catch { $_dataOk = $false; Write-Host ('  ' + ($_msgStep0Failed -f $_.Exception.Message)) -ForegroundColor Yellow }
+    $_dataOk = $true; $_dataReason = ''
+    try { Initialize-DataDisk } catch { $_dataOk = $false; $_dataReason = $_.Exception.Message; Write-Host ('  ' + ($_msgStep0Failed -f $_.Exception.Message)) -ForegroundColor Yellow }
     $_dataDrive = [string](Get-MiosTomlValue -Section 'bootstrap.host_storage' -Key 'drive_letter' -Default 'C')
-    if ($_dataOk -and -not (Get-Volume -DriveLetter $_dataDrive -ErrorAction SilentlyContinue)) { $_dataOk = $false }
+    if ($_dataOk -and -not (Get-Volume -DriveLetter $_dataDrive -ErrorAction SilentlyContinue)) { $_dataOk = $false; $_dataReason = "volume ${_dataDrive}: is not present" }
     if (-not $_dataOk) {
         Write-Err "Could not provision the ${_dataDrive}:\ data partition -- MiOS stores its containers,"
         Write-Err "  packages, config and repos there, so the install cannot continue without it."
@@ -5685,33 +5685,28 @@ function Initialize-MiosMachineStorage {
         Write-Err "    - Under ~64 GB free on C:  (free some space / empty the Recycle Bin, then re-run)."
         Write-Err "    - C: is BitLocker-locked or non-shrinkable  (suspend it, then re-run the one-liner:"
         Write-Err "        manage-bde -protectors -disable C: -RebootCount 1)."
-        try { Invoke-MiOSFullReap } catch {}
-        exit 1
+        throw "Could not provision the ${_dataDrive}:\ data partition ($_dataReason); existing distributions, persistent state and source checkouts are preserved."
     }
 }
 
 function Publish-MiosMachineToml {
-    param([Parameter(Mandatory)]$Context)
+    # Publishes to exactly one explicit machine root: the selected system drive that boundary recovery just used.
+    # No other drive is repaired or written merely because it exists.
+    param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][string]$Root)
+    $_sysDrive = $Root.TrimEnd('\')
+    if ($_sysDrive -notmatch '^[A-Za-z]:$') { throw 'Machine TOML publication needs an explicit drive root.' }
     # Restrict/repair old readable credential copies before network fetching or any later provisioning can fail.
-    $_hostSecurityDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
-    $null = Repair-MiosHostTierCredentials -Paths @((Join-Path $_hostSecurityDrive 'etc\mios\mios.toml'), 'M:\etc\mios\mios.toml')
-
+    $null = Repair-MiosHostTierCredentials -Paths @((Join-Path $_sysDrive 'etc\mios\mios.toml'))
 
     try {
         $_miosVendorToml = Resolve-MiosVendorTomlText
         $_miosHostToml = Resolve-MiosTomlText
-        $_sysLetter = if ($env:SystemDrive) { $env:SystemDrive.TrimEnd(':') } else { 'C' }
-        $_sysDrive  = "${_sysLetter}:"
         if ($_miosVendorToml) {
             $_vendorDst = Join-Path $_sysDrive 'usr\share\mios\mios.toml'
             Write-MiosVendorToml -Path $_vendorDst -Text $_miosVendorToml
-            if (Test-Path 'M:\') { Write-MiosVendorToml -Path 'M:\usr\share\mios\mios.toml' -Text $_miosVendorToml }
             if ($_miosHostToml) {
                 # The operator layer stays in the user tier (~\.config\mios); the host tier gets its credential-free projection.
                 Write-MiosHostToml -Path (Join-Path $_sysDrive 'etc\mios\mios.toml') -Text $_miosHostToml
-                if (Test-Path 'M:\') {
-                    Write-MiosHostToml -Path 'M:\etc\mios\mios.toml' -Text $_miosHostToml
-                }
                 Write-Host "  [+] Full vendor mios.toml -> $_sysDrive\usr\share\mios; operator profile (credential-free) -> $_sysDrive\etc\mios" -ForegroundColor DarkGray
             } else {
                 Write-Host "  [+] Full vendor mios.toml -> $_sysDrive\usr\share\mios (no host override found)" -ForegroundColor DarkGray
@@ -5722,7 +5717,7 @@ function Publish-MiosMachineToml {
     } catch {
         throw 'Host TOML security/promotion failed; provisioning stopped. Check host-tier ACLs before retrying.'
     }
-    $_checkDst = if (Test-Path (Join-Path $_sysDrive 'usr\share\mios\mios.toml')) { Join-Path $_sysDrive 'usr\share\mios\mios.toml' } else { 'M:\usr\share\mios\mios.toml' }
+    $_checkDst = Join-Path $_sysDrive 'usr\share\mios\mios.toml'
     if (-not (Test-Path -LiteralPath $_checkDst -PathType Leaf) -or
         [IO.File]::ReadAllText($_checkDst, (New-Object System.Text.UTF8Encoding($false))) -cne $_miosVendorToml) {
         throw "Full fetched system mios.toml was not staged exactly on $_checkDst; refusing to continue the installer."
@@ -5792,9 +5787,11 @@ function Invoke-MiosMachinePreparationCore {
     if (-not (Test-MiosElevated)) { throw 'Machine preparation requires an elevated token.' }
     Assert-MiosOriginContext $Context
     $script:MiosMachineOrigin = $Context
-    # Explicit, backed-up boundary recovery on the system drive, only after the origin is validated and before any TOML write.
-    $null = Invoke-MiosMachineBoundaryRecovery -OriginSid ([string]$Context.Sid)
-    Publish-MiosMachineToml -Context $Context
+    # One explicit machine root for recovery and publication: the selected system drive, never another drive because it exists.
+    $_machineRoot = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
+    # Explicit, backed-up boundary recovery, only after the origin is validated and before any TOML write.
+    $null = Invoke-MiosMachineBoundaryRecovery -OriginSid ([string]$Context.Sid) -Root $_machineRoot
+    Publish-MiosMachineToml -Context $Context -Root $_machineRoot
     Initialize-MiosMachineStorage -Context $Context
     Add-MiosDefenderExclusions
     # The readiness gate remains mandatory and outside a warning-only catch.

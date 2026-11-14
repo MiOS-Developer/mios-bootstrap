@@ -60,7 +60,7 @@ jobs:
           function Export-MiosCiVendorBlob {
               param([string]$Repository, [string]$Blob, [string]$Destination)
               $start = [Diagnostics.ProcessStartInfo]::new()
-              $start.FileName = (Get-Command git -CommandType Application -ErrorAction Stop).Source
+              $start.FileName = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
               $start.UseShellExecute = $false
               $start.RedirectStandardOutput = $true
               $start.RedirectStandardError = $true

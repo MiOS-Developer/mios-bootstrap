@@ -191,20 +191,48 @@ function Assert-MiOSPrivateFile {
         if ($LASTEXITCODE -ne 0 -or $owner -cne [string]$caller -or ($mode -band 61440) -ne 32768 -or (-not $AllowPublicTemplate -and (($mode -band 63) -ne 0 -or ($mode -band 256) -eq 0))) { throw 'MiOS SSOT: private projection must be a caller-owned regular file without group or other access' }
     }
 }
+function New-MiOSPrivateFileSecurity {
+    $acl = [Security.AccessControl.FileSecurity]::new(); $acl.SetAccessRuleProtection($true, $false)
+    $current = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    foreach ($sid in @($current, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'), [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
+    }
+    return $acl
+}
+function Open-MiOSPrivateFileStream {
+    param([string]$Path, [ValidateSet('CreateNew','Open')][string]$Mode = 'CreateNew')
+    $ErrorActionPreference = 'Stop'
+    $fileMode = [IO.FileMode]$Mode
+    if ($env:OS -ne 'Windows_NT') {
+        $access = if ($Mode -ceq 'Open') { [IO.FileAccess]::ReadWrite } else { [IO.FileAccess]::Write }
+        return [IO.FileStream]::new($Path, $fileMode, $access, [IO.FileShare]::None)
+    }
+    $acl = New-MiOSPrivateFileSecurity
+    # Persisting a DACL through a handle requires WRITE_DAC. Apply the private
+    # descriptor at creation as well, before a temporary file can hold any bytes.
+    [Security.AccessControl.FileSystemRights]$rights = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::ChangePermissions
+    if ($Mode -ceq 'Open') { $rights = $rights -bor [Security.AccessControl.FileSystemRights]::Read }
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        return [IO.FileStream]::new($Path, $fileMode, $rights, [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $acl)
+    }
+    $method = @([IO.FileSystemAclExtensions].GetMethods() | Where-Object { $_.Name -eq 'Create' -and $_.GetParameters().Count -eq 7 -and
+        $_.GetParameters()[0].ParameterType -eq [IO.FileInfo] -and $_.GetParameters()[6].ParameterType -eq [Security.AccessControl.FileSecurity] }) | Select-Object -First 1
+    if (-not $method) { throw 'MiOS SSOT: atomic private file creation with protected access is unavailable' }
+    return $method.Invoke($null, [object[]]@(([IO.FileInfo]::new($Path)).psobject.BaseObject, $fileMode, $rights,
+        [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $acl.psobject.BaseObject))
+}
 function Set-MiOSPrivateStream {
     param([IO.FileStream]$Stream)
+    $ErrorActionPreference = 'Stop'
     if ($env:OS -eq 'Windows_NT') {
-        $acl = [Security.AccessControl.FileSecurity]::new(); $acl.SetAccessRuleProtection($true, $false)
-        $current = [Security.Principal.WindowsIdentity]::GetCurrent().User
-        foreach ($sid in @($current, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'), [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))) {
-            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
-        }
+        $acl = New-MiOSPrivateFileSecurity
         if ($stream.PSObject.Methods.Name -contains 'SetAccessControl') { $stream.SetAccessControl($acl) }
         else { [IO.FileSystemAclExtensions]::SetAccessControl($stream, $acl) }
     } else { [IO.File]::SetUnixFileMode($stream.SafeFileHandle, [IO.UnixFileMode]384) }
 }
 function Write-MiOSPrivateText {
     param([string]$Path, [AllowEmptyString()][string]$Text, $Encoding = ([Text.UTF8Encoding]::new($false)), [string]$PublicTemplateSha256)
+    $ErrorActionPreference = 'Stop'
     if ($Encoding -is [string]) {
         if ($Encoding -in @('UTF8','UTF-8')) { $Encoding = [Text.UTF8Encoding]::new($false) }
         elseif ($Encoding -eq 'ASCII') { $Encoding = [Text.Encoding]::ASCII }
@@ -218,7 +246,7 @@ function Write-MiOSPrivateText {
     $tmp = [IO.Path]::Combine($dir, '.mios-private-' + [Guid]::NewGuid().ToString('N'))
     $stream = $null
     try {
-        $stream = [IO.FileStream]::new($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $stream = Open-MiOSPrivateFileStream -Path $tmp
         Set-MiOSPrivateStream -Stream $stream
         $bytes = $Encoding.GetBytes($Text); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true); $stream.Dispose(); $stream = $null
         if ([IO.File]::Exists($target) -or [IO.Directory]::Exists($target)) {
@@ -230,7 +258,7 @@ function Write-MiOSPrivateText {
                 Assert-MiOSPrivateFile -Path $target -AllowPublicTemplate
                 $item = Get-Item -LiteralPath $target -Force -ErrorAction Stop
                 if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'MiOS SSOT: public template must be a regular non-link file' }
-                $old = [IO.FileStream]::new($target, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                $old = Open-MiOSPrivateFileStream -Path $target -Mode Open
                 try {
                     $hash = [Security.Cryptography.SHA256]::Create()
                     try { $actual = ([BitConverter]::ToString($hash.ComputeHash($old))).Replace('-', '').ToLowerInvariant() }

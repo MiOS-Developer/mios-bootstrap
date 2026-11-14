@@ -2421,6 +2421,7 @@ function Get-MiosMachineWorkerScript {
         'Get-MiosMachinePodmanExe', 'Get-MiosMachinePodmanVersion', 'Get-MiosPodmanVersion', 'Get-MiosRequiredPodmanVersion',
         'Get-MiosPinnedDownloadBytes', 'Invoke-MiosMsiInstall', 'Install-MiosPodmanClient', 'Read-MiosPodmanUninstallEntries',
         'Get-MiosOlderPodmanEntries', 'Get-MiosPodmanRemovalPlan', 'Invoke-MiosPodmanRemoval', 'Remove-MiosOlderPodman',
+        'Get-MiosMachinePodmanPaths', 'Get-MiosMachinePath', 'Get-MiosMsiPackageInfo', 'Get-MiosMsiRelatedProducts', 'Remove-MiosPerUserPodman',
         'Read-MiosPipeLine', 'Invoke-MiosMachineWorker', 'Invoke-MiosMachinePreparationRequest', 'Invoke-MiosMachinePreparationCore')
     $functions = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $names }, $true))
     foreach ($name in $names) { if (@($functions | Where-Object Name -eq $name).Count -ne 1) { throw "Missing or duplicate machine helper: $name" } }
@@ -5242,20 +5243,25 @@ function Ensure-Git {
     }
 }
 
+function Get-MiosMachinePodmanPaths {
+    # The per-machine podman.exe locations, all under %ProgramFiles% (administrator-writable): the pinned 6.x MSI's
+    # INSTALLDIR first, then the 5.x setup bundle's layout. Never PATH, never a user profile.
+    return @((Join-Path ${env:ProgramFiles} 'Podman\podman.exe'), (Join-Path ${env:ProgramFiles} 'RedHat\Podman\podman.exe'))
+}
+
 function Resolve-MiosPodmanExe {
-    # User side only: the podman.exe this unelevated session would run, or $null. Explicit install path after PATH.
+    # User side only: the podman.exe this unelevated session would run, or $null. The per-machine install paths after
+    # PATH, so a client the elevated stage just installed is found before a new logon picks up the machine PATH.
     $cmd = Get-Command podman -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($cmd) { return [string]$cmd.Source }
-    $candidate = Join-Path ${env:ProgramFiles} 'RedHat\Podman\podman.exe'
-    if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    foreach ($candidate in @(Get-MiosMachinePodmanPaths)) { if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate } }
     return $null
 }
 
 function Get-MiosMachinePodmanExe {
-    # Elevated side: only the MSI's machine path, never PATH. Under admin-approval UAC the elevated PATH still carries
+    # Elevated side: only the per-machine install paths, never PATH. Under admin-approval UAC the elevated PATH still carries
     # user-writable directories (WinGet Links, WindowsApps), so a podman.exe found through PATH could be a planted one.
-    $path = Join-Path ${env:ProgramFiles} 'RedHat\Podman\podman.exe'
-    if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
+    foreach ($path in @(Get-MiosMachinePodmanPaths)) { if (Test-Path -LiteralPath $path -PathType Leaf) { return $path } }
     return $null
 }
 
@@ -5300,10 +5306,78 @@ function Get-MiosPinnedDownloadBytes {
 }
 
 function Invoke-MiosMsiInstall {
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path, [string[]]$Properties = @())
     $msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
-    $proc = Start-Process -FilePath $msiexec -ArgumentList @('/i', ('"' + $Path + '"'), '/qn', '/norestart') -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+    $proc = Start-Process -FilePath $msiexec -ArgumentList (@('/i', ('"' + $Path + '"')) + @($Properties) + @('/qn', '/norestart')) -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
     return [int]$proc.ExitCode
+}
+
+function Get-MiosMachinePath {
+    # The machine-wide PATH (HKLM Environment) as stored, without this process's additions.
+    return [string][Environment]::GetEnvironmentVariable('Path', 'Machine')
+}
+
+function Get-MiosMsiPackageInfo {
+    # ProductCode, UpgradeCode and Manufacturer from an MSI's own Property table, opened read-only through Windows Installer
+    # (msiOpenDatabaseModeReadOnly). Called only on the private copy after its sha256, signature and signer are verified.
+    param([Parameter(Mandatory)][string]$Path)
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($Path, [int]0))
+    $info = [ordered]@{}
+    try {
+        foreach ($name in 'ProductCode', 'UpgradeCode', 'Manufacturer') {
+            $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$name'"))
+            try {
+                [void]$view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+                $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+                $info[$name] = if ($record) { [string]$record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, [object[]]@([int]1)) } else { '' }
+            } finally {
+                [void]$view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null)
+                [void][Runtime.InteropServices.Marshal]::ReleaseComObject($view)
+            }
+        }
+    } finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db) }
+    return [pscustomobject]$info
+}
+
+function Get-MiosMsiRelatedProducts {
+    # The installed products of one UpgradeCode as this (elevated) account sees them: the per-machine ones and its own
+    # per-user ones. AssignmentType is Windows Installer's own: '1' per-machine, '0' per-user.
+    param([Parameter(Mandatory)][string]$UpgradeCode)
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $related = $installer.GetType().InvokeMember('RelatedProducts', 'GetProperty', $null, $installer, @($UpgradeCode))
+    $count = [int]$related.GetType().InvokeMember('Count', 'GetProperty', $null, $related, $null)
+    $products = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $count; $i++) {
+        $code = [string]$related.GetType().InvokeMember('Item', 'GetProperty', $null, $related, [object[]]@([int]$i))
+        $assignment = [string]$installer.GetType().InvokeMember('ProductInfo', 'GetProperty', $null, $installer, [object[]]@($code, 'AssignmentType'))
+        $version = [string]$installer.GetType().InvokeMember('ProductInfo', 'GetProperty', $null, $installer, [object[]]@($code, 'VersionString'))
+        $products.Add([pscustomobject]@{ ProductCode = $code; AssignmentType = $assignment; Version = $version })
+    }
+    return $products.ToArray()
+}
+
+function Remove-MiosPerUserPodman {
+    # A per-user install of the pinned package family (the UpgradeCode read from the verified MSI) belongs to the account
+    # that elevated, not to the machine, and the operator account never sees it. It is removed by its GUID-validated
+    # ProductCode with msiexec /x in this account's context, then re-checked. Per-machine products of the family are left to
+    # the MSI's own upgrade; any other state refuses before install.
+    param([Parameter(Mandatory)][string]$UpgradeCode)
+    $guid = '^\{[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$'
+    $related = @(Get-MiosMsiRelatedProducts -UpgradeCode $UpgradeCode)
+    $unknown = @($related | Where-Object { $_.AssignmentType -notin @('0', '1') -or $_.ProductCode -notmatch $guid })
+    if ($unknown.Count) { throw "A Podman product of the pinned family has an unexpected Windows Installer registration ($(@($unknown | ForEach-Object { "$($_.ProductCode) assignment '$($_.AssignmentType)'" }) -join ', ')); nothing was removed and the pinned Podman MSI was not installed." }
+    $perUser = @($related | Where-Object { $_.AssignmentType -eq '0' })
+    $removed = 0
+    foreach ($p in $perUser) {
+        Write-Info "Removing the per-user Podman $($p.Version) [$($p.ProductCode)] of this elevated account; MiOS installs Podman per-machine."
+        $code = Invoke-MiosPodmanRemoval -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -Arguments @('/x', $p.ProductCode, '/qn', '/norestart')
+        if ($code -notin @(0, 3010)) { throw "Removing the per-user Podman $($p.Version) [$($p.ProductCode)] failed (exit $code); the pinned Podman MSI was not installed." }
+        $removed++
+    }
+    $left = @(@(Get-MiosMsiRelatedProducts -UpgradeCode $UpgradeCode) | Where-Object { $_.AssignmentType -ne '1' })
+    if ($left.Count) { throw "A per-user Podman is still installed for this elevated account after removal ($(@($left | ForEach-Object { "$($_.Version) [$($_.ProductCode)]" }) -join ', ')); the pinned Podman MSI was not installed." }
+    return $removed
 }
 
 function Read-MiosPodmanUninstallEntries {
@@ -5426,22 +5500,43 @@ function Install-MiosPodmanClient {
         if ([string]$signature.Status -ne 'Valid') { throw "The pinned Podman MSI signature is $($signature.Status), not Valid. Nothing was installed." }
         $subject = if ($signature.SignerCertificate) { [string]$signature.SignerCertificate.Subject } else { '' }
         if ($subject -cne $signer) { throw "The pinned Podman MSI is signed by '$subject', not the SSOT signer '$signer'. Nothing was installed." }
+        # The verified package's own identity; its UpgradeCode names the family whose per-user installs are removed below.
+        $package = Get-MiosMsiPackageInfo -Path $msi
+        $guid = '^\{[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$'
+        if ($package.ProductCode -notmatch $guid -or $package.UpgradeCode -notmatch $guid) { throw "The verified Podman MSI has no valid ProductCode/UpgradeCode ('$($package.ProductCode)', '$($package.UpgradeCode)'). Nothing was installed." }
+        Write-Info "Verified Podman MSI: ProductCode $($package.ProductCode), UpgradeCode $($package.UpgradeCode), Manufacturer '$($package.Manufacturer)'."
         # Only with a verified replacement in hand: remove an older Red Hat Podman the MSI cannot upgrade, then re-check.
         $removed = Remove-MiosOlderPodman -Required $required -Signer $signer
         # Re-read the machine client after a removal: anything left at the machine path must still carry the SSOT signer.
         if ($removed) { $null = Get-MiosMachinePodmanVersion -Signer $signer }
-        $code = Invoke-MiosMsiInstall -Path $msi
+        $removed += Remove-MiosPerUserPodman -UpgradeCode $package.UpgradeCode
+        # The package is dual-purpose (ALLUSERS=2, MSIINSTALLPERUSER=1): without these it installs per-user for whichever
+        # account approved the UAC prompt. ALLUSERS=1 makes it per-machine, and MSIINSTALLPERUSER=0 (not "", which Windows
+        # PowerShell 5.1 would strip) selects its machine-PATH component instead of the per-user one.
+        $code = Invoke-MiosMsiInstall -Path $msi -Properties @('ALLUSERS=1', 'MSIINSTALLPERUSER=0')
         if ($code -notin @(0, 3010)) {
             $state = if ($removed) { "the older Podman was already removed ($removed registration(s))" } else { "$have is unchanged" }
             throw "msiexec could not install the verified Podman MSI (exit $code); $state."
         }
     } finally { Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue }
-    $after = Get-MiosMachinePodmanVersion -Signer $signer
-    if (-not $after -or (New-Object Version $after.Major, $after.Minor) -lt $required) {
-        $now = if ($after) { "Podman $after" } else { 'no Podman client' }
-        throw "After installing the verified MSI, $now is still older than machine-os $required."
+    # Windows Installer itself must report the verified product per-machine.
+    $scope = @(@(Get-MiosMsiRelatedProducts -UpgradeCode $package.UpgradeCode) | Where-Object { $_.ProductCode -eq $package.ProductCode })
+    if (-not @($scope | Where-Object { $_.AssignmentType -eq '1' }).Count) {
+        throw "The verified Podman MSI $($package.ProductCode) installed per-user for this elevated account, not per-machine; the operator account cannot use it."
     }
-    Write-Good "Podman client $after installed from the verified MSI"
+    $after = Get-MiosMachinePodmanVersion -Signer $signer
+    if (-not $after) {
+        throw "After installing the verified MSI, no Podman client was found at $(@(Get-MiosMachinePodmanPaths) -join ' or '); the elevated stage trusts only those per-machine paths."
+    }
+    if ((New-Object Version $after.Major, $after.Minor) -lt $required) {
+        throw "After installing the verified MSI, Podman $after is still older than machine-os $required."
+    }
+    # The package's machine-PATH component puts its INSTALLDIR on the machine PATH; the user side also finds the exe directly.
+    $installDir = Split-Path -Parent @(Get-MiosMachinePodmanPaths)[0]
+    if (-not @(@((Get-MiosMachinePath) -split ';') | Where-Object { $_.Trim().TrimEnd('\') -ieq $installDir }).Count) {
+        Write-Info "Warning: the machine PATH does not list $installDir; the operator side finds $(@(Get-MiosMachinePodmanPaths)[0]) directly."
+    }
+    Write-Good "Podman client $after installed per-machine from the verified MSI"
     return 'installed'
 }
 
@@ -5450,6 +5545,14 @@ function Ensure-PodmanDesktop {
     $env:PATH = [Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('PATH', 'User') + ';' + $env:PATH
     if (Get-Command podman -ErrorAction SilentlyContinue) {
         Write-Good "Podman already installed ($((podman --version) 2>&1))"
+        return
+    }
+    # A per-machine client the elevated stage installed is used even if the machine PATH has not picked it up yet; its
+    # directory goes first on this session's PATH so build-mios and its guard resolve the same exe. No winget run over it.
+    $machineClient = Resolve-MiosPodmanExe
+    if ($machineClient) {
+        $env:PATH = (Split-Path -Parent $machineClient) + ';' + $env:PATH
+        Write-Good "Podman already installed at $machineClient"
         return
     }
     # Check if we should install Podman Desktop
@@ -5504,6 +5607,7 @@ function Ensure-PodmanDesktop {
         # CLI install dir, Podman Desktop's resources bundle, the older
         # podman-machine standalone, plus any user-scope variants.
         $pmCandidates = @(
+            (Join-Path ${env:ProgramFiles}      'Podman'),
             (Join-Path ${env:ProgramFiles}      'RedHat\Podman\bin'),
             (Join-Path ${env:ProgramFiles}      'RedHat\Podman'),
             (Join-Path ${env:ProgramFiles}      'RedHat\Podman\resources\app\binary'),

@@ -39,7 +39,8 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
     $script:fail = 0; $script:checks = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
     $entryAst = Get-Ast $Entry; $buildAst = Get-Ast $Build
     Import-Functions $entryAst @('Get-MiosTomlValue', 'Get-MiosPodmanVersion', 'Get-MiosRequiredPodmanVersion', 'Install-MiosPodmanClient', 'Get-MiosMachineWorkerScript',
-        'Get-MiosMachinePodmanExe', 'Get-MiosMachinePodmanVersion', 'Get-MiosOlderPodmanEntries', 'Get-MiosPodmanRemovalPlan', 'Remove-MiosOlderPodman')
+        'Get-MiosMachinePodmanExe', 'Get-MiosMachinePodmanVersion', 'Get-MiosOlderPodmanEntries', 'Get-MiosPodmanRemovalPlan', 'Remove-MiosOlderPodman',
+        'Get-MiosMachinePodmanPaths', 'Remove-MiosPerUserPodman', 'Resolve-MiosPodmanExe')
     $savedProgramData = $env:ProgramData
     Import-Functions $buildAst @('Assert-MiosPodmanInitSupport')
 
@@ -82,7 +83,7 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
     function global:Resolve-MiosTomlText { return $script:operatorText }
 
     # --- Elevated-stage collaborators: recorded, never real ----------------------------------------------------------
-    function global:Write-Info { param($m) }
+    function global:Write-Info { param($m) $script:infos.Add([string]$m) }
     function global:Write-Good { param($m) }
     function global:Log-Fail { param($m) $script:logged = $m }
     function global:Assert-MiosMachineWriteBoundary { param($Path) }
@@ -125,21 +126,38 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
     function global:Invoke-MiosPodmanRemoval {
         param([string]$FilePath, [string[]]$Arguments)
         $script:removals.Add($FilePath + '|' + ($Arguments -join ' '))
-        $kind = if ($FilePath -like '*podman-setup.exe') { 'bundle' } else { 'msi' }
+        $kind = if ($FilePath -like '*podman-setup.exe') { 'bundle' } elseif (@($script:related | ForEach-Object { $_.ProductCode }) -contains $Arguments[1]) { 'peruser' } else { 'msi' }
         $script:events.Add('remove-' + $kind)
         if ($script:removalExit -notin @(0, 3010) -or $script:removalLeavesEntries) { return $script:removalExit }
+        if ($kind -eq 'peruser') { $script:related = @($script:related | Where-Object { $_.ProductCode -ne $Arguments[1] }); return $script:removalExit }
         $gone = if ($kind -eq 'bundle') { @($script:registry | Where-Object { $_.BundleCachePath -eq $FilePath -or ($script:bundleRemovesMsi -and $_.Key -eq $msiKey) }) }
                 else { @($script:registry | Where-Object { $_.Key -eq $Arguments[1] }) }
         $script:registry = @($script:registry | Where-Object { $gone -notcontains $_ })
         $script:clientAbsent = $true
         return $script:removalExit
     }
+    # --- Windows Installer: the verified package's identity and the products of its family, never real ----------------
+    $productCode = '{1F3FA496-3F50-4C98-BAEA-464990EDF033}'; $upgradeCode = '{A6A9DD9C-0732-44BA-9279-FFE22EA50671}'
+    $installDir = Join-Path $env:ProgramFiles 'Podman'
+    function New-Related([string]$Code = $productCode, [string]$Assignment = '0', [string]$Version = '6.2.0') { return [pscustomobject]@{ ProductCode = $Code; AssignmentType = $Assignment; Version = $Version } }
+    function global:Get-MiosMsiPackageInfo { param($Path) $script:events.Add('package-read'); $script:packageReads.Add($Path); return $script:package }
+    function global:Get-MiosMsiRelatedProducts { param($UpgradeCode) $script:relatedQueries.Add($UpgradeCode); return @($script:related) }
+    function global:Get-MiosMachinePath { return $script:machinePath }
     function global:Invoke-MiosMsiInstall {
-        param($Path)
+        # Behaves like the pinned dual-purpose package (ALLUSERS=2, MSIINSTALLPERUSER=1): without ALLUSERS=1 it installs
+        # per-user for the elevating account, leaving nothing under Program Files (run 5); its machine-PATH component is
+        # selected only with ALLUSERS=1 AND NOT MSIINSTALLPERUSER=1.
+        param($Path, [string[]]$Properties = @())
         $script:events.Add('install')
         $script:installs.Add($Path)
+        $script:installProperties = @($Properties)
         $script:installedExisted = Test-Path -LiteralPath $Path
-        if ($script:msiUpgradesTo) { $env:MIOS_FAKE_PODMAN_VERSION = $script:msiUpgradesTo; $script:clientAbsent = $false }
+        if ($script:msiExit -notin @(0, 3010)) { return $script:msiExit }
+        $perMachine = ($Properties -contains 'ALLUSERS=1') -and -not $script:forcePerUser
+        $perUserProperty = if ($Properties -contains 'MSIINSTALLPERUSER=0') { '0' } else { '1' }
+        $script:related = @(@($script:related | Where-Object { $_.ProductCode -ne $script:package.ProductCode }) + @(New-Related -Code $script:package.ProductCode -Assignment $(if ($perMachine) { '1' } else { '0' })))
+        if ($perMachine -and $perUserProperty -ne '1') { $script:machinePath = $script:machinePath + ';' + $installDir }
+        if ($perMachine -and $script:msiUpgradesTo -and -not $script:installLeavesNoExe) { $env:MIOS_FAKE_PODMAN_VERSION = $script:msiUpgradesTo; $script:clientAbsent = $false }
         return $script:msiExit
     }
     $download = Join-Path $scratch 'downloads'
@@ -156,6 +174,10 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
         $script:registry = @(); $script:removals = New-Object System.Collections.Generic.List[string]; $script:events = New-Object System.Collections.Generic.List[string]
         $script:bundleSigStatus = 'Valid'; $script:bundleSigSubject = $signer; $script:bundleSignatureChecks = New-Object System.Collections.Generic.List[string]
         $script:removalExit = 0; $script:bundleRemovesMsi = $false; $script:removalLeavesEntries = $false
+        $script:package = [pscustomobject]@{ ProductCode = $productCode; UpgradeCode = $upgradeCode; Manufacturer = 'Podman' }
+        $script:related = @(); $script:machinePath = 'C:\Windows\system32;C:\Windows'; $script:installProperties = @()
+        $script:infos = New-Object System.Collections.Generic.List[string]; $script:packageReads = New-Object System.Collections.Generic.List[string]
+        $script:relatedQueries = New-Object System.Collections.Generic.List[string]; $script:forcePerUser = $false; $script:installLeavesNoExe = $false
         if (Test-Path -LiteralPath $download) { Remove-Item -LiteralPath $download -Recurse -Force }
     }
     function Invoke-Install { $script:outcome = $null; $script:installError = ''; try { $script:outcome = Install-MiosPodmanClient -DownloadDirectory $download } catch { $script:installError = $_.Exception.Message } }
@@ -178,10 +200,20 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
     $plantMarker = Join-Path $scratch 'planted-ran.txt'; Remove-Item -LiteralPath $plantMarker -Force -ErrorAction SilentlyContinue
     [IO.File]::WriteAllText((Join-Path $planted 'podman.cmd'), ("@echo off`r`necho ran>>""" + $plantMarker + """`r`necho podman version 9.9.9`r`n"), (New-Object Text.ASCIIEncoding))
     $emptyProgramFiles = Join-Path $scratch 'ProgramFiles'; New-Item -ItemType Directory -Force -Path $emptyProgramFiles | Out-Null
-    $savedProgramFiles = $env:ProgramFiles; $savedPath = $env:PATH
-    try { $env:ProgramFiles = $emptyProgramFiles; $env:PATH = $planted + ';' + $env:PATH; Invoke-Install }
+    # Run 5's per-user copy lived in the elevating account's profile; it must never count as the machine client.
+    $profileApp = Join-Path $scratch 'LocalAppData'; New-Item -ItemType Directory -Force -Path (Join-Path $profileApp 'Programs\Podman') | Out-Null
+    [IO.File]::WriteAllText((Join-Path $profileApp 'Programs\Podman\podman.exe'), 'fixture per-user client')
+    $savedProgramFiles = $env:ProgramFiles; $savedPath = $env:PATH; $savedLocalAppData = $env:LOCALAPPDATA
+    try { $env:ProgramFiles = $emptyProgramFiles; $env:LOCALAPPDATA = $profileApp; $env:PATH = $planted + ';' + $env:PATH; Invoke-Install }
+    finally { $env:ProgramFiles = $savedProgramFiles; $env:PATH = $savedPath; $env:LOCALAPPDATA = $savedLocalAppData }
+    Check (-not (Test-Path -LiteralPath $plantMarker) -and $script:exeSignatureChecks.Count -eq 0) 'neither a podman planted on PATH nor a per-user profile copy is considered by the elevated check'
+    # The user side finds a fresh per-machine 6.x even before the machine PATH reaches this session.
+    $pf = Join-Path $scratch 'ProgramFilesWith6'; New-Item -ItemType Directory -Force -Path (Join-Path $pf 'Podman') | Out-Null
+    [IO.File]::WriteAllText((Join-Path $pf 'Podman\podman.exe'), 'fixture machine client')
+    $resolved = $null
+    try { $env:ProgramFiles = $pf; $env:PATH = Join-Path $env:SystemRoot 'System32'; $resolved = Resolve-MiosPodmanExe }
     finally { $env:ProgramFiles = $savedProgramFiles; $env:PATH = $savedPath }
-    Check (-not (Test-Path -LiteralPath $plantMarker) -and $script:exeSignatureChecks.Count -eq 0) 'a podman planted earlier on PATH is never run by the elevated check'
+    Check ($resolved -eq (Join-Path $pf 'Podman\podman.exe')) 'the user side finds a per-machine 6.x podman.exe that is not yet on PATH'
     Reset-Scenario '6.2.0'; Invoke-Install
     Check ($script:outcome -eq 'current' -and $script:downloads.Count -eq 0 -and $script:installs.Count -eq 0) 'a 6.2 client skips the MSI path'
     Reset-Scenario '6.3.1'; Invoke-Install
@@ -205,7 +237,36 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
     Reset-Scenario; $script:msiExit = 1603; $script:msiUpgradesTo = $null; Invoke-Install
     Check ($script:installError -match 'exit 1603' -and @(Get-ChildItem -LiteralPath $download -Force).Count -eq 0) 'an msiexec failure is reported and the private copy is removed'
     Reset-Scenario; $script:msiUpgradesTo = $null; Invoke-Install
-    Check ($script:installError -match 'still older than machine-os 6.2') 'a client still too old after the install is refused'
+    Check ($script:installError -match 'Podman 5\.8\.10 is still older than machine-os 6.2') 'a client still too old after the install is refused'
+    Reset-Scenario; $script:clientAbsent = $true; $script:installLeavesNoExe = $true; Invoke-Install
+    Check ($script:installError -match 'no Podman client was found at ' -and $script:installError.Contains((Join-Path $env:ProgramFiles 'Podman\podman.exe')) -and
+           $script:installError -notmatch 'still older') 'no client at the per-machine paths after install is reported as missing, not as older'
+
+    # --- Install scope: the dual-purpose package must install per-machine (run 5 installed it per-user for MIOS\admin) ---
+    Reset-Scenario '5.8.10'; Invoke-Install
+    Check ($script:outcome -eq 'installed' -and (@($script:installProperties) -join ' ') -ceq 'ALLUSERS=1 MSIINSTALLPERUSER=0' -and
+           @($script:related | Where-Object { $_.ProductCode -eq $productCode -and $_.AssignmentType -eq '1' }).Count -eq 1) 'the verified MSI is installed per-machine (ALLUSERS=1 MSIINSTALLPERUSER=0) and Windows Installer reports it per-machine'
+    Check (@($script:infos | Where-Object { $_ -match '^Warning: the machine PATH' }).Count -eq 0 -and (@($script:machinePath -split ';') -contains $installDir)) 'the per-machine install selects the machine PATH component, with no PATH warning'
+    Check ($script:packageReads.Count -eq 1 -and $script:packageReads[0] -eq $script:installs[0] -and @($script:relatedQueries | Where-Object { $_ -ne $upgradeCode }).Count -eq 0 -and
+           @($script:infos | Where-Object { $_ -eq "Verified Podman MSI: ProductCode $productCode, UpgradeCode $upgradeCode, Manufacturer 'Podman'." }).Count -eq 1) 'ProductCode, UpgradeCode and Manufacturer come from the verified private copy, are logged, and only that UpgradeCode is queried'
+    $perUserCall = $msiexecPath + '|/x ' + $productCode + ' /qn /norestart'
+    Reset-Scenario; $script:clientAbsent = $true; $script:related = @(New-Related -Assignment '0'); Invoke-Install
+    Check ($script:outcome -eq 'installed' -and (@($script:removals) -join ';') -ceq $perUserCall -and (@($script:events) -join ',') -ceq 'package-read,remove-peruser,install' -and
+           @($script:related | Where-Object { $_.AssignmentType -eq '0' }).Count -eq 0) 'run 5''s per-user 6.2 of the elevating account is removed by its ProductCode, then the MSI installs per-machine'
+    Reset-Scenario; $script:clientAbsent = $true; $script:related = @(New-Related -Code '{44444444-4444-4444-4444-444444444444}' -Assignment '1' -Version '6.1.0'); Invoke-Install
+    Check ($script:outcome -eq 'installed' -and $script:removals.Count -eq 0 -and @($script:related | Where-Object { $_.ProductCode -like '{4444*' }).Count -eq 1) 'a per-machine product of the family is left to the MSI''s own upgrade'
+    Reset-Scenario; $script:clientAbsent = $true; $script:related = @(New-Related -Code 'not-a-guid' -Assignment '0'); Invoke-Install
+    Check ($script:installError -match 'unexpected Windows Installer registration' -and $script:removals.Count -eq 0 -and $script:installs.Count -eq 0) 'a related product with a non-GUID code refuses with nothing removed'
+    Reset-Scenario; $script:clientAbsent = $true; $script:related = @(New-Related -Assignment '7'); Invoke-Install
+    Check ($script:installError -match 'unexpected Windows Installer registration' -and $script:removals.Count -eq 0 -and $script:installs.Count -eq 0) 'a related product with an unknown assignment refuses with nothing removed'
+    Reset-Scenario; $script:clientAbsent = $true; $script:related = @(New-Related -Assignment '0'); $script:removalExit = 1603; Invoke-Install
+    Check ($script:installError -match 'per-user Podman 6\.2\.0 .* failed \(exit 1603\)' -and $script:installs.Count -eq 0) 'a per-user removal failure refuses before install'
+    Reset-Scenario; $script:clientAbsent = $true; $script:related = @(New-Related -Assignment '0'); $script:removalLeavesEntries = $true; Invoke-Install
+    Check ($script:installError -match 'still installed for this elevated account after removal' -and $script:installs.Count -eq 0) 'a per-user install still present after removal refuses before install'
+    Reset-Scenario; $script:forcePerUser = $true; Invoke-Install
+    Check ($script:installError -match 'installed per-user for this elevated account, not per-machine') 'an install Windows Installer reports per-user is refused'
+    Reset-Scenario; $script:package = [pscustomobject]@{ ProductCode = $productCode; UpgradeCode = ''; Manufacturer = 'Podman' }; $script:registry = @(New-RealShape); Invoke-Install
+    Check ($script:installError -match 'no valid ProductCode/UpgradeCode' -and $script:removals.Count -eq 0 -and $script:installs.Count -eq 0) 'a verified MSI without a valid UpgradeCode refuses with nothing removed'
     Reset-Scenario; $script:vendorText = New-Vendor -Tag 'latest'; Invoke-Install
     Check ($script:installError -match 'machine_os_tag') 'an unversioned machine-os tag refuses the comparison'
 
@@ -213,7 +274,7 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
     $bundleCall = $cacheExe + '|/uninstall /quiet /norestart'; $msiCall = $msiexecPath + '|/x ' + $msiKey + ' /qn /norestart'
     Reset-Scenario '5.8.10'; $script:registry = @(New-RealShape) + $bystanders; Invoke-Install
     Check ($script:outcome -eq 'installed' -and (@($script:removals) -join ';') -ceq ($bundleCall + ';' + $msiCall) -and
-           (@($script:events) -join ',') -ceq 'remove-bundle,remove-msi,install' -and $script:bundleSignatureChecks.Count -eq 1) 'an older bundle and its MSI are removed in order with fixed arguments, then 6.2 is installed'
+           (@($script:events) -join ',') -ceq 'package-read,remove-bundle,remove-msi,install' -and $script:bundleSignatureChecks.Count -eq 1) 'an older bundle and its MSI are removed in order with fixed arguments, then 6.2 is installed'
     Check (@($script:registry | Where-Object { $bystanders -contains $_ }).Count -eq 3 -and @($script:removals | Where-Object { $_ -match '\{(1|2|3)' }).Count -eq 0) 'Podman Desktop, a non-Red Hat Podman and a current 6.2 entry are never touched'
     Reset-Scenario '5.8.10'; $script:registry = @(New-RealShape); $script:bundleRemovesMsi = $true; Invoke-Install
     Check ($script:outcome -eq 'installed' -and (@($script:removals) -join ';') -ceq $bundleCall) 'an MSI its bundle already removed is not removed again'
@@ -274,8 +335,10 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
     Check (-not ($ensure -match 'WebClient|DownloadFile|msiexec|podman_url|Invoke-RestMethod')) 'the user-side Podman step has no unverified download or install path'
     $machineText = (Get-Function $entryAst 'Get-MiosMachinePodmanExe').Body.Extent.Text
     $versionText = (Get-Function $entryAst 'Get-MiosMachinePodmanVersion').Body.Extent.Text
-    Check (-not ($installText -match 'Resolve-MiosPodmanExe|Get-Command|\$env:PATH') -and -not ($machineText -match 'Get-Command|\$env:PATH|Resolve-MiosPodmanExe') -and
-           $machineText.Contains("Join-Path `${env:ProgramFiles} 'RedHat\Podman\podman.exe'") -and
+    $pathsText = (Get-Function $entryAst 'Get-MiosMachinePodmanPaths').Body.Extent.Text
+    Check (-not ($installText -match 'Resolve-MiosPodmanExe|Get-Command|\$env:PATH') -and -not (($machineText + $pathsText) -match 'Get-Command|\$env:PATH|Resolve-MiosPodmanExe|LOCALAPPDATA|USERPROFILE|APPDATA') -and
+           $machineText.Contains('@(Get-MiosMachinePodmanPaths)') -and $pathsText.Contains("Join-Path `${env:ProgramFiles} 'Podman\podman.exe'") -and
+           $pathsText.Contains("Join-Path `${env:ProgramFiles} 'RedHat\Podman\podman.exe'") -and
            @([regex]::Matches($installText, 'Get-MiosMachinePodmanVersion -Signer \$signer')).Count -eq 3 -and
            $versionText.IndexOf('Get-AuthenticodeSignature -LiteralPath $exe') -ge 0 -and
            $versionText.IndexOf('Get-AuthenticodeSignature -LiteralPath $exe') -lt $versionText.IndexOf('Get-MiosPodmanVersion $exe')) 'the elevated check resolves only the machine path and verifies it before running it'
@@ -288,10 +351,22 @@ function Invoke-Checks([string]$Entry, [string]$Build) {
            $removeText.Contains('Invoke-MiosPodmanRemoval -FilePath $step.FilePath -Arguments $step.Arguments')) 'removal reads both registry views as data and runs only fixed arguments'
     $removeAt = $installText.IndexOf('Remove-MiosOlderPodman -Required $required -Signer $signer')
     Check ($removeAt -gt $signerAt -and $removeAt -lt $msiAt) 'older registrations are removed only after the replacement MSI is verified and before it installs'
+    $packageAt = $installText.IndexOf('$package = Get-MiosMsiPackageInfo -Path $msi'); $perUserAt = $installText.IndexOf('Remove-MiosPerUserPodman -UpgradeCode $package.UpgradeCode')
+    $scopeAt = $installText.IndexOf('$scope = @(@(Get-MiosMsiRelatedProducts -UpgradeCode $package.UpgradeCode)')
+    Check ($packageAt -gt $signerAt -and $packageAt -lt $removeAt -and $perUserAt -gt $removeAt -and $perUserAt -lt $msiAt -and $scopeAt -gt $msiAt -and
+           $installText.Contains("Invoke-MiosMsiInstall -Path `$msi -Properties @('ALLUSERS=1', 'MSIINSTALLPERUSER=0')")) 'the package identity is read after the signer check; per-user removal precedes the per-machine install; the scope is checked after it'
+    $msiexecText = (Get-Function $entryAst 'Invoke-MiosMsiInstall').Body.Extent.Text
+    $infoText = (Get-Function $entryAst 'Get-MiosMsiPackageInfo').Body.Extent.Text
+    $perUserText = (Get-Function $entryAst 'Remove-MiosPerUserPodman').Body.Extent.Text
+    Check ($msiexecText.Contains("(@('/i', ('`"' + `$Path + '`"')) + @(`$Properties) + @('/qn', '/norestart'))") -and $infoText.Contains("@(`$Path, [int]0)") -and
+           $perUserText.Contains("-Arguments @('/x', `$p.ProductCode, '/qn', '/norestart')") -and -not ($perUserText -match 'Invoke-Expression|\biex\b|UninstallString|cmd(\.exe)?\s+/c')) 'msiexec gets fixed properties; the MSI is opened read-only; per-user removal runs only msiexec /x {ProductCode}'
+    $ensureResolveAt = $ensure.IndexOf('$machineClient = Resolve-MiosPodmanExe'); $wingetAt = $ensure.IndexOf('Get-Command winget')
+    Check ($ensureResolveAt -ge 0 -and $ensureResolveAt -lt $wingetAt -and $ensure.Contains('$env:PATH = (Split-Path -Parent $machineClient) + '';'' + $env:PATH')) 'the user side adopts a per-machine client before any winget install and puts it first on PATH'
     $worker = ''; try { $worker = Get-MiosMachineWorkerScript -Source ([IO.File]::ReadAllText($Entry)) } catch { $worker = '' }
     $missingHelpers = @(@('Get-MiosMachinePodmanExe', 'Get-MiosMachinePodmanVersion', 'Get-MiosPodmanVersion', 'Get-MiosRequiredPodmanVersion', 'Get-MiosPinnedDownloadBytes',
         'Invoke-MiosMsiInstall', 'Install-MiosPodmanClient', 'Read-MiosPodmanUninstallEntries', 'Get-MiosOlderPodmanEntries', 'Get-MiosPodmanRemovalPlan',
-        'Invoke-MiosPodmanRemoval', 'Remove-MiosOlderPodman') | Where-Object { $worker -notmatch ('(?m)^function ' + [regex]::Escape($_) + ' \{') })
+        'Invoke-MiosPodmanRemoval', 'Remove-MiosOlderPodman', 'Get-MiosMachinePodmanPaths', 'Get-MiosMachinePath', 'Get-MiosMsiPackageInfo',
+        'Get-MiosMsiRelatedProducts', 'Remove-MiosPerUserPodman') | Where-Object { $worker -notmatch ('(?m)^function ' + [regex]::Escape($_) + ' \{') })
     Check ([bool]$worker -and $missingHelpers.Count -eq 0) 'the elevated worker carries every Podman client helper'
 
     # --- The shipped template pin parses to the expected shapes ----------------------------------------------------------
@@ -320,9 +395,21 @@ try {
         @{ Name = 'sha256 check removed'; File = 'entry'; Expected = 'a sha256 mismatch refuses before the MSI touches disk'; From = 'if ($actual -cne $sha) { throw'; To = 'if ($false) { throw' },
         @{ Name = 'signature check removed'; File = 'entry'; Expected = 'an MSI without a Valid signature refuses and installs nothing'; From = "if ([string]`$signature.Status -ne 'Valid') { throw `"The pinned Podman MSI signature"; To = "if (`$false) { throw `"The pinned Podman MSI signature" },
         @{ Name = 'signer check removed'; File = 'entry'; Expected = 'a valid signature from another signer refuses and installs nothing'; From = "if (`$subject -cne `$signer) { throw `"The pinned Podman MSI is signed by"; To = "if (`$false) { throw `"The pinned Podman MSI is signed by" },
-        @{ Name = 'PATH resolution restored in the elevated check'; File = 'entry'; Expected = 'a podman planted earlier on PATH is never run by the elevated check'
-           From = "`$path = Join-Path `${env:ProgramFiles} 'RedHat\Podman\podman.exe'"
-           To = "`$path = [string](Get-Command podman -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source; if (-not `$path) { `$path = Join-Path `${env:ProgramFiles} 'RedHat\Podman\podman.exe' }" },
+        @{ Name = 'PATH resolution restored in the elevated check'; File = 'entry'; Expected = 'neither a podman planted on PATH nor a per-user profile copy is considered by the elevated check'
+           From = "foreach (`$path in @(Get-MiosMachinePodmanPaths)) { if (Test-Path -LiteralPath `$path -PathType Leaf) { return `$path } }"
+           To = "`$cmd = Get-Command podman -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if (`$cmd) { return [string]`$cmd.Source }; foreach (`$path in @(Get-MiosMachinePodmanPaths)) { if (Test-Path -LiteralPath `$path -PathType Leaf) { return `$path } }" },
+        @{ Name = 'a profile path accepted as a machine path'; File = 'entry'; Expected = 'neither a podman planted on PATH nor a per-user profile copy is considered by the elevated check'
+           From = "return @((Join-Path `${env:ProgramFiles} 'Podman\podman.exe'), "; To = "return @((Join-Path `$env:LOCALAPPDATA 'Programs\Podman\podman.exe'), (Join-Path `${env:ProgramFiles} 'Podman\podman.exe'), " },
+        @{ Name = 'ALLUSERS=1 dropped'; File = 'entry'; Expected = 'the verified MSI is installed per-machine (ALLUSERS=1 MSIINSTALLPERUSER=0) and Windows Installer reports it per-machine'
+           From = "-Properties @('ALLUSERS=1', 'MSIINSTALLPERUSER=0')"; To = '-Properties @()' },
+        @{ Name = 'MSIINSTALLPERUSER override dropped (ALLUSERS=1 only)'; File = 'entry'; Expected = 'the per-machine install selects the machine PATH component, with no PATH warning'
+           From = "-Properties @('ALLUSERS=1', 'MSIINSTALLPERUSER=0')"; To = "-Properties @('ALLUSERS=1')" },
+        @{ Name = 'per-user leftover not removed'; File = 'entry'; Expected = "run 5's per-user 6.2 of the elevating account is removed by its ProductCode, then the MSI installs per-machine"
+           From = "`$removed += Remove-MiosPerUserPodman -UpgradeCode `$package.UpgradeCode"; To = '$removed += 0' },
+        @{ Name = 'scope check removed'; File = 'entry'; Expected = 'an install Windows Installer reports per-user is refused'
+           From = "if (-not @(`$scope | Where-Object { `$_.AssignmentType -eq '1' }).Count) {"; To = "if (`$false) {" },
+        @{ Name = 'RelatedProducts not filtered to AssignmentType 0'; File = 'entry'; Expected = "a per-machine product of the family is left to the MSI's own upgrade"
+           From = "`$perUser = @(`$related | Where-Object { `$_.AssignmentType -eq '0' })"; To = '$perUser = @($related)' },
         @{ Name = 'machine exe signer check removed'; File = 'entry'; Expected = 'a machine Podman client from another signer is never run elevated'; From = "if (`$subject -cne `$Signer) { throw `"The machine Podman client"; To = "if (`$false) { throw `"The machine Podman client" },
         @{ Name = 'machine exe signature check removed'; File = 'entry'; Expected = 'an unsigned machine Podman client is never run elevated'; From = "if ([string]`$signature.Status -ne 'Valid') { throw `"The machine Podman client"; To = "if (`$false) { throw `"The machine Podman client" },
         @{ Name = 'guard removed'; File = 'build'; Expected = 'a client without --update-connection stops before init with version, path, requirement and remedy'; From = "if (`$help -match '(?m)^\s*(?:-\w,\s*)?--update-connection\b') { return }"; To = 'return' },

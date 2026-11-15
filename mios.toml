@@ -313,6 +313,16 @@ loopback = "127.0.0.1"
 bind_all = "0.0.0.0"
 win_tailscale_ip = "100.79.3.50"
 
+# [network.vpn] -- mios-vpn-killswitch.service, the nftables VPN kill switch.
+# killswitch is an opt-in. When it is true, from the next boot every egress that is
+# neither local nor leaving through `interface` is dropped, even while that tunnel is
+# down: the guard fails closed. false, the default, never arms it, so a host without
+# the tunnel keeps its egress. Tighten-only: the operator's mios.html tier can enable
+# it, never disable a vendor/host true. `interface` is read from vendor/host only.
+[network.vpn]
+killswitch = false
+interface  = "wg0"
+
 # ----------------------------------------------------------------------------
 # [mios_app] -- placeholder for the future MiOS App client (scaffold-stage;
 # see src/mios-app/README.md + RESEARCH.md). Gated off: this section carries

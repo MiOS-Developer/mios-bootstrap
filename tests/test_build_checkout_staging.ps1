@@ -41,12 +41,12 @@ $null = Invoke-Git $origin config core.autocrlf false
 [IO.File]::WriteAllText((Join-Path $origin 'a.txt'), "one`n")
 $null = Invoke-Git $origin add a.txt; $null = Invoke-Git $origin commit -q -m one
 $first = (Invoke-Git $origin rev-parse HEAD).Trim()
-$clone = Join-Path $scratch 'repo'
-$null = & git clone -q $origin $clone 2>&1; if ($LASTEXITCODE -ne 0) { throw 'scratch clone failed' }
-$null = Invoke-Git $clone config core.autocrlf false
 [IO.File]::WriteAllText((Join-Path $origin 'b.txt'), "two`n")
 $null = Invoke-Git $origin add b.txt; $null = Invoke-Git $origin commit -q -m two
 $second = (Invoke-Git $origin rev-parse HEAD).Trim()
+$null = Invoke-Git $origin branch base $first
+$originUrl = 'file:///' + ($origin -replace '\\', '/')
+$script:clone = ''
 
 function Invoke-Checks([string]$Build) {
     $script:fail = 0; $script:checks = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
@@ -55,24 +55,32 @@ function Invoke-Checks([string]$Build) {
         . ([scriptblock]::Create(((Get-Function $ast $name).Extent.Text -replace '^function\s+', 'function global:')))
     }
     function global:Log-Warn { param($m) $script:warnings.Add([string]$m) }
-    function global:Write-Log { param($m) }
-    function global:Invoke-GitFetchWithRetry { param([string]$RepoPath, [string]$Ref) $null = & git -C $RepoPath fetch -q origin $Ref 2>&1; return $LASTEXITCODE }
+    function global:Write-Log { param($m) $script:logs.Add([string]$m) }
+    # Mirrors the product's first attempt (asserted below): a depth-1 fetch, which leaves a shallow checkout's HEAD and
+    # FETCH_HEAD as separate shallow roots, exactly as on mios-1.
+    function global:Invoke-GitFetchWithRetry { param([string]$RepoPath, [string]$Ref) $ErrorActionPreference = 'Continue'; $null = & git -C $RepoPath fetch -q --depth=1 origin $Ref 2>&1; return $LASTEXITCODE }
 
     function Reset-Clone {
-        $null = Invoke-Git $clone reset -q --hard $first
-        $null = Invoke-Git $clone clean -q -fdx
-        $script:warnings = New-Object System.Collections.Generic.List[string]
+        # A fresh depth-1 clone at the older commit, like the installer's own depth-1 mios.git checkout.
+        $script:clone = Join-Path $scratch ('repo-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $ErrorActionPreference = 'Continue'
+        # autocrlf=false at clone time, so the checkout's bytes match the index on any host setting.
+        $null = & git clone -q -c core.autocrlf=false --depth 1 --branch base $originUrl $script:clone 2>&1
+        if ($LASTEXITCODE -ne 0) { throw 'scratch shallow clone failed' }
+        $null = Invoke-Git $script:clone config user.email fixture@example.invalid; $null = Invoke-Git $script:clone config user.name Fixture
+        $script:warnings = New-Object System.Collections.Generic.List[string]; $script:logs = New-Object System.Collections.Generic.List[string]
         $script:updateError = ''
     }
     function Invoke-Update { try { Update-MiosCheckout -RepoPath $clone -Ref main } catch { $script:updateError = $_.Exception.Message } }
 
     # --- Update-MiosCheckout: only tracked changes defer --------------------------------------------------------------
     Reset-Clone
+    $wasShallow = (Invoke-Git $clone rev-parse --is-shallow-repository).Trim() -eq 'true'
     [IO.File]::WriteAllText((Join-Path $clone 'install.ps1'), 'overlay copy')
     New-Item -ItemType Directory -Force -Path (Join-Path $clone 'tests') | Out-Null
     [IO.File]::WriteAllText((Join-Path $clone 'tests\test_overlay.ps1'), 'overlay copy')
     Invoke-Update
-    Check ($script:updateError -eq '' -and (Invoke-Git $clone rev-parse HEAD).Trim() -eq $second -and @($script:warnings).Count -eq 0 -and
+    Check (@($script:logs | Where-Object { $_ -match 'deepened to 8; HEAD is an ancestor of main' }).Count -eq 1 -and $wasShallow -and $script:updateError -eq '' -and (Invoke-Git $clone rev-parse HEAD).Trim() -eq $second -and @($script:warnings).Count -eq 0 -and
            (Test-Path -LiteralPath (Join-Path $clone 'install.ps1')) -and (Test-Path -LiteralPath (Join-Path $clone 'tests\test_overlay.ps1'))) 'untracked overlay copies do not defer the update; it fast-forwards and keeps them'
     Reset-Clone
     [IO.File]::WriteAllText((Join-Path $clone 'a.txt'), "local edit`n")
@@ -84,6 +92,15 @@ function Invoke-Checks([string]$Build) {
     Invoke-Update
     Check ($script:updateError -match 'Cannot fast-forward .* untracked files are preserved' -and (Invoke-Git $clone rev-parse HEAD).Trim() -eq $first -and
            [IO.File]::ReadAllText((Join-Path $clone 'b.txt')) -eq 'untracked local b') 'an untracked file the update would overwrite refuses the fast-forward and is preserved'
+    # A local commit (no tracked changes left) is never reachable from main, however deep the fetch: it refuses and stays.
+    Reset-Clone
+    [IO.File]::WriteAllText((Join-Path $clone 'c.txt'), "local`n")
+    $null = Invoke-Git $clone add c.txt; $null = Invoke-Git $clone commit -q -m local
+    $localHead = (Invoke-Git $clone rev-parse HEAD).Trim()
+    Invoke-Update
+    Check ($script:updateError -match 'HEAD is not in its history; local commits are preserved' -and (Invoke-Git $clone rev-parse HEAD).Trim() -eq $localHead) 'a local commit is never fast-forwarded over and stays the checkout'
+    $fetchFn = (Get-Function $ast 'Invoke-GitFetchWithRetry').Body.Extent.Text
+    Check ($fetchFn.Contains('git fetch --depth=1 origin $Ref')) 'the product fetch is depth 1, which the shallow fixture mirrors'
 
     # --- Publish-MiosEntryScripts: the shadow's bytes, never the mios.git work tree's stale root copies ----------------
     $shadow = Join-Path $scratch 'shadow'; $repoDir = Join-Path $scratch 'mios-worktree'; $bin = Join-Path $scratch 'bin'
@@ -126,6 +143,8 @@ try {
     $plants = @(
         @{ Name = 'untracked files counted again'; Expected = 'untracked overlay copies do not defer the update; it fast-forwards and keeps them'
            From = '$changes = @(& git -C $RepoPath status --porcelain --untracked-files=no)'; To = '$changes = @(& git -C $RepoPath status --porcelain --untracked-files=all)' },
+        @{ Name = 'shallow deepen removed'; Expected = 'untracked overlay copies do not defer the update; it fast-forwards and keeps them'
+           From = 'foreach ($depth in @(8, 64, 512)) {'; To = 'foreach ($depth in @()) {' },
         @{ Name = "the mios.git work tree's root copy staged"; Expected = "entry scripts are staged with the shadow's published bytes"
            From = '$srcFile = Join-Path $ShadowDir $script'; To = '$srcFile = Join-Path $MiosRepoDir $script' },
         @{ Name = 'staged hash check removed'; Expected = 'a staged copy that differs from the shadow refuses'

@@ -6890,6 +6890,21 @@ function Update-MiosCheckout([string]$RepoPath, [string]$Ref) {
     }
     $fetchExit = Invoke-GitFetchWithRetry -RepoPath $RepoPath -Ref $Ref
     if ($fetchExit -ne 0) { throw "Cannot fetch $Ref at $RepoPath (exit $fetchExit)" }
+    # The fetch is depth 1, so in a shallow checkout HEAD and FETCH_HEAD are separate shallow roots and a fast-forward
+    # refuses them as "unrelated histories". Deepen until HEAD is reachable from FETCH_HEAD; a HEAD that never becomes
+    # reachable is a local commit, and it stays preserved.
+    $deepened = 0
+    foreach ($depth in @(8, 64, 512)) {
+        & git -C $RepoPath merge-base --is-ancestor HEAD FETCH_HEAD 2>$null
+        if ($LASTEXITCODE -eq 0) { break }
+        if ((& git -C $RepoPath rev-parse --is-shallow-repository 2>$null) -ne 'true') { break }
+        & git -C $RepoPath fetch -q "--deepen=$depth" origin $Ref 2>&1 | ForEach-Object { Write-Log "git-update: $_" }
+        if ($LASTEXITCODE -ne 0) { throw "Cannot deepen $RepoPath to find HEAD in $Ref (exit $LASTEXITCODE)" }
+        $deepened = $depth
+    }
+    & git -C $RepoPath merge-base --is-ancestor HEAD FETCH_HEAD 2>$null
+    if ($LASTEXITCODE -ne 0) { throw "Cannot fast-forward $RepoPath to ${Ref}: HEAD is not in its history; local commits are preserved." }
+    if ($deepened) { Write-Log "git-update: deepened to $deepened; HEAD is an ancestor of $Ref" }
     & git -C $RepoPath merge --ff-only FETCH_HEAD | ForEach-Object { Write-Log "git-update: $_" }
     if ($LASTEXITCODE -ne 0) { throw "Cannot fast-forward $RepoPath to $Ref; local commits and untracked files are preserved." }
 }

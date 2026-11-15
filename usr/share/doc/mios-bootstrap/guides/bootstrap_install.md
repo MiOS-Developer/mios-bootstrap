@@ -117,7 +117,7 @@ The 11-phase pipeline in `mios.git` (`mios-pipeline.{sh,ps1}`) is the finer-grai
 | Profile | `commandline` | Notes |
 |---|---|---|
 | **MiOS** | `pwsh.exe` → MiOS PS profile body (dashboard + `mios <verb>` dispatcher) | Verbs: `dash`, `config`, `update`, `pull`, `help` → Windows host; `build`, `dev` → pass through to dev VM via `wsl.exe`. |
-| **MiOS-DEV** | `wsl.exe -d <BuilderDistro> --user mios` | Direct dev-VM shell. |
+| **MiOS-DEV** | `wsl.exe -d <BuilderDistro> --user <login>` | Direct dev-VM shell as the MiOS login: `[identity].username` through MiOS's identity guard, resolved by the installer (re-run it after changing the login). |
 
 **Don't bind the MiOS profile to `wsl.exe` directly** — that hits `WSL_E_DISTRO_NOT_FOUND` when the distro name doesn't match. Distro names are locked: `MIOS_WSL_DISTRO=MiOS`, `MIOS_BUILDER_DISTRO=MiOS-DEV`. Podman derives `podman-MiOS-DEV` from these; renaming breaks `podman machine` discovery.
 

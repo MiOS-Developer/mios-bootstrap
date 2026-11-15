@@ -139,7 +139,7 @@ Windows Terminal profiles:
 | Profile | Command | Notes |
 |---|---|---|
 | **MiOS** | `pwsh.exe` → MiOS PS profile | `mios <verb>` dispatcher; verbs `build`/`dev` hand off to MiOS-DEV via `wsl.exe` |
-| **MiOS-DEV** | `wsl.exe -d <BuilderDistro> --user mios` | Direct dev-VM shell |
+| **MiOS-DEV** | `wsl.exe -d <BuilderDistro> --user <login>` | Direct dev-VM shell as the MiOS login: `[identity].username` through MiOS's identity guard, resolved by the installer (re-run it after changing the login) |
 
 Do **not** bind the MiOS profile directly to `wsl.exe` — that hits `WSL_E_DISTRO_NOT_FOUND`. Locked names: `MIOS_WSL_DISTRO=MiOS`, `MIOS_BUILDER_DISTRO=MiOS-DEV`. Every spawned window opens at **80 × 40** (`wt.exe --size 80,40`).
 

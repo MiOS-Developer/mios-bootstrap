@@ -2124,6 +2124,7 @@ function Get-MiOSTerminalSettingsPath {
 # the wt.exe command line ALONE only hides tabs but keeps the title bar
 # unless launchMode is also set in JSON. We set both for belt-and-braces.
 function Install-MiOSTerminalProfile {
+    param([string]$LinuxLogin = '')
     # Defensive readiness wait: even if Install-MiOSWindowsTerminal
     # already waited, AppX deployment can still be propagating user-state
     # paths. Re-wait so we never write to a non-existent LocalState dir.
@@ -2422,10 +2423,12 @@ function Install-MiOSTerminalProfile {
             if ($_wslList -contains $_cand) { $_devDistroName = $_cand; break }
         }
     } catch {}
+    # The MiOS-DEV login: -LinuxLogin carries the guard's name. Without it the profile names no account, so wsl.exe
+    # opens the distro's [user].default, which the realize stage sets from the same guard; never a literal name.
     $miosDevProfile = [ordered]@{
         guid              = $miosDevGuid
         name              = 'MiOS-DEV'
-        commandline       = ('wsl.exe -d ' + $_devDistroName + ' --cd / --user mios')
+        commandline       = ('wsl.exe -d ' + $_devDistroName + ' --cd /' + $(if ($LinuxLogin -cmatch '^[a-z_][a-z0-9_-]*$') { ' --user ' + $LinuxLogin } else { '' }))
         startingDirectory = $null
     }
     foreach ($k in $commonProfileProps.Keys) { $miosDevProfile[$k] = $commonProfileProps[$k] }
@@ -3030,7 +3033,7 @@ if ($hwnd -ne [IntPtr]::Zero) {
     # commands INSIDE the MiOS terminal, NOT separate native apps.
     # Per-verb shortcuts.  Each entry maps to:
     #   * Profile  -- WT profile name to launch ('MiOS' = hub,
-    #                 'MiOS-DEV' = wsl.exe -d podman-MiOS-DEV --user mios)
+    #                 'MiOS-DEV' = wsl.exe -d podman-MiOS-DEV --user <the MiOS login>)
     #   * Verb     -- mios verb to run inside the launched window
     #                 (empty = just open the profile, no dispatch)
     #   * Icon     -- per-verb .ico under M:\MiOS\icons (fallback: mios.ico)
@@ -3898,6 +3901,8 @@ function Install-MiOSPowerShellProfile {
     $windowsRefreshBlock = Get-MiosFieldCheckoutProfileBlock
     $miosBuildRef = [string](Get-MiosTomlValue -Section 'bootstrap' -Key 'mios_ref' -Default 'main')
     $miosBuildRefLiteral = "'" + $miosBuildRef.Replace("'", "''") + "'"
+    # The verbs log in as the MiOS login, resolved at run time by Get-MiOS.ps1's Get-MiosLinuxLogin (its copy of the guard).
+    $loginHelperBlock = (Get-MiosFieldCanonicalFunctions -Path (Get-MiosFieldCanonicalPath) -Names @('Get-MiosLinuxLogin')).ToString()
 
     $miosScriptBody = @"
 # MiOS PowerShell profile -- PSReadLine reload + fastfetch MOTD +
@@ -4741,6 +4746,8 @@ function mios-config {
     }
 }
 
+$loginHelperBlock
+
 function mios-dev {
     [CmdletBinding()]
     param([Parameter(ValueFromRemainingArguments)]`$Args)
@@ -4766,7 +4773,7 @@ function mios-dev {
         Write-Host '  [!] No MiOS-DEV / podman-MiOS-DEV WSL distro registered. Run irm|iex one-liner to provision.' -ForegroundColor Yellow
         return
     }
-    & wsl.exe -d `$_devDistro --cd / --user mios @Args
+    & wsl.exe -d `$_devDistro --cd / --user (Get-MiosLinuxLogin `$_devDistro) @Args
 }
 
 function mios-mini {
@@ -4840,13 +4847,13 @@ function mios-dash {
         `$_distro = `$null
         foreach (`$_d in @('podman-MiOS-DEV','MiOS-DEV')) {
             try {
-                `$_chk = & wsl.exe -d `$_d --user mios -- echo ready 2>`$null
+                `$_chk = & wsl.exe -d `$_d -u root --exec echo ready 2>`$null
                 if (`$LASTEXITCODE -eq 0 -and `$_chk -match 'ready') { `$_distro = `$_d; break }
             } catch {}
         }
         if (`$_distro) {
             try {
-                & wsl.exe -d `$_distro --user mios -- bash -lc 'systemctl --user list-units --type=service --state=active --no-legend --no-pager 2>/dev/null | head -30; echo ""; echo "graphical-session.target: `$(systemctl --user is-active graphical-session.target 2>/dev/null)"; echo "xdg-desktop-portal.service: `$(systemctl --user is-active xdg-desktop-portal.service 2>/dev/null)"; echo "podman.socket: `$(systemctl --user is-active podman.socket 2>/dev/null)"'
+                & wsl.exe -d `$_distro --user (Get-MiosLinuxLogin `$_distro) -- bash -lc 'systemctl --user list-units --type=service --state=active --no-legend --no-pager 2>/dev/null | head -30; echo ""; echo "graphical-session.target: `$(systemctl --user is-active graphical-session.target 2>/dev/null)"; echo "xdg-desktop-portal.service: `$(systemctl --user is-active xdg-desktop-portal.service 2>/dev/null)"; echo "podman.socket: `$(systemctl --user is-active podman.socket 2>/dev/null)"'
             } catch {
                 Write-Host "  [!] failed to query MiOS-DEV services: `$_" -ForegroundColor Yellow
             }
@@ -4884,7 +4891,7 @@ function mios-help {
     Write-Host '  mios pull     clean fast-forward of M:\; preserve local work' -ForegroundColor White
     Write-Host '  mios config   open the HTML configurator (mios.toml editor)' -ForegroundColor White
     Write-Host '  mios ai       open Open WebUI (rich LLM interface) in your browser' -ForegroundColor White
-    Write-Host '  mios dev      wsl into the MiOS-DEV distro (root /, user mios)' -ForegroundColor White
+    Write-Host '  mios dev      wsl into MiOS-DEV (root /) as the MiOS login, [identity].username; re-run the installer after changing it' -ForegroundColor White
     Write-Host '  mios dash     FULL dashboard: banner + services + specs; -Live opens the monitor' -ForegroundColor White
     Write-Host '  mios xbox     Xbox VM Secure Boot / XML repair' -ForegroundColor White
     Write-Host '  mios virt     apply optimized VM config + CPU pinning' -ForegroundColor White
@@ -5286,14 +5293,14 @@ function Get-MiosFieldCanonicalPath {
 
 function Get-MiosFieldCanonicalFunctions {
     # Import function definitions only. Get-MiOS.ps1 top-level performs installation and must never run here.
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path, [string[]]$Names)
     $tokens = $null; $errors = $null
     $ast = [Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
     if ($errors.Count) { throw 'The canonical platform source does not parse; Field preparation stopped.' }
-    $names = @('Split-MiosTomlKeyLine', 'Get-MiosTomlTableArray', 'Get-MiosTomlValue',
+    $names = if ($Names) { $Names } else { @('Split-MiosTomlKeyLine', 'Get-MiosTomlTableArray', 'Get-MiosTomlValue',
         'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Test-MiosElevated', 'Enable-MiOSWindowsFeatures',
         'Test-MiosWslVmCreator', 'Register-MiosWslVmCreator', 'Set-MiosWslFirewallPolicy',
-        'Invoke-MiosPlatformGate', 'Get-MiosWslConfigText', 'Invoke-MiOSFullReap', 'Update-MiosWindowsBuildCheckout')
+        'Invoke-MiosPlatformGate', 'Get-MiosWslConfigText', 'Invoke-MiOSFullReap', 'Update-MiosWindowsBuildCheckout') }
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names
     }, $true))

@@ -137,7 +137,8 @@ function Get-GeneratedEntrypoints {
     $DevDistro = 'fixture-DEV'; $LegacyDevName = 'fixture-LEGACY'
     $devResolveBlock = & ([scriptblock]::Create((Get-HereString $buildAst 'devResolveBlock')))
     $miosDevDistroLiteral = "'fixture-DEV'"
-    $miosBuilderUserLiteral = "'mios'"
+    # The launcher bakes the MiOS login it resolved (Get-MiosLinuxLogin) into the generated build and pull scripts.
+    $miosLogin = 'fixture-login'
     $_miosCols = 80; $_miosRows = 20; $_miosScroll = 9000
     $ompBlobBase64 = ''; $Script:MiosBootstrapRaw = 'https://fixture.invalid/bootstrap'
     $standalone = [string](& ([scriptblock]::Create((Get-HereString $buildAst 'buildScript'))))
@@ -273,11 +274,17 @@ function Invoke-PromotionFixture([string]$Name, [string]$Program, [string]$Failu
         [IO.File]::WriteAllBytes($DestinationPath, [IO.File]::ReadAllBytes($SourcePath))
         return $DestinationPath
     }
+    # The profile verbs resolve the MiOS login at run time; the handoff must go to that account, never a literal name.
+    function Get-MiosLinuxLogin {
+        param([string]$Distribution)
+        if ($Distribution -ne 'fixture-DEV') { throw 'fixture refused a login lookup for another distribution' }
+        return 'fixture-login'
+    }
     function Sync-MiosUserTomlToBuilder {
         param([string]$Path, [string]$Distro, [string]$User)
         $script:events.Add('sync')
         if ($script:failure -eq 'sync') { $script:rejectedStage = 'sync'; throw 'fixture private handoff refused' }
-        if ($Path -ne $private -or $Distro -ne 'fixture-DEV' -or $User -ne 'mios') { throw 'fixture refused an unexpected handoff' }
+        if ($Path -ne $private -or $Distro -ne 'fixture-DEV' -or $User -ne 'fixture-login') { throw 'fixture refused an unexpected handoff' }
         $script:synced = [IO.File]::ReadAllText($Path, (New-Object System.Text.UTF8Encoding($false)))
     }
     function Move-Item {

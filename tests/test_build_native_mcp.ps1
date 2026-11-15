@@ -57,7 +57,10 @@ function Invoke-Checks([string]$Build) {
     Check ($iCatalog -ge 0 -and $iMcp -gt $iCatalog -and $iSetup -eq $iMcp + 1 -and $calls -eq 1) 'the native MiOS-MCP step runs unconditionally, after the catalog and right before the client setup'
 
     # --- Behaviour: Install-MiosNativeMcp against a wsl.exe mock ------------------------------------------------------
+    # The step takes its login from the installer's one resolver, so the harness loads both functions.
+    $loginFn = & $fnText 'Get-MiosLinuxLogin'
     $fn = & $fnText 'Install-MiosNativeMcp'
+    if ($loginFn -and $fn) { $fn = $loginFn + "`n" + $fn } else { $fn = '' }
     $ok = $false; $failInstall = $false; $failProbe = $false; $rootUid = $false
     if ($fn) {
         $a = & $harness -FnSrc $fn -InstallRc 0 -ProbeOk $true -Login 'user'
@@ -81,9 +84,11 @@ function Invoke-Checks([string]$Build) {
     Check $ok 'MiOS''s installer runs as root (python3.13 mios-mcp-server --install-native --source-root / --root /), then the client setup''s probe runs as the MiOS login'
     Check ($failInstall -and $failProbe -and $rootUid) 'an installer failure, a failed probe and a root or unresolved login are each fatal with their own message'
     # Native arguments carry no double quote (Windows PowerShell would drop it) and no 2>$null (it would throw on stderr).
-    $fnCode = Get-Code $fn
-    $probeLiteral = [regex]::Match($fnCode, "(?m)^\s*\`$identityProbe = '((?:[^']|'')*)'\s*$")
-    Check ($fnCode -and @([regex]::Matches($fnCode, "--exec [^\n]*-c '")).Count -eq 2 -and $fnCode -match '--exec python3 -c \$identityProbe' -and
+    $fnCode = Get-Code (& $fnText 'Install-MiosNativeMcp')
+    $loginCode = Get-Code $loginFn
+    $probeLiteral = [regex]::Match($loginCode, "(?m)^\s*\`$identityProbe = '((?:[^']|'')*)'\s*$")
+    Check ($fnCode -and @([regex]::Matches($fnCode, "--exec [^\n]*-c '")).Count -eq 2 -and $loginCode -match '--exec python3 -c \$identityProbe' -and
+           $fnCode -match '(?m)^\s*\$user = Get-MiosLinuxLogin \$distribution\s*$' -and $loginCode -notmatch '2>\$null' -and
            $probeLiteral.Success -and -not $probeLiteral.Groups[1].Value.Contains('"') -and
            -not ([regex]::Matches($fnCode, "--exec [^\n]*-c '[^'\n]*`"")).Count -and $fnCode -notmatch '2>\$null') 'the probes pass single-quoted Python with no 2>$null, safe on Windows PowerShell 5.1 and pwsh 7'
 

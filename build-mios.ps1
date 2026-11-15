@@ -55,6 +55,20 @@ function Install-MiosNativeCatalog([string]$Root, [string]$Machine) {
     return @{ Distribution = $distribution; LinuxRoot = $linuxRoot }
 }
 
+# The MiOS login: the vendor/host [identity].username through MiOS's identity guard (the text mios.git's
+# usr/share/mios/windows/*.ps1 carries), never a uid or a literal name. It is the one resolver every wsl.exe login in
+# this installer takes. The guard prints its refusal on stderr; this throws, so a caller never falls back to a name.
+# Python is single-quoted for the guest, and there is no 2>$null: Windows PowerShell turns any stderr line (wsl.exe
+# prints config notices there) into a terminating error.
+function Get-MiosLinuxLogin([string]$Distribution) {
+    $identityProbe = 'import sys,pwd; sys.path.insert(0,''/usr/lib/mios''); import mios_toml as m; n=str((m.base_view().get(''identity'') or {}).get(''username'') or '''').strip(); p={e.pw_name: e for e in pwd.getpwall()}.get(n); print(n) if p and p.pw_uid != 0 and p.pw_uid >= m._uid_min() and not p.pw_shell.endswith((''nologin'', ''false'')) else sys.exit(''MiOS identity: the vendor/host [identity].username %r is not a login account here (missing, root, a system uid below UID_MIN, or no login shell)'' % n)'
+    $login = ((& wsl.exe -d $Distribution -u root --exec python3 -c $identityProbe) -join '').Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $login -or $login -eq 'root') { throw "The MiOS login (vendor/host [identity].username) is not a usable account in $Distribution; set [identity].username and re-run the installer" }
+    # Generated scripts and shortcuts carry the name as a literal, so only a plain login name is accepted.
+    if ($login -cnotmatch '^[a-z_][a-z0-9_-]*$') { throw "The MiOS login in $Distribution is not a plain login name; set [identity].username and re-run the installer" }
+    return $login
+}
+
 # MiOS's own offline payload installer, the call its Containerfile makes after [packages.mcp] (realize installs that
 # section): the MCP venv from the vendored wheelhouse, tmux-mcp and the terminal fonts, each archive checked against its
 # SSOT digest. It runs on every install, with no skip, so the payload always matches the checkout. Then the probe that
@@ -71,11 +85,8 @@ function Install-MiosNativeMcp([string]$Machine) {
     if ($script:_mcpInstallRc -ne 0) { throw "Native MiOS-MCP install failed (exit $($script:_mcpInstallRc)): python3.13 /usr/libexec/mios/mios-mcp-server --install-native in $distribution" }
     # Python sources are single-quoted for the guest: no double quote reaches a native argument on either PowerShell.
     # No 2>$null: Windows PowerShell turns any stderr line (wsl.exe prints config notices there) into a terminating error.
-    # The probe account is the MiOS login: the vendor/host [identity].username through MiOS's identity guard (the text
-    # usr/share/mios/windows/*.ps1 carries), never a uid literal. The guard prints its refusal on stderr.
-    $identityProbe = 'import sys,pwd; sys.path.insert(0,''/usr/lib/mios''); import mios_toml as m; n=str((m.base_view().get(''identity'') or {}).get(''username'') or '''').strip(); p={e.pw_name: e for e in pwd.getpwall()}.get(n); print(n) if p and p.pw_uid != 0 and p.pw_uid >= m._uid_min() and not p.pw_shell.endswith((''nologin'', ''false'')) else sys.exit(''MiOS identity: the vendor/host [identity].username %r is not a login account here (missing, root, a system uid below UID_MIN, or no login shell)'' % n)'
-    $user = ((& wsl.exe -d $distribution -u root --exec python3 -c $identityProbe) -join '').Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $user -or $user -eq 'root') { throw 'The MiOS login (vendor/host [identity].username) is not a usable account in the MiOS builder; cannot probe native MiOS-MCP as it' }
+    # The probe account is the MiOS login (Get-MiosLinuxLogin), never a uid literal; an unusable login is fatal.
+    $user = Get-MiosLinuxLogin $distribution
     $python = ((& wsl.exe -d $distribution -u $user --exec python3 -c 'import sys; sys.path.insert(0, ''/usr/lib/mios''); import mios_toml; print(mios_toml.load_merged()[''mcp''][''python''])') -join '').Trim()
     if ($LASTEXITCODE -ne 0 -or -not $python.StartsWith('/')) { throw 'Could not resolve [mcp].python from the MiOS SSOT' }
     & {
@@ -1469,11 +1480,9 @@ function Open-ConfiguratorInDev([string]$RepoDir, [string]$Html) {
     }
     if (-not $wslDistro) { return $false }
 
-    # The configurator opens as the MiOS login: the vendor/host [identity].username through MiOS's identity guard
-    # (the text usr/share/mios/windows/*.ps1 carries), never a uid literal or a fallback name.
-    $identityProbe = 'import sys,pwd; sys.path.insert(0,''/usr/lib/mios''); import mios_toml as m; n=str((m.base_view().get(''identity'') or {}).get(''username'') or '''').strip(); p={e.pw_name: e for e in pwd.getpwall()}.get(n); print(n) if p and p.pw_uid != 0 and p.pw_uid >= m._uid_min() and not p.pw_shell.endswith((''nologin'', ''false'')) else sys.exit(''MiOS identity: the vendor/host [identity].username %r is not a login account here (missing, root, a system uid below UID_MIN, or no login shell)'' % n)'
-    $devUser = ((& wsl.exe -d $wslDistro -u root --exec python3 -c $identityProbe) -join "").Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $devUser) {
+    # The configurator opens as the MiOS login (Get-MiosLinuxLogin), never a uid literal or a fallback name.
+    try { $devUser = Get-MiosLinuxLogin $wslDistro }
+    catch {
         Log-Warn "MiOS-DEV has no usable login for [identity].username; the configurator opens on Windows instead"
         return $false
     }
@@ -5469,6 +5478,9 @@ function Install-MiosLauncher {
     foreach ($d in @($MiosInstallDir, $MiosBinDir, $MiosIconsDir, $MiosThemesDir, $StartMenuDir)) {
         New-Item -ItemType Directory -Path $d -Force | Out-Null
     }
+    # Every login this launcher writes (the generated verbs, the shortcuts, the terminal profile) is the MiOS login,
+    # resolved once here through Get-MiosLinuxLogin; the guest exists by now. Re-running the installer re-resolves it.
+    $miosLogin = Get-MiosLinuxLogin (Resolve-MiosBuilderDistribution $DevDistro)
 
     # -- 1. Generate the icon family (one .ico per verb) ---------------
     $iconMap = @{
@@ -5574,7 +5586,7 @@ if ((Test-Path (Join-Path `$miosRoot '.git')) -and (Get-Command git -ErrorAction
 $losslessPullShell
 '@
 `$inlinePullLf = `$inlinePull.Replace("``r``n", "``n")
-`$inlinePullLf | wsl.exe -d (Resolve-MiosDevDistro) --user mios -- sh -s -- / $miosBuildRefLiteral --sudo
+`$inlinePullLf | wsl.exe -d (Resolve-MiosDevDistro) --user $miosLogin -- sh -s -- / $miosBuildRefLiteral --sudo
 if (`$LASTEXITCODE -ne 0) { throw 'The native checkout refused a safe refresh; local work was preserved.' }
 "@
     Set-Content -Path $pullPath -Value $pullScript -Encoding UTF8
@@ -5791,7 +5803,7 @@ try {
     `$distro = Resolve-MiosDevDistro
     if (`$tomlSrc) { `$tomlDst = Import-MiosUserToml -SourcePath `$tomlSrc.FullName -DestinationPath `$tomlDst }
     if (Test-Path -LiteralPath `$tomlDst -PathType Leaf) {
-        Sync-MiosUserTomlToBuilder -Path `$tomlDst -Distro `$distro -User mios
+        Sync-MiosUserTomlToBuilder -Path `$tomlDst -Distro `$distro -User '$miosLogin'
     }
     if (`$tomlSrc) {
         `$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -5829,7 +5841,7 @@ if (Test-Path `$pull) {
 Write-Host ''
 Write-Host ('  [build] pre-warming WSL distro {0} ...' -f `$distro) -ForegroundColor DarkGray
 try {
-    & wsl.exe -d `$distro --user mios -- true 2>&1 | Out-Null
+    & wsl.exe -d `$distro --user $miosLogin -- true 2>&1 | Out-Null
 } catch {}
 
 Write-Host ('  [build] starting WSL-Podman machine: {0} ...' -f `$podmanMachine) -ForegroundColor Cyan
@@ -5873,7 +5885,7 @@ Write-Host ''
 Write-Host ('  [build] handing off to {0}:/usr/libexec/mios/mios-build-driver' -f `$distro) -ForegroundColor Cyan
 Write-Host '  [build] (this builds the OCI image inside MiOS-DEV; first run takes 10-30 min)' -ForegroundColor DarkGray
 Write-Host ''
-& wsl.exe -d `$distro --user mios --cd / -- bash -lc '/usr/libexec/mios/mios-build-driver'
+& wsl.exe -d `$distro --user $miosLogin --cd / -- bash -lc '/usr/libexec/mios/mios-build-driver'
 `$_drc = `$LASTEXITCODE
 if (`$_drc -ne 0) {
     Write-Host ('  [build] OCI image build FAILED inside {0} (exit {1}) -- MiOS AI will NOT be operational until this build succeeds; see the log above.' -f `$distro, `$_drc) -ForegroundColor Red
@@ -6034,7 +6046,7 @@ try {
         if (`$_wsl -contains `$_cand) { `$_distro = `$_cand; break }
     }
 } catch {}
-& wsl.exe -d `$_distro --user mios -- mios $v @Args
+& wsl.exe -d `$_distro --user $miosLogin -- mios $v @Args
 "@
         Set-Content -Path $vPath -Value $vScript -Encoding UTF8
     }
@@ -6289,7 +6301,7 @@ function btop {
     Set-MiosWindow -Mode reading
     Start-Sleep -Milliseconds 200   # let WT settle the new dims
     try {
-        & wsl.exe -d `$_dev --user mios -- btop @args
+        & wsl.exe -d `$_dev --user $miosLogin -- btop @args
     } finally {
         Set-MiosWindow -Mode portal
     }
@@ -6680,9 +6692,9 @@ End If
             # mios-gui dispatches through flatpak-launch, which arms the
             # SSOT Windows window-centering observer before mapping WSLg UI.
             $_args   = if ($_isWslg) {
-                ("-d {0} --user mios --cd `"~`" -- /usr/libexec/mios/mios-gui {1}" -f $linuxDistro, $_appId)
+                ("-d {0} --user {2} --cd `"~`" -- /usr/libexec/mios/mios-gui {1}" -f $linuxDistro, $_appId, $miosLogin)
             } else {
-                ("-d {0} --user mios -- /usr/libexec/mios/mios-gui {1}" -f $linuxDistro, $_appId)
+                ("-d {0} --user {2} -- /usr/libexec/mios/mios-gui {1}" -f $linuxDistro, $_appId, $miosLogin)
             }
             try {
                 New-Shortcut -Path $_lnk `
@@ -6705,9 +6717,9 @@ End If
             $_lnk = Join-Path $linuxAppsDir ("{0}.lnk" -f $_sa.Name)
             $_isWslg = $wslExe -match 'wslg\.exe$'
             $_sysArgs = if ($_isWslg) {
-                ("-d {0} --user mios --cd `"~`" -- /usr/libexec/mios/mios-gui {1}" -f $linuxDistro, $_sa.Cmd)
+                ("-d {0} --user {2} --cd `"~`" -- /usr/libexec/mios/mios-gui {1}" -f $linuxDistro, $_sa.Cmd, $miosLogin)
             } else {
-                ("-d {0} --user mios -- /usr/libexec/mios/mios-gui {1}" -f $linuxDistro, $_sa.Cmd)
+                ("-d {0} --user {2} -- /usr/libexec/mios/mios-gui {1}" -f $linuxDistro, $_sa.Cmd, $miosLogin)
             }
             try {
                 New-Shortcut -Path $_lnk `
@@ -6836,7 +6848,7 @@ End If
                 Log-Warn "Install-MiOSPowerShellProfile not defined after Get-MiOS.ps1 dot-source -- gate may have triggered too early"
             }
             if (Get-Command Install-MiOSTerminalProfile -ErrorAction SilentlyContinue) {
-                Install-MiOSTerminalProfile | Out-Null
+                Install-MiOSTerminalProfile -LinuxLogin $miosLogin | Out-Null
                 Log-Ok "Get-MiOS Install-MiOSTerminalProfile re-substituted (WT settings.json from current mios.toml)"
             }
             if (Get-Command Install-MiOSTmuxProfile -ErrorAction SilentlyContinue) {
@@ -8041,7 +8053,8 @@ exit 0
     Start-Phase 6
     $script:CurStep = "Resolving identity from mios.toml..."
     Show-Dashboard -Force
-    $MiosUser     = [string](Get-MiosTomlValue -Section 'identity' -Key 'username' -Default 'mios')
+    $MiosUser     = ([string](Get-MiosTomlValue -Section 'identity' -Key 'username' -Default '')).Trim()
+    if (-not $MiosUser) { throw "[identity].username is not set in any mios.toml layer (~\.config\mios\mios.toml, which mios.html writes, C:\etc\mios\mios.toml or C:\usr\share\mios\mios.toml); set it there and re-run the installer" }
     $MiosHostname = [string](Get-MiosTomlValue -Section 'identity' -Key 'hostname' -Default 'mios')
     $loginCredential = Resolve-MiosLoginCredential
     $MiosHash = $loginCredential.Hash
@@ -8634,12 +8647,9 @@ if (`$Purge) {
         } catch {}
         Write-Log "auto-chain: resolved dev distro = '$devDistro'"
         if ($devDistro) {
+            # The MiOS login (Get-MiosLinuxLogin); a guest without a usable one runs the driver as root.
             $resolvedUser = 'root'
-            try {
-                $passwd = (& wsl.exe -d $devDistro --user root -- cat /etc/passwd 2>$null) -join "`n"
-                if ($passwd -match '(?m)^mios:') { $resolvedUser = 'mios' }
-                elseif ($passwd -match '(?m)^core:') { $resolvedUser = 'core' }
-            } catch {}
+            try { $resolvedUser = Get-MiosLinuxLogin $devDistro } catch { Write-Log "auto-chain: $($_.Exception.Message); running the driver as root" "WARN" }
             Write-Log "auto-chain: resolved user = '$resolvedUser'"
             Write-Host "  -> Launching $devDistro (--user $resolvedUser) to run mios-build-driver..." -ForegroundColor Cyan
             Write-Host "     Output streams below; the OCI build runs inside MiOS-DEV." -ForegroundColor DarkGray

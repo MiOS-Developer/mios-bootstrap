@@ -1651,8 +1651,23 @@ function ConvertTo-MiosNativeArgument {
     return $out.ToString()
 }
 
+# The MiOS login: the vendor/host [identity].username through MiOS's identity guard (the text mios.git's
+# usr/share/mios/windows/*.ps1 carries; build-mios.ps1 holds the installer's copy). The profile verbs resolve it at
+# run time, once per distro per session. The guard prints its refusal on stderr and the verb then stops: never a
+# fallback name. Single-quoted Python, and no 2>$null (Windows PowerShell turns wsl.exe's stderr into errors).
+function Get-MiosLinuxLogin {
+    param([Parameter(Mandatory)][string]$Distribution)
+    if (-not $Global:MiosLinuxLogins) { $Global:MiosLinuxLogins = @{} }
+    if ($Global:MiosLinuxLogins.ContainsKey($Distribution)) { return $Global:MiosLinuxLogins[$Distribution] }
+    $identityProbe = 'import sys,pwd; sys.path.insert(0,''/usr/lib/mios''); import mios_toml as m; n=str((m.base_view().get(''identity'') or {}).get(''username'') or '''').strip(); p={e.pw_name: e for e in pwd.getpwall()}.get(n); print(n) if p and p.pw_uid != 0 and p.pw_uid >= m._uid_min() and not p.pw_shell.endswith((''nologin'', ''false'')) else sys.exit(''MiOS identity: the vendor/host [identity].username %r is not a login account here (missing, root, a system uid below UID_MIN, or no login shell)'' % n)'
+    $login = ((& wsl.exe -d $Distribution -u root --exec python3 -c $identityProbe) -join '').Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $login -or $login -eq 'root') { throw "The MiOS login (vendor/host [identity].username) is not a usable account in $Distribution; set [identity].username and re-run the installer" }
+    if ($login -cnotmatch '^[a-z_][a-z0-9_-]*$') { throw "The MiOS login in $Distribution is not a plain login name; set [identity].username and re-run the installer" }
+    $Global:MiosLinuxLogins[$Distribution] = $login
+    return $login
+}
 function Sync-MiosUserTomlToBuilder {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Distro, [string]$User = 'mios')
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Distro, [Parameter(Mandatory)][string]$User)
     if ($Distro -notmatch '^[A-Za-z0-9_.-]+$' -or $User -notmatch '^[A-Za-z_][A-Za-z0-9_-]*$') { throw 'Invalid builder distribution or user name.' }
     Set-MiosPrivateUserTomlAcl $Path
     function Get-MiosUserTomlReceiverScript {
@@ -3007,6 +3022,7 @@ function Get-MiosTerminalProfileCommand {
 }
 
 function Install-MiOSTerminalProfile {
+    param([string]$LinuxLogin = '')
     # Defensive readiness wait: even if Install-MiOSWindowsTerminal
     # already waited, AppX deployment can still be propagating user-state
     # paths. Re-wait so we never write to a non-existent LocalState dir.
@@ -3175,6 +3191,10 @@ function Install-MiOSTerminalProfile {
     foreach ($k in $commonProfileProps.Keys) { $miosProfile[$k] = $commonProfileProps[$k] }
 
     $_devDistroName = 'podman-MiOS-DEV'   # default if probing fails
+    # The MiOS-DEV login: the launcher's second render passes the guard's name (-LinuxLogin). This first render runs
+    # before the guest exists, so the vendor [identity].username is only a placeholder that the launcher replaces.
+    $_devLogin = if ($LinuxLogin) { $LinuxLogin } else { ([string](Get-MiosTomlValue -Section 'identity' -Key 'username' -Default '' -VendorOnly)).Trim() }
+    $_devLoginArg = if ($_devLogin -cmatch '^[a-z_][a-z0-9_-]*$') { ' --user ' + $_devLogin } else { '' }
     try {
         $_wslList = @(& wsl.exe -l -q 2>$null) | ForEach-Object { ($_ -replace [char]0,'').Trim() } | Where-Object { $_ }
         foreach ($_cand in @('podman-MiOS-DEV','MiOS-DEV','podman-MiOS-BUILDER','MiOS-BUILDER')) {
@@ -3184,7 +3204,7 @@ function Install-MiOSTerminalProfile {
     $miosDevProfile = [ordered]@{
         guid              = $miosDevGuid
         name              = 'MiOS-DEV'
-        commandline       = ('wsl.exe -d ' + $_devDistroName + ' --cd / --user mios')
+        commandline       = ('wsl.exe -d ' + $_devDistroName + ' --cd /' + $_devLoginArg)
         startingDirectory = $null
     }
     foreach ($k in $commonProfileProps.Keys) { $miosDevProfile[$k] = $commonProfileProps[$k] }
@@ -4341,7 +4361,7 @@ function Install-MiOSPowerShellProfile {
     ) + ')'
 
     $userTomlHelperBlock = (@('Assert-MiosNoReparsePath', 'Set-MiosPrivateUserTomlAcl', 'Import-MiosUserToml',
-        'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder') | ForEach-Object {
+        'ConvertTo-MiosNativeArgument', 'Get-MiosLinuxLogin', 'Sync-MiosUserTomlToBuilder') | ForEach-Object {
             'function ' + $_ + " {`r`n" + (Get-Command $_ -CommandType Function -ErrorAction Stop).Definition + "`r`n}"
         }) -join "`r`n"
     $windowsRefreshBlock = 'function Update-MiosWindowsBuildCheckout {' +
@@ -4536,7 +4556,7 @@ function mios-build {
                 # command line) for the builder distro's mios user. It is never copied into C:\etc\mios or M:\etc\mios.
                 `$tomlDst = Import-MiosUserToml -SourcePath `$tomlSrc.FullName
                 `$_devDistro = Resolve-MiosDevDistro
-                Sync-MiosUserTomlToBuilder -Path `$tomlDst -Distro `$_devDistro -User mios
+                Sync-MiosUserTomlToBuilder -Path `$tomlDst -Distro `$_devDistro -User (Get-MiosLinuxLogin `$_devDistro)
                 `$syncedUserToml = `$true
                 Write-Host ('         [+] '+`$tomlSrc.Name+' -> private user tiers (Windows + '+`$_devDistro+')') -ForegroundColor Green
                 `$archive = Join-Path `$dlDir (`$tomlSrc.BaseName+'.imported-'+`$stamp+'.toml')
@@ -4569,7 +4589,8 @@ function mios-build {
     # Existing user tiers and -SkipConfig retries must reach the builder as well.
     `$existingUserToml = Join-Path `$env:USERPROFILE '.config\mios\mios.toml'
     if (-not `$syncedUserToml -and (Test-Path -LiteralPath `$existingUserToml -PathType Leaf)) {
-        Sync-MiosUserTomlToBuilder -Path `$existingUserToml -Distro (Resolve-MiosDevDistro) -User mios
+        `$_devDistro = Resolve-MiosDevDistro
+        Sync-MiosUserTomlToBuilder -Path `$existingUserToml -Distro `$_devDistro -User (Get-MiosLinuxLogin `$_devDistro)
     }
     # END PRIVATE USER CONFIGURATION HANDOFF
 
@@ -4654,7 +4675,7 @@ function mios-dev {
     if (`$Args.Count -eq 0) {
         & (Join-Path `$Global:MiosBin 'mios.cmd') terminal
     } else {
-        & wsl.exe -d `$_devDistro --cd / --user mios @Args
+        & wsl.exe -d `$_devDistro --cd / --user (Get-MiosLinuxLogin `$_devDistro) @Args
     }
 }
 
@@ -4665,12 +4686,12 @@ function mios-mini {
         `$_distro = `$null
         foreach (`$_d in @('podman-MiOS-DEV','MiOS-DEV')) {
             try {
-                `$_chk = & wsl.exe -d `$_d --user mios -- echo ready 2>`$null
+                `$_chk = & wsl.exe -d `$_d -u root --exec echo ready 2>`$null
                 if (`$LASTEXITCODE -eq 0 -and `$_chk -match 'ready') { `$_distro = `$_d; break }
             } catch {}
         }
         if (`$_distro) {
-            & wsl.exe -d `$_distro --cd / --user mios -- /usr/libexec/mios/mios-dashboard.sh --mini @Args
+            & wsl.exe -d `$_distro --cd / --user (Get-MiosLinuxLogin `$_distro) -- /usr/libexec/mios/mios-dashboard.sh --mini @Args
             return
         }
     }
@@ -4758,13 +4779,13 @@ function mios-dash {
         `$_distro = `$null
         foreach (`$_d in @('podman-MiOS-DEV','MiOS-DEV')) {
             try {
-                `$_chk = & wsl.exe -d `$_d --user mios -- echo ready 2>`$null
+                `$_chk = & wsl.exe -d `$_d -u root --exec echo ready 2>`$null
                 if (`$LASTEXITCODE -eq 0 -and `$_chk -match 'ready') { `$_distro = `$_d; break }
             } catch {}
         }
         if (`$_distro) {
             try {
-                & wsl.exe -d `$_distro --user mios -- bash -lc 'systemctl --user list-units --type=service --state=active --no-legend --no-pager 2>/dev/null | head -30; echo ""; echo "graphical-session.target: `$(systemctl --user is-active graphical-session.target 2>/dev/null)"; echo "xdg-desktop-portal.service: `$(systemctl --user is-active xdg-desktop-portal.service 2>/dev/null)"; echo "podman.socket: `$(systemctl --user is-active podman.socket 2>/dev/null)"'
+                & wsl.exe -d `$_distro --user (Get-MiosLinuxLogin `$_distro) -- bash -lc 'systemctl --user list-units --type=service --state=active --no-legend --no-pager 2>/dev/null | head -30; echo ""; echo "graphical-session.target: `$(systemctl --user is-active graphical-session.target 2>/dev/null)"; echo "xdg-desktop-portal.service: `$(systemctl --user is-active xdg-desktop-portal.service 2>/dev/null)"; echo "podman.socket: `$(systemctl --user is-active podman.socket 2>/dev/null)"'
             } catch {
                 Write-Host "  [!] failed to query MiOS-DEV services: `$_" -ForegroundColor Yellow
             }
@@ -4802,7 +4823,7 @@ function mios-help {
     Write-Host '  mios pull     git fetch + hard reset root overlay to origin/main' -ForegroundColor White
     Write-Host '  mios config   open the HTML configurator (mios.toml editor)' -ForegroundColor White
     Write-Host '  mios ai       open Open WebUI (rich LLM interface) in your browser' -ForegroundColor White
-    Write-Host '  mios dev      wsl into the MiOS-DEV distro (root /, user mios)' -ForegroundColor White
+    Write-Host '  mios dev      wsl into MiOS-DEV (root /) as the MiOS login, [identity].username; re-run the installer after changing it' -ForegroundColor White
     Write-Host '  mios dash     FULL dashboard: ASCII banner + services + extended sys specs' -ForegroundColor White
     Write-Host '  mios xbox     Xbox VM Secure Boot / XML repair' -ForegroundColor White
     Write-Host '  mios virt     apply optimized VM config + CPU pinning' -ForegroundColor White
@@ -4916,7 +4937,7 @@ function btop {
     try { Set-MiosWindow -Mode reading } catch {}
     Start-Sleep -Milliseconds 200
     try {
-        & wsl.exe -d `$_dev --user mios -- btop @args
+        & wsl.exe -d `$_dev --user (Get-MiosLinuxLogin `$_dev) -- btop @args
     } finally {
         try { Set-MiosWindow -Mode portal } catch {}
     }

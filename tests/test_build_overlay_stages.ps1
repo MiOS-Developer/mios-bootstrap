@@ -208,6 +208,61 @@ function Invoke-Checks([string]$Build) {
            (Get-Count $fn 'Resolve-MiosLoginCredential') -eq 1 -and $iIf -ge 0 -and $iIf -lt $iResolve -and
            $fn -match '(?s)\} finally \{\n[^}]*Remove-Item -LiteralPath \$stagedPath -Force') 'each stage is passed to the seed, only realize resolves the credential, and the staged copy is removed after every run'
 
+    # The function itself, run for each stage against a wsl.exe mock. Only the 8 s probe line is replaced: it would start
+    # a real wsl.exe. Source checks alone missed run 8's failure (a local $stage is the ValidateSet-bound $Stage).
+    $probeLine = 'if (_ProbeWslAlive -Distro $candidate -TimeoutMs 8000) {'
+    $fnNode = @($psAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-MiosQuadletOverlay' }, $true))
+    $stageAssign = if ($fnNode.Count -eq 1) { @($fnNode[0].Body.FindAll({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $n.Left -is [Management.Automation.Language.VariableExpressionAst] -and $n.Left.VariablePath.UserPath -ieq 'Stage' }, $true)) } else { @('no function') }
+    $runOk = $false
+    if ($fn -and (Get-Count $fn $probeLine) -eq 1) {
+        $fnRun = $fn.Replace($probeLine, 'if ($true) {')
+        $harness = [scriptblock]::Create(@'
+param($FnSrc, $RepoDir, $ShadowDir, $Stage, $Rc)
+$ErrorActionPreference = 'Stop'
+$calls = New-Object System.Collections.Generic.List[object]; $logs = New-Object System.Collections.Generic.List[string]
+function Write-Log { param($M) $logs.Add([string]$M) }
+function Set-Step { param($T) }
+function Log-Ok { param($T) $logs.Add("OK $T") }
+function Log-Warn { param($T) $logs.Add("WARN $T") }
+function Log-Fail { param($T) $logs.Add("FAIL $T") }
+function Get-MiosTomlValue { param($Section, $Key, $Default) $Default }
+function Get-MiosSsotPort { param($Key) 8888 }
+function Resolve-MiosLoginCredential { @{ Plain = 'fixture-credential'; Hash = '' } }
+function wsl.exe {
+    $cmd = [string]$args[-1]
+    $m = [regex]::Match($cmd, "bash '/mnt/([a-z])(/[^']+)'")
+    $win = if ($m.Success) { $m.Groups[1].Value.ToUpper() + ':' + ($m.Groups[2].Value -replace '/', '\') } else { '' }
+    $text = if ($win -and (Test-Path -LiteralPath $win)) { [IO.File]::ReadAllText($win) } else { '' }
+    $calls.Add([pscustomobject]@{ Command = $cmd; Staged = [bool]$text; Credential = $text.Contains("_mios_pw='fixture-credential'") })
+    'seed line'
+    $global:LASTEXITCODE = $Rc
+}
+. ([scriptblock]::Create($FnSrc))
+$DevDistro = 'MiOS-DEV'; $MiosRepoDir = $RepoDir; $MiosBootstrapShadow = $ShadowDir
+$err = ''
+try { Invoke-MiosQuadletOverlay -Stage $Stage } catch { $err = $_.Exception.Message }
+[pscustomobject]@{ Error = $err; Calls = $calls.ToArray(); Logs = ($logs -join "`n"); Left = (Test-Path -LiteralPath (Join-Path $ShadowDir '.tmp\quadlet-overlay-seed.sh')) }
+'@)
+        $runRoot = Join-Path $scratch ('fnrun-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $repoDir = Join-Path $runRoot 'repo'; Write-Lf (Join-Path $repoDir 'Containerfile') "FROM scratch`n"
+        $shadowDir = Join-Path $runRoot 'shadow'; New-Item -ItemType Directory -Force -Path $shadowDir | Out-Null
+        $savedSkip = $env:MIOS_SKIP_DEV_QUADLETS; $env:MIOS_SKIP_DEV_QUADLETS = $null
+        try {
+            $run = { param($s, $rc) & $harness -FnSrc $fnRun -RepoDir $repoDir -ShadowDir $shadowDir -Stage $s -Rc $rc }
+            $co = & $run 'checkout' 0; $rz = & $run 'realize' 0; $r7 = & $run 'realize' 7; $r3 = & $run 'realize' 3; $c4 = & $run 'checkout' 4; $bad = & $run 'bogus' 0
+        } finally { $env:MIOS_SKIP_DEV_QUADLETS = $savedSkip }
+        $one = { param($r, $stage) $r.Calls.Count -eq 1 -and $r.Calls[0].Staged -and $r.Calls[0].Command.Contains("MIOS_OVERLAY_STAGE='$stage'") -and $r.Calls[0].Command.Contains("MIOS_DEV_MACHINE='MiOS-DEV'") -and -not $r.Left }
+        $runOk = $co.Error -eq '' -and (& $one $co 'checkout') -and -not $co.Calls[0].Credential -and $co.Logs.Contains('OK mios.git checked out at / in MiOS-DEV') -and
+                 $rz.Error -eq '' -and (& $one $rz 'realize') -and $rz.Calls[0].Credential -and $rz.Logs.Contains('OK MiOS Quadlet overlay applied to MiOS-DEV') -and
+                 $r7.Error -eq 'Quadlet overlay failed (rc=7)' -and (& $one $r7 'realize') -and $r7.Logs.Contains('FAIL Quadlet overlay realize failed (rc=7)') -and $r7.Logs -notmatch 're-provision' -and
+                 $r3.Error -eq 'Quadlet overlay failed: 34-render-quadlets.sh' -and (& $one $r3 'realize') -and
+                 $c4.Error -eq 'Quadlet overlay failed (rc=4)' -and (& $one $c4 'checkout') -and $c4.Logs -match 'FAIL Quadlet overlay failed \(rc=4\): .*re-provision it' -and
+                 $bad.Error -and $bad.Calls.Count -eq 0
+        if (-not $runOk -and $env:MIOS_TEST_VERBOSE) { foreach ($x in @($co, $rz, $r7, $r3, $c4, $bad)) { Write-Host ("error=[{0}] calls={1} left={2}`n{3}" -f $x.Error, $x.Calls.Count, $x.Left, $x.Logs) } }
+    }
+    Check ($runOk -and $stageAssign.Count -eq 0) 'Invoke-MiosQuadletOverlay runs both stages against a wsl.exe mock: the stage reaches the seed, only realize stages the credential, no staged copy survives, rc 3/4/7 fail with their own messages'
+
     Write-Host "OVERLAY_STAGES_ASSERTIONS $($script:checks)"
     return $script:fail
 }
@@ -254,7 +309,9 @@ try {
         @{ Name = '11 the staged credential copy kept'; Expected = 'each stage is passed to the seed, only realize resolves the credential, and the staged copy is removed after every run'
            Edits = @(, @('Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue', '$null = $stagedPath')) },
         @{ Name = '12 a modified root ends the checkout stage'; Expected = 'a modified root skips only the checkout; the rest of the checkout stage still runs'
-           Edits = @(, @("        ROOT_PRESERVED=1`n", "        exit 0`n")) }
+           Edits = @(, @("        ROOT_PRESERVED=1`n", "        exit 0`n")) },
+        @{ Name = '13 the seed command held in $stage (run 8)'; Expected = 'Invoke-MiosQuadletOverlay runs both stages against a wsl.exe mock: the stage reaches the seed, only realize stages the credential, no staged copy survives, rc 3/4/7 fail with their own messages'
+           Edits = @(@('    $seedCommand = "set -e; export MIOS_DEV_ENABLE_AI=', '    $stage = "set -e; export MIOS_DEV_ENABLE_AI='), @('--exec bash -c $seedCommand 2>&1', '--exec bash -c $stage 2>&1')) }
     )
     $caught = 0; $index = 0
     foreach ($plant in $plants) {

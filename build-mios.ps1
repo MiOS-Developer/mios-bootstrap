@@ -3651,18 +3651,19 @@ echo "[quadlet-overlay] sealed: $SENTINEL"
         New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
     }
     $stagedPath  = Join-Path $stagingDir 'quadlet-overlay-seed.sh'
-    [System.IO.File]::WriteAllText($stagedPath, $overlayScript, [System.Text.UTF8Encoding]::new($false))
 
     # Convert Windows path -> WSL /mnt/<drive>/... path so the seed
     # script can be invoked from the WSL side without re-mounting.
     $stagedDrive = $stagedPath.Substring(0,1).ToLower()
     $stagedWsl   = "/mnt/$stagedDrive" + ($stagedPath.Substring(2) -replace '\\','/')
 
-    $stage = "set -e; export MIOS_DEV_ENABLE_AI='$enableAi' MIOS_DEV_ENABLE_RUNNER='$enableRunner' MIOS_DEV_MACHINE='$DevDistro' MIOS_OVERLAY_STAGE='$Stage'; " +
-             "bash '$stagedWsl' '$miosRootWsl'"
+    # Not $stage: PowerShell names are case-insensitive, so that would be the ValidateSet-bound $Stage parameter.
+    $seedCommand = "set -e; export MIOS_DEV_ENABLE_AI='$enableAi' MIOS_DEV_ENABLE_RUNNER='$enableRunner' MIOS_DEV_MACHINE='$DevDistro' MIOS_OVERLAY_STAGE='$Stage'; " +
+                   "bash '$stagedWsl' '$miosRootWsl'"
     $seedLines = New-Object System.Collections.Generic.List[string]
     try {
-        & wsl.exe -d $wslDistro --exec bash -c $stage 2>&1 | ForEach-Object { $seedLines.Add([string]$_); Write-Log "quadlet-overlay: $_" }
+        [System.IO.File]::WriteAllText($stagedPath, $overlayScript, [System.Text.UTF8Encoding]::new($false))
+        & wsl.exe -d $wslDistro --exec bash -c $seedCommand 2>&1 | ForEach-Object { $seedLines.Add([string]$_); Write-Log "quadlet-overlay: $_" }
         $overlayRc = $LASTEXITCODE
     } finally {
         # The realize copy holds the login credential; no staged copy outlives its run.

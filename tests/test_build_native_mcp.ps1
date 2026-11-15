@@ -1,6 +1,7 @@
 # Native MiOS-MCP step (C8). Before the launcher's client setup, build-mios.ps1 runs MiOS's own offline payload installer
 # (mios-mcp-server --install-native, the call MiOS's Containerfile makes) in the builder as root on every install, then
-# re-probes as the uid-1000 user exactly what mios-native-client-setup.ps1 probes. The source-order checks read
+# re-probes as the MiOS login ([identity].username through MiOS's identity guard) exactly what
+# mios-native-client-setup.ps1 probes. The source-order checks read
 # build-mios.ps1; the behaviour checks run Install-MiosNativeMcp itself against a wsl.exe mock. No distro or wsl.exe is
 # touched. Default runs the checks; -PlantDefect plants each guarded defect into a copy and requires a red result.
 [CmdletBinding()]
@@ -18,7 +19,7 @@ function Get-Count([string]$Text, [string]$Needle) { return ([regex]::Matches($T
 function Get-Code([string]$Text) { return ((($Text -split "`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n") }
 
 $harness = [scriptblock]::Create(@'
-param($FnSrc, $InstallRc, $ProbeOk, $Uid1000)
+param($FnSrc, $InstallRc, $ProbeOk, $Login)
 $ErrorActionPreference = 'Stop'
 $calls = New-Object System.Collections.Generic.List[string]; $logs = New-Object System.Collections.Generic.List[string]
 function Write-Log { param($M) $logs.Add([string]$M) }
@@ -29,7 +30,7 @@ function wsl.exe {
     $line = ($args | ForEach-Object { [string]$_ }) -join ' '
     $calls.Add($line)
     if ($line -match '--install-native') { 'mios-mcp-server: installed'; $global:LASTEXITCODE = $InstallRc; return }
-    if ($line -match 'getpwuid\(1000\)') { $Uid1000; $global:LASTEXITCODE = 0; return }
+    if ($line -match "base_view\(\)\.get\('identity'\)") { if ($Login) { $Login; $global:LASTEXITCODE = 0 } else { $global:LASTEXITCODE = 1 }; return }
     if ($line -match "load_merged\(\)\['mcp'\]\['python'\]") { '/usr/lib/mios/mcp/.venv/bin/python3'; $global:LASTEXITCODE = 0; return }
     if ($line -match 'native-ready') { if ($ProbeOk) { 'native-ready'; $global:LASTEXITCODE = 0 } else { 'AssertionError'; $global:LASTEXITCODE = 1 }; return }
     'unexpected'; $global:LASTEXITCODE = 99
@@ -59,7 +60,7 @@ function Invoke-Checks([string]$Build) {
     $fn = & $fnText 'Install-MiosNativeMcp'
     $ok = $false; $failInstall = $false; $failProbe = $false; $rootUid = $false
     if ($fn) {
-        $a = & $harness -FnSrc $fn -InstallRc 0 -ProbeOk $true -Uid1000 'user'
+        $a = & $harness -FnSrc $fn -InstallRc 0 -ProbeOk $true -Login 'user'
         $install = @($a.Calls | Where-Object { $_ -match '--install-native' })
         $probe = @($a.Calls | Where-Object { $_ -match 'native-ready' })
         $iInstall = [array]::IndexOf($a.Calls, $install[0]); $iProbe = [array]::IndexOf($a.Calls, $probe[0])
@@ -68,18 +69,23 @@ function Invoke-Checks([string]$Build) {
               $probe[0].StartsWith('-d podman-MiOS-DEV -u user --exec /usr/lib/mios/mcp/.venv/bin/python3 -c ') -and
               $probe[0].Contains("from mcp import Client; assert os.getuid()!=0; assert os.access('/usr/libexec/mios/tmux-mcp',os.X_OK); print('native-ready')") -and
               $a.Logs.Contains('mios-mcp-install: mios-mcp-server: installed') -and $a.Logs.Contains('mios-mcp-probe: native-ready') -and $a.Logs.Contains('OK Native MiOS-MCP installed and probed as user')
-        $b = & $harness -FnSrc $fn -InstallRc 1 -ProbeOk $true -Uid1000 'user'
+        $b = & $harness -FnSrc $fn -InstallRc 1 -ProbeOk $true -Login 'user'
         $failInstall = $b.Error -match '^Native MiOS-MCP install failed \(exit 1\)' -and @($b.Calls | Where-Object { $_ -match 'native-ready' }).Count -eq 0
-        $c = & $harness -FnSrc $fn -InstallRc 0 -ProbeOk $false -Uid1000 'user'
+        $c = & $harness -FnSrc $fn -InstallRc 0 -ProbeOk $false -Login 'user'
         $failProbe = $c.Error -match '^Native MiOS-MCP probe failed as user \(exit 1\)' -and $c.Logs.Contains('mios-mcp-probe: AssertionError')
-        $d = & $harness -FnSrc $fn -InstallRc 0 -ProbeOk $true -Uid1000 'root'
-        $rootUid = $d.Error -match 'No unprivileged uid-1000 user' -and @($d.Calls | Where-Object { $_ -match 'native-ready' }).Count -eq 0
+        $d = & $harness -FnSrc $fn -InstallRc 0 -ProbeOk $true -Login 'root'
+        $e = & $harness -FnSrc $fn -InstallRc 0 -ProbeOk $true -Login ''
+        $rootUid = $d.Error -match 'The MiOS login \(vendor/host \[identity\]\.username\) is not a usable account' -and @($d.Calls | Where-Object { $_ -match 'native-ready' }).Count -eq 0 -and
+                   $e.Error -match 'The MiOS login \(vendor/host \[identity\]\.username\) is not a usable account' -and @($e.Calls | Where-Object { $_ -match 'native-ready' }).Count -eq 0
     }
-    Check $ok 'MiOS''s installer runs as root (python3.13 mios-mcp-server --install-native --source-root / --root /), then the client setup''s probe runs as the uid-1000 user'
-    Check ($failInstall -and $failProbe -and $rootUid) 'an installer failure, a failed probe and a root uid 1000 are each fatal with their own message'
+    Check $ok 'MiOS''s installer runs as root (python3.13 mios-mcp-server --install-native --source-root / --root /), then the client setup''s probe runs as the MiOS login'
+    Check ($failInstall -and $failProbe -and $rootUid) 'an installer failure, a failed probe and a root or unresolved login are each fatal with their own message'
     # Native arguments carry no double quote (Windows PowerShell would drop it) and no 2>$null (it would throw on stderr).
     $fnCode = Get-Code $fn
-    Check ($fnCode -and @([regex]::Matches($fnCode, "--exec [^\n]*-c '")).Count -eq 3 -and -not ([regex]::Matches($fnCode, "--exec [^\n]*-c '[^'\n]*`"")).Count -and $fnCode -notmatch '2>\$null') 'the probes pass single-quoted Python with no 2>$null, safe on Windows PowerShell 5.1 and pwsh 7'
+    $probeLiteral = [regex]::Match($fnCode, "(?m)^\s*\`$identityProbe = '((?:[^']|'')*)'\s*$")
+    Check ($fnCode -and @([regex]::Matches($fnCode, "--exec [^\n]*-c '")).Count -eq 2 -and $fnCode -match '--exec python3 -c \$identityProbe' -and
+           $probeLiteral.Success -and -not $probeLiteral.Groups[1].Value.Contains('"') -and
+           -not ([regex]::Matches($fnCode, "--exec [^\n]*-c '[^'\n]*`"")).Count -and $fnCode -notmatch '2>\$null') 'the probes pass single-quoted Python with no 2>$null, safe on Windows PowerShell 5.1 and pwsh 7'
 
     Write-Host "NATIVE_MCP_ASSERTIONS $($script:checks)"
     return $script:fail
@@ -98,11 +104,11 @@ try {
     $plants = @(
         @{ Name = 'the step removed'; Expected = 'the native MiOS-MCP step runs unconditionally, after the catalog and right before the client setup'
            Edits = @(, @($call, '')) },
-        @{ Name = 'the installer failure downgraded to a warning'; Expected = 'an installer failure, a failed probe and a root uid 1000 are each fatal with their own message'
+        @{ Name = 'the installer failure downgraded to a warning'; Expected = 'an installer failure, a failed probe and a root or unresolved login are each fatal with their own message'
            Edits = @(, @('{ throw "Native MiOS-MCP install failed', '{ Log-Warn "Native MiOS-MCP install failed')) },
         @{ Name = 'the step placed after the client setup'; Expected = 'the native MiOS-MCP step runs unconditionally, after the catalog and right before the client setup'
            Edits = @(, @(($call + $setup), ($setup + $call))) },
-        @{ Name = 'the probe run as root'; Expected = 'MiOS''s installer runs as root (python3.13 mios-mcp-server --install-native --source-root / --root /), then the client setup''s probe runs as the uid-1000 user'
+        @{ Name = 'the probe run as root'; Expected = 'MiOS''s installer runs as root (python3.13 mios-mcp-server --install-native --source-root / --root /), then the client setup''s probe runs as the MiOS login'
            Edits = @(, @("& wsl.exe -d `$distribution -u `$user --exec `$python -c", "& wsl.exe -d `$distribution -u root --exec `$python -c")) },
         @{ Name = 'a skip when the payload is present'; Expected = 'the native MiOS-MCP step runs unconditionally, after the catalog and right before the client setup'
            Edits = @(, @($call, "    if (-not (Test-Path -LiteralPath `$MiosBinDir)) { Install-MiosNativeMcp -Machine `$DevDistro }`n")) }

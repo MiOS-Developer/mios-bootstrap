@@ -152,20 +152,21 @@ function Invoke-Checks([string]$Build) {
     $body = $lf.GetBytes($miosWslConf); $hdr = [Text.Encoding]::ASCII.GetBytes("blob $($body.Length)`0")
     $blobOk = ([BitConverter]::ToString([Security.Cryptography.SHA1]::Create().ComputeHash([byte[]]($hdr + $body))).Replace('-', '').ToLowerInvariant()) -eq 'cad13fa99a8dd7d6a1a023ea3202857b82d29243'
     $wsl = Join-Path $scratch ('wsl-' + [guid]::NewGuid().ToString('N') + '.conf')
-    $seedBlock = Get-Block $text 'echo "[quadlet-overlay] setting wsl.conf' "skipping wsl.conf default-user write`"`nfi"
-    $seedRun = $seedBlock.Replace('/etc/wsl.conf', (Fwd $wsl)).Replace('sudo ', '').Replace('id mios >/dev/null 2>&1', 'true')
+    $seedBlock = Get-Block $text 'echo "[quadlet-overlay] setting wsl.conf' "wsl.conf [user].default left as it is`"`nfi"
+    # The writers resolve the login through MiOS's identity guard; the fixture pins a login so the fill path runs.
+    $seedRun = ($seedBlock.Replace('/etc/wsl.conf', (Fwd $wsl)).Replace('sudo ', '')) -replace 'MIOS_LOGIN=\$\(python3 -c "[^"]*"\) \|\| MIOS_LOGIN=""', 'MIOS_LOGIN=user'
     Write-Lf $wsl $miosWslConf; $before = Get-Sha $wsl; $null = Invoke-BashBlock $seedRun
     $seedSame = (Get-Sha $wsl) -eq $before
     Write-Lf $wsl "[interop]`nenabled=true`n"; $null = Invoke-BashBlock $seedRun; $seedActs = ([IO.File]::ReadAllText($wsl)) -match '\[boot\]'
     Check ($blobOk -and $seedSame -and $seedActs) 'the quadlet-overlay wsl.conf enforcement leaves mios.git''s bytes unchanged (and still repairs a file that lacks them)'
-    $miosSeed = Get-Block $text 'if [ ! -f /etc/wsl.conf ]; then' "default=mios already set`"`n    fi`nfi"
-    $miosSeedRun = $miosSeed.Replace('/etc/wsl.conf', (Fwd $wsl)).Replace('id mios >/dev/null 2>&1', 'true')
+    $miosSeed = Get-Block $text 'if [ ! -f /etc/wsl.conf ]; then' "the realize stage sets wsl.conf [user].default`"`nfi"
+    $miosSeedRun = ($miosSeed.Replace('/etc/wsl.conf', (Fwd $wsl))) -replace 'MIOS_LOGIN=\$\(python3 -c "[^"]*" 2>/dev/null\) \|\| MIOS_LOGIN=""', 'MIOS_LOGIN=user'
     Write-Lf $wsl $miosWslConf; $null = Invoke-BashBlock $miosSeedRun
     Check ((Get-Sha $wsl) -eq $before) 'the mios-seed wsl.conf enforcement leaves mios.git''s bytes unchanged'
-    $py = Get-Block $text 'import os, re, shutil' 'sanitize_conf("/etc/wsl.conf", has_mios)'
+    $py = Get-Block $text 'import os, re, shutil' 'sanitize_conf("/etc/wsl.conf", login)'
     $usrLib = Join-Path $scratch ('usrlib-' + [guid]::NewGuid().ToString('N') + '.conf')
     # On Linux text-mode writes use "\n"; this Windows fixture host would translate to "\r\n", so the copy pins newline="\n".
-    $pyRun = $py.Replace('"/usr/lib/wsl.conf"', ('"' + (Fwd $usrLib) + '"')).Replace('"/etc/wsl.conf"', ('"' + (Fwd $wsl) + '"')).Replace('has_mios = os.system("id mios >/dev/null 2>&1") == 0', 'has_mios = True').Replace('open(filepath, "w", encoding="utf-8")', 'open(filepath, "w", encoding="utf-8", newline="\n")')
+    $pyRun = $py.Replace('"/usr/lib/wsl.conf"', ('"' + (Fwd $usrLib) + '"')).Replace('"/etc/wsl.conf"', ('"' + (Fwd $wsl) + '"')).Replace('probe = subprocess.run([sys.executable, "-c", GUARD], capture_output=True, text=True)', 'probe = None').Replace('login = probe.stdout.strip() if probe.returncode == 0 else ""', 'login = "user"').Replace('open(filepath, "w", encoding="utf-8")', 'open(filepath, "w", encoding="utf-8", newline="\n")')
     $pyFile = Join-Path $scratch ('sanitize-' + [guid]::NewGuid().ToString('N') + '.py'); Write-Lf $pyFile $pyRun
     Write-Lf $wsl $miosWslConf; Write-Lf $usrLib $miosWslConf
     $ErrorActionPreference = 'Continue'; $null = & $python -I $pyFile 2>&1; $pyExit = $LASTEXITCODE; $ErrorActionPreference = 'Stop'
@@ -207,7 +208,13 @@ try {
         @{ Name = 'the on-screen remedy dropped'; Expected = 'an unknown-path refusal tells the operator the paths and the remedy on screen'
            From = ' re-provision it (podman machine rm $DevDistro, then re-run the installer)."'; To = '"' },
         @{ Name = "the seed's wsl.conf rewrite making / dirty"; Expected = "the quadlet-overlay wsl.conf enforcement leaves mios.git's bytes unchanged (and still repairs a file that lacks them)"
-           From = 'echo "[quadlet-overlay] /etc/wsl.conf: [boot] systemd=true already set"'; To = 'printf ''systemd=true\n'' | sudo tee -a /etc/wsl.conf >/dev/null' }
+           From = 'echo "[quadlet-overlay] /etc/wsl.conf: [boot] systemd=true already set"'; To = 'printf ''systemd=true\n'' | sudo tee -a /etc/wsl.conf >/dev/null' },
+        @{ Name = 'the realize rewriting an existing default login'; Expected = "the quadlet-overlay wsl.conf enforcement leaves mios.git's bytes unchanged (and still repairs a file that lacks them)"
+           From = '        echo "[quadlet-overlay] /etc/wsl.conf: [user] default already set; left as it is"'; To = '        sudo sed -i "s|^[[:space:]]*default[[:space:]]*=.*|default=$MIOS_LOGIN|" /etc/wsl.conf' },
+        @{ Name = 'mios-seed rewriting an existing default login'; Expected = "the mios-seed wsl.conf enforcement leaves mios.git's bytes unchanged"
+           From = '        echo "[mios-seed] /etc/wsl.conf: [user] default already set; left as it is"'; To = '        sed -i "s|^[[:space:]]*default[[:space:]]*=.*|default=$MIOS_LOGIN|" /etc/wsl.conf' },
+        @{ Name = 'the sanitizer replacing an existing default login'; Expected = "the wsl.conf sanitizer leaves mios.git's etc/ and usr/lib/ copies unchanged"
+           From = '                new_lines.append(f"default={v}")'; To = '                new_lines.append(f"default={login}" if login else f"default={v}")' }
     )
     $caught = 0; $index = 0
     foreach ($plant in $plants) {

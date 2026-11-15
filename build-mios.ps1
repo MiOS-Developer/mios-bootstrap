@@ -71,8 +71,11 @@ function Install-MiosNativeMcp([string]$Machine) {
     if ($script:_mcpInstallRc -ne 0) { throw "Native MiOS-MCP install failed (exit $($script:_mcpInstallRc)): python3.13 /usr/libexec/mios/mios-mcp-server --install-native in $distribution" }
     # Python sources are single-quoted for the guest: no double quote reaches a native argument on either PowerShell.
     # No 2>$null: Windows PowerShell turns any stderr line (wsl.exe prints config notices there) into a terminating error.
-    $user = ((& wsl.exe -d $distribution -u root --exec python3 -c 'import pwd; print(pwd.getpwuid(1000).pw_name)') -join '').Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $user -or $user -eq 'root') { throw 'No unprivileged uid-1000 user in the MiOS builder to probe native MiOS-MCP as' }
+    # The probe account is the MiOS login: the vendor/host [identity].username through MiOS's identity guard (the text
+    # usr/share/mios/windows/*.ps1 carries), never a uid literal. The guard prints its refusal on stderr.
+    $identityProbe = 'import sys,pwd; sys.path.insert(0,''/usr/lib/mios''); import mios_toml as m; n=str((m.base_view().get(''identity'') or {}).get(''username'') or '''').strip(); p={e.pw_name: e for e in pwd.getpwall()}.get(n); print(n) if p and p.pw_uid != 0 and p.pw_uid >= m._uid_min() and not p.pw_shell.endswith((''nologin'', ''false'')) else sys.exit(''MiOS identity: the vendor/host [identity].username %r is not a login account here (missing, root, a system uid below UID_MIN, or no login shell)'' % n)'
+    $user = ((& wsl.exe -d $distribution -u root --exec python3 -c $identityProbe) -join '').Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $user -or $user -eq 'root') { throw 'The MiOS login (vendor/host [identity].username) is not a usable account in the MiOS builder; cannot probe native MiOS-MCP as it' }
     $python = ((& wsl.exe -d $distribution -u $user --exec python3 -c 'import sys; sys.path.insert(0, ''/usr/lib/mios''); import mios_toml; print(mios_toml.load_merged()[''mcp''][''python''])') -join '').Trim()
     if ($LASTEXITCODE -ne 0 -or -not $python.StartsWith('/')) { throw 'Could not resolve [mcp].python from the MiOS SSOT' }
     & {
@@ -1466,10 +1469,14 @@ function Open-ConfiguratorInDev([string]$RepoDir, [string]$Html) {
     }
     if (-not $wslDistro) { return $false }
 
-    # Find the regular user (uid 1000) inside the dev VM. Podman machines
-    # default to "user"; we honor whatever's actually there.
-    $devUser = ((& wsl.exe -d $wslDistro --exec bash -c "getent passwd 1000 | cut -d: -f1" 2>$null) -join "").Trim()
-    if (-not $devUser) { $devUser = "user" }
+    # The configurator opens as the MiOS login: the vendor/host [identity].username through MiOS's identity guard
+    # (the text usr/share/mios/windows/*.ps1 carries), never a uid literal or a fallback name.
+    $identityProbe = 'import sys,pwd; sys.path.insert(0,''/usr/lib/mios''); import mios_toml as m; n=str((m.base_view().get(''identity'') or {}).get(''username'') or '''').strip(); p={e.pw_name: e for e in pwd.getpwall()}.get(n); print(n) if p and p.pw_uid != 0 and p.pw_uid >= m._uid_min() and not p.pw_shell.endswith((''nologin'', ''false'')) else sys.exit(''MiOS identity: the vendor/host [identity].username %r is not a login account here (missing, root, a system uid below UID_MIN, or no login shell)'' % n)'
+    $devUser = ((& wsl.exe -d $wslDistro -u root --exec python3 -c $identityProbe) -join "").Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $devUser) {
+        Log-Warn "MiOS-DEV has no usable login for [identity].username; the configurator opens on Windows instead"
+        return $false
+    }
 
     # Convert C:\path\mios.html -> /mnt/c/path/mios.html
     $drive    = $Html.Substring(0,1).ToLower()
@@ -3084,7 +3091,7 @@ $NS systemd-tmpfiles --create 2>&1 | tail -3 || true
 $NS systemctl daemon-reload 2>&1 | tail -3
 mios_restart_stopped
 
-echo "[quadlet-overlay] setting wsl.conf [boot].systemd=true + [user].default=mios"
+echo "[quadlet-overlay] setting wsl.conf [boot].systemd=true + [user].default=<the [identity].username login>"
 if ! grep -q '^\[boot\]' /etc/wsl.conf 2>/dev/null; then
     printf '\n[boot]\nsystemd=true\n' | sudo tee -a /etc/wsl.conf >/dev/null
     echo "[quadlet-overlay] /etc/wsl.conf: appended [boot] systemd=true"
@@ -3099,21 +3106,21 @@ elif ! grep -qE '^[[:space:]]*systemd[[:space:]]*=[[:space:]]*true[[:space:]]*$'
 else
     echo "[quadlet-overlay] /etc/wsl.conf: [boot] systemd=true already set"
 fi
-if id mios >/dev/null 2>&1; then
+# The default login is the vendor/host [identity].username through MiOS's identity guard (no literal name).
+MIOS_LOGIN=$(python3 -c "import sys,pwd; sys.path.insert(0,'/usr/lib/mios'); import mios_toml as m; n=str((m.base_view().get('identity') or {}).get('username') or '').strip(); p={e.pw_name: e for e in pwd.getpwall()}.get(n); print(n) if p and p.pw_uid != 0 and p.pw_uid >= m._uid_min() and not p.pw_shell.endswith(('nologin', 'false')) else sys.exit('MiOS identity: the vendor/host [identity].username %r is not a login account here (missing, root, a system uid below UID_MIN, or no login shell)' % n)") || MIOS_LOGIN=""
+if [ -n "$MIOS_LOGIN" ]; then
     if ! grep -q '^\[user\]' /etc/wsl.conf 2>/dev/null; then
-        printf '\n[user]\ndefault=mios\n' | sudo tee -a /etc/wsl.conf >/dev/null
-        echo "[quadlet-overlay] /etc/wsl.conf: appended [user] default=mios"
+        printf '\n[user]\ndefault=%s\n' "$MIOS_LOGIN" | sudo tee -a /etc/wsl.conf >/dev/null
+        echo "[quadlet-overlay] /etc/wsl.conf: appended [user] default=$MIOS_LOGIN"
     elif ! grep -qE '^[[:space:]]*default[[:space:]]*=' /etc/wsl.conf 2>/dev/null; then
-        sudo sed -i '/^\[user\]/a default=mios' /etc/wsl.conf
-        echo "[quadlet-overlay] /etc/wsl.conf: inserted default=mios under existing [user]"
-    elif ! grep -qE '^[[:space:]]*default[[:space:]]*=[[:space:]]*mios[[:space:]]*$' /etc/wsl.conf 2>/dev/null; then
-        sudo sed -i 's|^[[:space:]]*default[[:space:]]*=.*|default=mios|' /etc/wsl.conf
-        echo "[quadlet-overlay] /etc/wsl.conf: rewrote default=<other> to default=mios"
+        sudo sed -i "/^\[user\]/a default=$MIOS_LOGIN" /etc/wsl.conf
+        echo "[quadlet-overlay] /etc/wsl.conf: inserted default=$MIOS_LOGIN under existing [user]"
     else
-        echo "[quadlet-overlay] /etc/wsl.conf: default=mios already set"
+        # Fill only: an existing default is never rewritten here, so mios.git's tracked etc/wsl.conf stays clean (R5).
+        echo "[quadlet-overlay] /etc/wsl.conf: [user] default already set; left as it is"
     fi
 else
-    echo "[quadlet-overlay] WARN: mios user not found after sysusers; skipping wsl.conf default-user write"
+    echo "[quadlet-overlay] WARN: no usable MiOS login for [identity].username; wsl.conf [user].default left as it is"
 fi
 
 echo "[quadlet-overlay] container-host prerequisites for mios user ..."
@@ -3317,9 +3324,11 @@ WRAPPER
 done
 }
 
-DEV_USER=$(getent passwd 1000 | cut -d: -f1) || DEV_USER=""
-[[ -z "$DEV_USER" ]] && DEV_USER=user
-if [[ ! -f /etc/sudoers.d/00-mios-dev ]]; then
+# The sudoers grant goes to the vendor/host [identity].username login through MiOS's identity guard, never uid 1000.
+DEV_USER=$(python3 -c "import sys,pwd; sys.path.insert(0,'/usr/lib/mios'); import mios_toml as m; n=str((m.base_view().get('identity') or {}).get('username') or '').strip(); p={e.pw_name: e for e in pwd.getpwall()}.get(n); print(n) if p and p.pw_uid != 0 and p.pw_uid >= m._uid_min() and not p.pw_shell.endswith(('nologin', 'false')) else sys.exit('MiOS identity: the vendor/host [identity].username %r is not a login account here (missing, root, a system uid below UID_MIN, or no login shell)' % n)") || DEV_USER=""
+if [[ -z "$DEV_USER" ]]; then
+    echo "[quadlet-overlay] WARN: no usable MiOS login for [identity].username; sudoers drop-in not written"
+elif [[ ! -f /etc/sudoers.d/00-mios-dev ]]; then
     sudo tee /etc/sudoers.d/00-mios-dev >/dev/null <<SUDO
 # MiOS-DEV passwordless sudo. Generated by Invoke-MiosQuadletOverlay.
 # The dev VM is single-tenant on Windows; the operator already has
@@ -4018,13 +4027,17 @@ function Import-MiosWsl {
     # Configure /etc/wsl.conf and /usr/lib/wsl.conf without duplicate sections
     try {
         $sanitizePy = @'
-import os, re, shutil
+import os, re, shutil, subprocess, sys
 
-def sanitize_conf(filepath, has_user_mios):
+# The default login is the vendor/host [identity].username through MiOS's identity guard (the text
+# usr/share/mios/windows/*.ps1 carries), never a literal name.
+GUARD = "import sys,pwd; sys.path.insert(0,'/usr/lib/mios'); import mios_toml as m; n=str((m.base_view().get('identity') or {}).get('username') or '').strip(); p={e.pw_name: e for e in pwd.getpwall()}.get(n); print(n) if p and p.pw_uid != 0 and p.pw_uid >= m._uid_min() and not p.pw_shell.endswith(('nologin', 'false')) else sys.exit('MiOS identity: the vendor/host [identity].username %r is not a login account here (missing, root, a system uid below UID_MIN, or no login shell)' % n)"
+
+def sanitize_conf(filepath, login):
     if not os.path.exists(filepath):
         content = "[boot]\nsystemd=true\n"
-        if has_user_mios:
-            content += "\n[user]\ndefault=mios\n"
+        if login:
+            content += f"\n[user]\ndefault={login}\n"
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
         return
@@ -4061,7 +4074,8 @@ def sanitize_conf(filepath, has_user_mios):
                 new_lines.append("systemd=true")
                 continue
             if current_sec == "user" and k == "default":
-                new_lines.append("default=mios" if has_user_mios else f"default={v}")
+                # Fill only: an existing default is kept, so mios.git's tracked wsl.conf copies stay clean (R5).
+                new_lines.append(f"default={v}")
                 continue
             new_lines.append(line)
             continue
@@ -4075,37 +4089,39 @@ def sanitize_conf(filepath, has_user_mios):
         idx = new_lines.index("[boot]") + 1
         new_lines.insert(idx, "systemd=true")
 
-    if has_user_mios:
+    if login:
         if "user" not in seen_sections:
             new_lines.append("[user]")
-            new_lines.append("default=mios")
+            new_lines.append(f"default={login}")
         elif "default" not in sec_keys.get("user", set()):
             idx = new_lines.index("[user]") + 1
-            new_lines.insert(idx, "default=mios")
+            new_lines.insert(idx, f"default={login}")
 
     output = "\n".join(new_lines).strip() + "\n"
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(output)
 
-has_mios = os.system("id mios >/dev/null 2>&1") == 0
+probe = subprocess.run([sys.executable, "-c", GUARD], capture_output=True, text=True)
+login = probe.stdout.strip() if probe.returncode == 0 else ""
+if not login:
+    print((probe.stderr.strip().splitlines() or ["MiOS identity: no usable login"])[-1] + "; [user] default left as it is")
 if os.path.exists("/usr/lib/wsl.conf"):
-    sanitize_conf("/usr/lib/wsl.conf", has_mios)
+    sanitize_conf("/usr/lib/wsl.conf", login)
     shutil.copyfile("/usr/lib/wsl.conf", "/etc/wsl.conf")
     os.chmod("/etc/wsl.conf", 0o644)
 else:
-    sanitize_conf("/etc/wsl.conf", has_mios)
+    sanitize_conf("/etc/wsl.conf", login)
 '@
         $pyB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($sanitizePy))
+        # Without python3 the SSOT identity cannot be resolved, so the fallback sets [boot] only and leaves [user] alone.
         $bashCmd = "if command -v python3 >/dev/null 2>&1; then echo '$pyB64' | base64 -d | python3; else " +
                    "if [ -f /usr/lib/wsl.conf ]; then " +
                    "if ! grep -q '^\[boot\]' /usr/lib/wsl.conf 2>/dev/null; then printf '[boot]\nsystemd=true\n\n' >> /usr/lib/wsl.conf; fi; " +
-                   "if id mios >/dev/null 2>&1 && ! grep -q '^\[user\]' /usr/lib/wsl.conf 2>/dev/null; then printf '[user]\ndefault=mios\n\n' >> /usr/lib/wsl.conf; fi; " +
                    "cp -f /usr/lib/wsl.conf /etc/wsl.conf; chmod 644 /etc/wsl.conf; " +
                    "else " +
                    "if ! grep -q '^\[boot\]' /etc/wsl.conf 2>/dev/null; then printf '[boot]\nsystemd=true\n\n' >> /etc/wsl.conf; " +
-                   "elif ! grep -qE '^[[:space:]]*systemd[[:space:]]*=' /etc/wsl.conf 2>/dev/null; then sed -i '/^\[boot\]/a systemd=true' /etc/wsl.conf; fi; " +
-                   "if id mios >/dev/null 2>&1; then if ! grep -q '^\[user\]' /etc/wsl.conf 2>/dev/null; then printf '[user]\ndefault=mios\n\n' >> /etc/wsl.conf; " +
-                   "elif ! grep -qE '^[[:space:]]*default[[:space:]]*=' /etc/wsl.conf 2>/dev/null; then sed -i '/^\[user\]/a default=mios' /etc/wsl.conf; fi; fi; fi; fi"
+                   "elif ! grep -qE '^[[:space:]]*systemd[[:space:]]*=' /etc/wsl.conf 2>/dev/null; then sed -i '/^\[boot\]/a systemd=true' /etc/wsl.conf; fi; fi; " +
+                   "echo 'no python3: the [identity].username login cannot be resolved; [user] default left as it is'; fi"
         & wsl.exe -d $targetDistro --user root --exec bash -c $bashCmd 2>&1 | ForEach-Object { Write-Log "wsl-conf: $_" }
     } catch {
         Write-Log "WARN: /etc/wsl.conf configuration: $($_.Exception.Message)" "WARN"
@@ -7639,7 +7655,7 @@ if ! id mios >/dev/null 2>&1; then
         fi
         echo "[mios-seed] mios user created (uid=$(id -u mios), groups=$(id -Gn mios))"
     else
-        echo "[mios-seed] WARN: useradd mios failed (rc=$_useradd_rc) -- wsl.conf default=mios will fail until the user exists"
+        echo "[mios-seed] WARN: useradd mios failed (rc=$_useradd_rc)"
     fi
 fi
 if [ ! -f /etc/wsl.conf ]; then
@@ -7659,19 +7675,22 @@ elif ! grep -qE '^[[:space:]]*systemd[[:space:]]*=[[:space:]]*true[[:space:]]*$'
 else
     echo "[mios-seed] /etc/wsl.conf: [boot] systemd=true already set"
 fi
-if id mios >/dev/null 2>&1; then
+# The default login is the vendor/host [identity].username through MiOS's identity guard (no literal name). Before
+# the overlay lays down /usr/lib/mios the guard cannot run; the realize stage sets the default login then.
+MIOS_LOGIN=$(python3 -c "import sys,pwd; sys.path.insert(0,'/usr/lib/mios'); import mios_toml as m; n=str((m.base_view().get('identity') or {}).get('username') or '').strip(); p={e.pw_name: e for e in pwd.getpwall()}.get(n); print(n) if p and p.pw_uid != 0 and p.pw_uid >= m._uid_min() and not p.pw_shell.endswith(('nologin', 'false')) else sys.exit('MiOS identity: the vendor/host [identity].username %r is not a login account here (missing, root, a system uid below UID_MIN, or no login shell)' % n)" 2>/dev/null) || MIOS_LOGIN=""
+if [ -n "$MIOS_LOGIN" ]; then
     if ! grep -q '^\[user\]' /etc/wsl.conf 2>/dev/null; then
-        printf '\n[user]\ndefault=mios\n' >> /etc/wsl.conf
-        echo "[mios-seed] /etc/wsl.conf: appended [user].default=mios"
+        printf '\n[user]\ndefault=%s\n' "$MIOS_LOGIN" >> /etc/wsl.conf
+        echo "[mios-seed] /etc/wsl.conf: appended [user].default=$MIOS_LOGIN"
     elif ! grep -qE '^[[:space:]]*default[[:space:]]*=' /etc/wsl.conf 2>/dev/null; then
-        sed -i '/^\[user\]/a default=mios' /etc/wsl.conf
-        echo "[mios-seed] /etc/wsl.conf: inserted default=mios under existing [user]"
-    elif ! grep -qE '^[[:space:]]*default[[:space:]]*=[[:space:]]*mios[[:space:]]*$' /etc/wsl.conf 2>/dev/null; then
-        sed -i 's|^[[:space:]]*default[[:space:]]*=.*|default=mios|' /etc/wsl.conf
-        echo "[mios-seed] /etc/wsl.conf: rewrote default=<other> to default=mios"
+        sed -i "/^\[user\]/a default=$MIOS_LOGIN" /etc/wsl.conf
+        echo "[mios-seed] /etc/wsl.conf: inserted default=$MIOS_LOGIN under existing [user]"
     else
-        echo "[mios-seed] /etc/wsl.conf: default=mios already set"
+        # Fill only: an existing default is never rewritten here, so mios.git's tracked etc/wsl.conf stays clean (R5).
+        echo "[mios-seed] /etc/wsl.conf: [user] default already set; left as it is"
     fi
+else
+    echo "[mios-seed] no usable MiOS login for [identity].username yet; the realize stage sets wsl.conf [user].default"
 fi
 # Pre-bootc bridge: source mios.git profile.d scripts from /mnt/m/ on
 # every interactive bash login, IF the canonical /etc/profile.d/mios-*

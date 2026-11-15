@@ -55,6 +55,37 @@ function Install-MiosNativeCatalog([string]$Root, [string]$Machine) {
     return @{ Distribution = $distribution; LinuxRoot = $linuxRoot }
 }
 
+# MiOS's own offline payload installer, the call its Containerfile makes after [packages.mcp] (realize installs that
+# section): the MCP venv from the vendored wheelhouse, tmux-mcp and the terminal fonts, each archive checked against its
+# SSOT digest. It runs on every install, with no skip, so the payload always matches the checkout. Then the probe that
+# mios-native-client-setup.ps1 runs, as the same uid-1000 user. Either failing is fatal.
+function Install-MiosNativeMcp([string]$Machine) {
+    $distribution = Resolve-MiosBuilderDistribution $Machine
+    & {
+        $ErrorActionPreference = 'Continue'
+        if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) { $PSNativeCommandUseErrorActionPreference = $false }
+        $script:_mcpInstallOut = @(& wsl.exe -d $distribution -u root --exec python3.13 /usr/libexec/mios/mios-mcp-server --install-native --source-root / --root / 2>&1 | ForEach-Object { "$_" })
+        $script:_mcpInstallRc = $LASTEXITCODE
+    }
+    $script:_mcpInstallOut | ForEach-Object { Write-Log "mios-mcp-install: $_" }
+    if ($script:_mcpInstallRc -ne 0) { throw "Native MiOS-MCP install failed (exit $($script:_mcpInstallRc)): python3.13 /usr/libexec/mios/mios-mcp-server --install-native in $distribution" }
+    # Python sources are single-quoted for the guest: no double quote reaches a native argument on either PowerShell.
+    # No 2>$null: Windows PowerShell turns any stderr line (wsl.exe prints config notices there) into a terminating error.
+    $user = ((& wsl.exe -d $distribution -u root --exec python3 -c 'import pwd; print(pwd.getpwuid(1000).pw_name)') -join '').Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $user -or $user -eq 'root') { throw 'No unprivileged uid-1000 user in the MiOS builder to probe native MiOS-MCP as' }
+    $python = ((& wsl.exe -d $distribution -u $user --exec python3 -c 'import sys; sys.path.insert(0, ''/usr/lib/mios''); import mios_toml; print(mios_toml.load_merged()[''mcp''][''python''])') -join '').Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $python.StartsWith('/')) { throw 'Could not resolve [mcp].python from the MiOS SSOT' }
+    & {
+        $ErrorActionPreference = 'Continue'
+        if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) { $PSNativeCommandUseErrorActionPreference = $false }
+        $script:_mcpProbeOut = @(& wsl.exe -d $distribution -u $user --exec $python -c 'import os; from mcp import Client; assert os.getuid()!=0; assert os.access(''/usr/libexec/mios/tmux-mcp'',os.X_OK); print(''native-ready'')' 2>&1 | ForEach-Object { "$_" })
+        $script:_mcpProbeRc = $LASTEXITCODE
+    }
+    $script:_mcpProbeOut | ForEach-Object { Write-Log "mios-mcp-probe: $_" }
+    if ($script:_mcpProbeRc -ne 0 -or $script:_mcpProbeOut -notcontains 'native-ready') { throw "Native MiOS-MCP probe failed as $user (exit $($script:_mcpProbeRc)); see the mios-mcp-probe lines in the log" }
+    Log-Ok "Native MiOS-MCP installed and probed as $user in $distribution"
+}
+
 # True when the first mios.toml in $Candidates sets [bootstrap].dev_overlay_full = false. That skips the full dev
 # overlay, whose [packages.build-toolchain] is the only source of the Rust toolchain the native catalog builds with.
 function Test-MiosDevOverlayFullDisabled([string[]]$Candidates) {
@@ -5853,6 +5884,8 @@ if ($args.Count -gt 0) {
     if (-not (Test-Path -LiteralPath $_nativeSetup)) { throw "Native MiOS CMD setup missing: $_nativeSetup" }
     # Phase 3 built the catalog before the Quadlet realize stage; this process does not build it twice.
     if (-not $script:MiosNativeCatalogInstalled) { $null = Install-MiosNativeCatalog -Root $MiosRepoDir -Machine $DevDistro }
+    # The client setup probes the native MiOS-MCP payload; nothing else installs it outside the image build.
+    Install-MiosNativeMcp -Machine $DevDistro
     & $_nativeSetup -Distro $DevDistro -BinDirectory $MiosBinDir -SourceRoot $MiosRepoDir
     if (-not $?) { throw 'Native MiOS CMD/client setup failed' }
 

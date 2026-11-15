@@ -192,10 +192,40 @@ public static class MiosBootstrapWindow {
 }
 Center-MiosBootstrapWindow
 
+function Test-MiosElevated {
+    return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-MiosWindowsInstallRoot {
+    param([bool]$Elevated = (Test-MiosElevated),
+          [string]$LocalAppData = ([Environment]::GetFolderPath('LocalApplicationData')),
+          [string]$SystemDrive = $env:SystemDrive)
+    if ($Elevated) { return Join-Path $SystemDrive 'MiOS' }
+    if (-not $LocalAppData) { throw 'The operator Local AppData folder is unavailable.' }
+    return Join-Path $LocalAppData 'MiOS'
+}
+
+# The installed Windows layout, the one source for every native-bin default and both PowerShell profile redirectors.
+# build-mios.ps1 carries the same function; tests/test_install_native_layout.ps1 holds the two to one answer.
+# Unelevated: %LOCALAPPDATA%\MiOS, User scope. Elevated: %SystemDrive%\MiOS, Machine scope. MIOS_NATIVE_BIN overrides
+# only the native bin.
+function Get-MiosInstalledLayout {
+    param([bool]$Elevated = (Test-MiosElevated))
+    $root = Get-MiosWindowsInstallRoot -Elevated $Elevated
+    $bin = Join-Path $root 'bin'
+    return [pscustomobject]@{
+        Root        = $root
+        Bin         = $bin
+        NativeBin   = if ($env:MIOS_NATIVE_BIN) { $env:MIOS_NATIVE_BIN } else { $bin }
+        ProfileBody = Join-Path $root 'powershell\profile.ps1'
+        Scope       = if ($Elevated) { 'Machine' } else { 'User' }
+    }
+}
+
 function Start-MiosBuildMonitor {
     if ($env:MIOS_NO_MONITOR -in @('1','true','yes','on') -or
         $env:MIOS_HEADLESS -in @('1','true','yes','on')) { return }
-    $launcher = Join-Path $env:ProgramData 'MiOS\bin\mios-launch.exe'
+    $launcher = Join-Path (Get-MiosInstalledLayout).NativeBin 'mios-launch.exe'
     $monitorScript = @($env:MIOS_MONITOR_SCRIPT,
         (Join-Path $PSScriptRoot 'usr\libexec\mios\mios-mon.py'),
         'C:\MiOS\usr\libexec\mios\mios-mon.py') |
@@ -2303,15 +2333,6 @@ function Assert-MiosOriginContext {
     Assert-MiosNoReparsePath $Context.ConfigPath
 }
 
-function Get-MiosWindowsInstallRoot {
-    param([bool]$Elevated = (Test-MiosElevated),
-          [string]$LocalAppData = ([Environment]::GetFolderPath('LocalApplicationData')),
-          [string]$SystemDrive = $env:SystemDrive)
-    if ($Elevated) { return Join-Path $SystemDrive 'MiOS' }
-    if (-not $LocalAppData) { throw 'The operator Local AppData folder is unavailable.' }
-    return Join-Path $LocalAppData 'MiOS'
-}
-
 function Get-MiosWindowsBootstrapRoot {
     param([bool]$Elevated = (Test-MiosElevated),
           [string]$LocalAppData = ([Environment]::GetFolderPath('LocalApplicationData')),
@@ -3067,7 +3088,7 @@ function Install-MiOSTerminalProfile {
         Write-Host "  [!] No pwsh 7 found; falling back to Windows PS 5.1 in MiOS profile." -ForegroundColor Yellow
     }
     $_sysDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
-    $miosProfilePath = Join-Path (Get-MiosWindowsInstallRoot) 'powershell/profile.ps1'
+    $miosProfilePath = (Get-MiosInstalledLayout).ProfileBody
     $profileCmdline = Get-MiosTerminalProfileCommand -ShellPath $defaultPwsh -ProfilePath $miosProfilePath
 
     $_themeFontFace    = Get-MiosTomlValue -Section 'theme.font' -Key 'family'             -Default 'GeistMono Nerd Font Mono'
@@ -3354,13 +3375,9 @@ param(
 )
 $ErrorActionPreference = 'SilentlyContinue'
 
-$_programDataLauncher = "$env:ProgramData\MiOS\bin\mios-launch.exe"
-$_programDataBinding  = "$env:ProgramData\MiOS\bin\native-binding.json"
-if ((Test-Path -LiteralPath $_programDataBinding) -and (Test-Path -LiteralPath $_programDataLauncher)) {
-    $_nativeLauncher = $_programDataLauncher
-} else {
-    $_nativeLauncher = Join-Path $PSScriptRoot 'mios-launch.exe'
-}
+# This script lives in the installed layout's bin, next to the native launcher; MIOS_NATIVE_BIN overrides it.
+$_nativeBin = if ($env:MIOS_NATIVE_BIN) { $env:MIOS_NATIVE_BIN } else { $PSScriptRoot }
+$_nativeLauncher = Join-Path $_nativeBin 'mios-launch.exe'
 if (Test-Path -LiteralPath $_nativeLauncher) {
     & $_nativeLauncher $Profile
     exit $LASTEXITCODE
@@ -3510,8 +3527,9 @@ if ($hwnd -ne [IntPtr]::Zero) {
     if (-not $pwshExe) { $pwshExe = (Get-Command powershell.exe -ErrorAction SilentlyContinue).Source }
     if (-not $pwshExe) { Write-Host "  [!] No pwsh.exe found; cannot create launcher .lnk." -ForegroundColor Yellow; return }
 
-    $_runHiddenVbs = Join-Path $env:ProgramData 'MiOS\bin\run-hidden.vbs'
-    if (-not (Test-Path -LiteralPath $_runHiddenVbs)) { $_runHiddenVbs = Join-Path $env:ProgramData 'MiOS\run-hidden.vbs' }
+    $_layout = Get-MiosInstalledLayout
+    $_runHiddenVbs = Join-Path $_layout.NativeBin 'run-hidden.vbs'
+    if (-not (Test-Path -LiteralPath $_runHiddenVbs)) { $_runHiddenVbs = Join-Path $_layout.Root 'run-hidden.vbs' }
     if (-not (Test-Path -LiteralPath $_runHiddenVbs) -and $miosRoot) {
         $_vbsCandidate = Join-Path $miosRoot 'usr\share\mios\windows\run-hidden.vbs'
         if (Test-Path -LiteralPath $_vbsCandidate) { $_runHiddenVbs = $_vbsCandidate }
@@ -3572,15 +3590,8 @@ if ($hwnd -ne [IntPtr]::Zero) {
     # Prefer the compiled subsystem:Windows launcher (.exe -- zero pwsh
     # flash, proper window centering loop). Fall back to pwsh + .ps1
     # only for recovery of an older installation without the native launcher.
-    $_programDataLauncher = "$env:ProgramData\MiOS\bin\mios-launch.exe"
-    $_programDataBinding  = "$env:ProgramData\MiOS\bin\native-binding.json"
-    if ((Test-Path -LiteralPath $_programDataBinding) -and (Test-Path -LiteralPath $_programDataLauncher)) {
-        $_launcherExe = $_programDataLauncher
-        $_useExeLauncher = $true
-    } else {
-        $_launcherExe = Join-Path $miosRoot 'bin\mios-launch.exe'
-        $_useExeLauncher = Test-Path -LiteralPath $_launcherExe
-    }
+    $_launcherExe = Join-Path (Get-MiosInstalledLayout).NativeBin 'mios-launch.exe'
+    $_useExeLauncher = Test-Path -LiteralPath $_launcherExe
 
     $writeMiosLnk = {
         param([string]$LnkPath, [string]$LnkTarget, [string]$LnkArgs, [string]$LnkDesc)
@@ -4214,7 +4225,7 @@ function Install-MiOSTmuxProfile {
     param([switch]$Required)
     # Bootstrap may run before the native catalog is installed. Final installation
     # and runtime must use the native renderer; a deferred phase is never success.
-    $nativeRoots = @($env:MIOS_NATIVE_BIN, (Join-Path $env:ProgramData 'MiOS\bin'), (Join-Path $env:LOCALAPPDATA 'MiOS\bin'))
+    $nativeRoots = @((Get-MiosInstalledLayout).NativeBin)
     foreach ($nativeRoot in $nativeRoots) {
         if (-not $nativeRoot) { continue }
         $launcher = Join-Path $nativeRoot 'mios-launch.exe'
@@ -4232,9 +4243,13 @@ function Install-MiOSTmuxProfile {
 function Install-MiOSPowerShellProfile {
     $sysLetter = if ($env:SystemDrive) { $env:SystemDrive.TrimEnd(':') } else { 'C' }
     $sysDrive  = "${sysLetter}:"
-    $miosPsRoot = Join-Path (Get-MiosWindowsInstallRoot) 'powershell'
+    # The body path and its native-bin default both come from the installed layout; build-mios.ps1's redirector
+    # resolves the same body through the same function.
+    $_layout = Get-MiosInstalledLayout
+    $miosProfileScript = $_layout.ProfileBody
+    $miosPsRoot = Split-Path -Parent $miosProfileScript
     if (-not (Test-Path $miosPsRoot)) { New-Item -ItemType Directory -Path $miosPsRoot -Force | Out-Null }
-    $miosProfileScript = Join-Path $miosPsRoot 'profile.ps1'
+    $safeNativeBin = $_layout.Bin.Replace("'", "''")
     $safeInstallRoot = (Get-MiosWindowsInstallRoot).Replace("'", "''")
     $operatorRepoRoot = if (Test-MiosElevated) { Get-MiosWindowsInstallRoot } else { Join-Path (Get-MiosWindowsInstallRoot) 'repo' }
     $safeOperatorRepoRoot = $operatorRepoRoot.Replace("'", "''")
@@ -4432,8 +4447,13 @@ if (`$true) {
     # Both variants use the same native dashboard; no embedded roster or TOML scrape.
     function Show-MiosDashboard {
         param([string]`$ConfigPath, [string]`$LogoPath)
-        `$_native = if (`$env:MIOS_NATIVE_BIN) { `$env:MIOS_NATIVE_BIN } else { Join-Path `$env:ProgramData 'MiOS\bin' }
-        . (Join-Path `$_native 'mios-native-shell.ps1') -BinDirectory `$_native
+        `$_native = if (`$env:MIOS_NATIVE_BIN) { `$env:MIOS_NATIVE_BIN } else { '$safeNativeBin' }
+        `$_shell = Join-Path `$_native 'mios-native-shell.ps1'
+        if (-not (Test-Path -LiteralPath `$_shell)) {
+            Write-Host "  [!] MiOS native shell missing at `$_shell -- finish the MiOS install, then open a new terminal." -ForegroundColor Yellow
+            return
+        }
+        . `$_shell -BinDirectory `$_native
         Invoke-MiosNativeDashboard
     }
 
@@ -4904,20 +4924,28 @@ function btop {
 
 # Windows tmux dispatch is rendered and enforced by the native Rust SSOT launcher.
 function tmux {
-    & (Join-Path `$env:ProgramData 'MiOS\bin\mios-launch.exe') --tmux @args
+    `$_nativeBin = if (`$env:MIOS_NATIVE_BIN) { `$env:MIOS_NATIVE_BIN } else { '$safeNativeBin' }
+    & (Join-Path `$_nativeBin 'mios-launch.exe') --tmux @args
 }
 "@
+    # The native client setup replaces this block with its own hook once it has installed the native shell.
     $nativeStartup = @'
 # >>> MiOS native SSOT runtime >>>
-$_miosNativeBin = if ($env:MIOS_NATIVE_BIN) { $env:MIOS_NATIVE_BIN } else { Join-Path $env:ProgramData 'MiOS\bin' }
-. (Join-Path $_miosNativeBin 'mios-native-shell.ps1') -BinDirectory $_miosNativeBin
-if (-not $env:MIOS_SKIP_MOTD -and -not $env:MIOS_HOST_TMUX -and -not $env:TMUX -and -not $env:SSH_CONNECTION -and -not [Console]::IsInputRedirected) {
-    & (Join-Path $_miosNativeBin 'mios-launch.exe') --host-terminal
-    if ($LASTEXITCODE -ne 0) { throw "Native MiOS host terminal failed (exit $LASTEXITCODE)" }
-    return
+$_miosNativeBin = if ($env:MIOS_NATIVE_BIN) { $env:MIOS_NATIVE_BIN } else { '__MIOS_NATIVE_BIN__' }
+$_miosNativeShell = Join-Path $_miosNativeBin 'mios-native-shell.ps1'
+if (-not (Test-Path -LiteralPath $_miosNativeShell)) {
+    Write-Host "  [!] MiOS native shell missing at $_miosNativeShell -- finish the MiOS install, then open a new terminal." -ForegroundColor Yellow
+} else {
+    . $_miosNativeShell -BinDirectory $_miosNativeBin
+    if (-not $env:MIOS_SKIP_MOTD -and -not $env:MIOS_HOST_TMUX -and -not $env:TMUX -and -not $env:SSH_CONNECTION -and -not [Console]::IsInputRedirected) {
+        & (Join-Path $_miosNativeBin 'mios-launch.exe') --host-terminal
+        if ($LASTEXITCODE -ne 0) { throw "Native MiOS host terminal failed (exit $LASTEXITCODE)" }
+        return
+    }
 }
 # <<< MiOS native SSOT runtime <<<
 '@
+    $nativeStartup = $nativeStartup.Replace('__MIOS_NATIVE_BIN__', $safeNativeBin)
     $miosScriptBody = $nativeStartup + "`n" + $miosScriptBody
     $_utf8Bom = New-Object System.Text.UTF8Encoding($true)
     [System.IO.File]::WriteAllText($miosProfileScript, $miosScriptBody, $_utf8Bom)
@@ -5049,10 +5077,6 @@ function Get-MiosFeatureState([string[]]$Info) {
 function Get-MiosDismEnableOutcome([int]$ExitCode) {
     # dism /enable-feature /norestart: 0 = enabled; 3010 (ERROR_SUCCESS_REBOOT_REQUIRED) = enabled, active after a restart
     switch ($ExitCode) { 0 { return 'enabled' } 3010 { return 'restart' } default { return 'unavailable' } }
-}
-
-function Test-MiosElevated {
-    return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 function Enable-MiOSWindowsFeatures {
@@ -6586,10 +6610,13 @@ if ($_bootstrapExit -eq 0) {
     }
     # Reconcile after the legacy app registrar so its per-action links cannot
     # reappear at the end of a fresh install. Uninstall remains in Windows Settings.
-    $_nativeProjection = Join-Path (Get-MiosWindowsInstallRoot) 'bin\mios-native-client-setup.ps1'
-    if (-not (Test-Path -LiteralPath $_nativeProjection)) { $_nativeProjection = Join-Path $env:ProgramData 'MiOS\bin\mios-native-client-setup.ps1' }
+    $_layout = Get-MiosInstalledLayout
+    $_nativeProjection = Join-Path $_layout.NativeBin 'mios-native-client-setup.ps1'
     if (Test-Path -LiteralPath $_nativeProjection) {
-        & $_nativeProjection -RuntimeOnly -BinDirectory (Split-Path -Parent $_nativeProjection)
+        # A per-user layout projects in User scope: no Machine variable, all-users key or shortcut, and no elevation.
+        $_projectionArgs = @{ RuntimeOnly = $true; BinDirectory = (Split-Path -Parent $_nativeProjection) }
+        if ($_layout.Scope -eq 'User') { $_projectionArgs['Scope'] = 'User'; $_projectionArgs['ProfilePath'] = $_layout.ProfileBody }
+        & $_nativeProjection @_projectionArgs
     }
 }
 

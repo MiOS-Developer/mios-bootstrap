@@ -51,9 +51,9 @@ function Invoke-Checks([string]$Build) {
     $lines = @(($launcher -split "`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $iCatalog = [array]::IndexOf($lines, 'if (-not $script:MiosNativeCatalogInstalled) { $null = Install-MiosNativeCatalog -Root $MiosRepoDir -Machine $DevDistro }')
     $iMcp = [array]::IndexOf($lines, 'Install-MiosNativeMcp -Machine $DevDistro')
-    $iSetup = [array]::IndexOf($lines, '& $_nativeSetup -Distro $DevDistro -BinDirectory $MiosBinDir -SourceRoot $MiosRepoDir')
+    $iSetup = [array]::IndexOf($lines, '& $_nativeSetup @_setupArgs')
     $calls = @([regex]::Matches((Get-Code $text), '(?m)^\s*Install-MiosNativeMcp\b')).Count
-    Check ($iCatalog -ge 0 -and $iMcp -eq $iCatalog + 1 -and $iSetup -eq $iMcp + 1 -and $calls -eq 1) 'the native MiOS-MCP step runs unconditionally, right after the catalog and right before the client setup'
+    Check ($iCatalog -ge 0 -and $iMcp -gt $iCatalog -and $iSetup -eq $iMcp + 1 -and $calls -eq 1) 'the native MiOS-MCP step runs unconditionally, after the catalog and right before the client setup'
 
     # --- Behaviour: Install-MiosNativeMcp against a wsl.exe mock ------------------------------------------------------
     $fn = & $fnText 'Install-MiosNativeMcp'
@@ -94,17 +94,17 @@ try {
     $baseline = Invoke-Checks $BuildPath
     if ($baseline) { Write-Host 'NATIVE_MCP_BASELINE_FAILED'; exit 1 }
     $call = "    Install-MiosNativeMcp -Machine `$DevDistro`n"
-    $setup = "    & `$_nativeSetup -Distro `$DevDistro -BinDirectory `$MiosBinDir -SourceRoot `$MiosRepoDir`n"
+    $setup = "    & `$_nativeSetup @_setupArgs`n"
     $plants = @(
-        @{ Name = 'the step removed'; Expected = 'the native MiOS-MCP step runs unconditionally, right after the catalog and right before the client setup'
+        @{ Name = 'the step removed'; Expected = 'the native MiOS-MCP step runs unconditionally, after the catalog and right before the client setup'
            Edits = @(, @($call, '')) },
         @{ Name = 'the installer failure downgraded to a warning'; Expected = 'an installer failure, a failed probe and a root uid 1000 are each fatal with their own message'
            Edits = @(, @('{ throw "Native MiOS-MCP install failed', '{ Log-Warn "Native MiOS-MCP install failed')) },
-        @{ Name = 'the step placed after the client setup'; Expected = 'the native MiOS-MCP step runs unconditionally, right after the catalog and right before the client setup'
+        @{ Name = 'the step placed after the client setup'; Expected = 'the native MiOS-MCP step runs unconditionally, after the catalog and right before the client setup'
            Edits = @(, @(($call + $setup), ($setup + $call))) },
         @{ Name = 'the probe run as root'; Expected = 'MiOS''s installer runs as root (python3.13 mios-mcp-server --install-native --source-root / --root /), then the client setup''s probe runs as the uid-1000 user'
            Edits = @(, @("& wsl.exe -d `$distribution -u `$user --exec `$python -c", "& wsl.exe -d `$distribution -u root --exec `$python -c")) },
-        @{ Name = 'a skip when the payload is present'; Expected = 'the native MiOS-MCP step runs unconditionally, right after the catalog and right before the client setup'
+        @{ Name = 'a skip when the payload is present'; Expected = 'the native MiOS-MCP step runs unconditionally, after the catalog and right before the client setup'
            Edits = @(, @($call, "    if (-not (Test-Path -LiteralPath `$MiosBinDir)) { Install-MiosNativeMcp -Machine `$DevDistro }`n")) }
     )
     $caught = 0

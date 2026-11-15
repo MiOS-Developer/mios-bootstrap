@@ -86,6 +86,43 @@ function Install-MiosNativeMcp([string]$Machine) {
     Log-Ok "Native MiOS-MCP installed and probed as $user in $distribution"
 }
 
+# The installed Windows layout, the one source for every native-bin default and both PowerShell profile redirectors.
+# Get-MiOS.ps1 carries the same function over Get-MiosWindowsInstallRoot; tests/test_install_native_layout.ps1 holds the
+# two to one answer. Unelevated: %LOCALAPPDATA%\MiOS, User scope. Elevated: %SystemDrive%\MiOS, Machine scope. The
+# installer's own paths win once set; MIOS_NATIVE_BIN overrides only the native bin.
+function Get-MiosInstalledLayout {
+    $elevated = if ($null -ne $script:IsAdmin) { [bool]$script:IsAdmin } else {
+        try { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { $false }
+    }
+    $root = if ($script:MiosInstallDir) { $script:MiosInstallDir }
+            elseif ($elevated) { Join-Path $env:SystemDrive 'MiOS' }
+            else { Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MiOS' }
+    $bin = if ($script:MiosBinDir) { $script:MiosBinDir } else { Join-Path $root 'bin' }
+    return [pscustomobject]@{
+        Root        = $root
+        Bin         = $bin
+        NativeBin   = if ($env:MIOS_NATIVE_BIN) { $env:MIOS_NATIVE_BIN } else { $bin }
+        ProfileBody = Join-Path $root 'powershell\profile.ps1'
+        Scope       = if ($elevated) { 'Machine' } else { 'User' }
+    }
+}
+
+# Arguments for MiOS's client setup in the installed layout. A User layout (the unelevated install) passes -Scope User
+# with its own bin and profile body, so the setup writes only User variables and never requests elevation.
+function Get-MiosClientSetupArguments([string]$Setup, [string]$Distro, [string]$SourceRoot) {
+    $layout = Get-MiosInstalledLayout
+    $arguments = @{ Distro = $Distro; BinDirectory = $layout.Bin; SourceRoot = $SourceRoot }
+    if ($layout.Scope -eq 'User') {
+        $parameters = (Get-Command -Name $Setup -ErrorAction Stop).Parameters
+        if (-not $parameters.ContainsKey('Scope') -or -not $parameters.ContainsKey('ProfilePath')) {
+            throw "The MiOS client setup at $Setup has no -Scope User; update the MiOS checkout before a per-user install"
+        }
+        $arguments['Scope'] = 'User'
+        $arguments['ProfilePath'] = $layout.ProfileBody
+    }
+    return $arguments
+}
+
 # True when the first mios.toml in $Candidates sets [bootstrap].dev_overlay_full = false. That skips the full dev
 # overlay, whose [packages.build-toolchain] is the only source of the Rust toolchain the native catalog builds with.
 function Test-MiosDevOverlayFullDisabled([string[]]$Candidates) {
@@ -170,7 +207,7 @@ if ($BuildOnly) {
         if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot $required) -PathType Leaf)) { throw "Current-source build input missing: $required" }
     }
     if (-not $BuildDistro) {
-        $binding = Get-Content -Raw -LiteralPath (Join-Path $env:ProgramData 'MiOS\bin\native-binding.json') -ErrorAction Stop | ConvertFrom-Json
+        $binding = Get-Content -Raw -LiteralPath (Join-Path (Get-MiosInstalledLayout).NativeBin 'native-binding.json') -ErrorAction Stop | ConvertFrom-Json
         $BuildDistro = $binding.distro
     }
     if (-not $BuildDistro) { throw 'A provisioned MiOS builder distribution is required' }
@@ -757,7 +794,7 @@ function Write-Log {
 function Start-MiosBuildMonitor {
     if ($env:MIOS_NO_MONITOR -in @('1','true','yes','on') -or
         $env:MIOS_HEADLESS -in @('1','true','yes','on')) { return }
-    $launcher = Join-Path $env:ProgramData 'MiOS\bin\mios-launch.exe'
+    $launcher = Join-Path (Get-MiosInstalledLayout).NativeBin 'mios-launch.exe'
     $monitorScript = @($env:MIOS_MONITOR_SCRIPT,
         (Join-Path $PSScriptRoot 'usr\libexec\mios\mios-mon.py'),
         'C:\MiOS\usr\libexec\mios\mios-mon.py') |
@@ -4956,7 +4993,7 @@ function Install-MiOSTmuxProfile {
     param([switch]$Required)
     # Bootstrap may run before the native catalog is installed. Final installation
     # and runtime must use the native renderer; a deferred phase is never success.
-    $nativeRoots = @($env:MIOS_NATIVE_BIN, (Join-Path $env:ProgramData 'MiOS\bin'), (Join-Path $env:LOCALAPPDATA 'MiOS\bin'))
+    $nativeRoots = @((Get-MiosInstalledLayout).NativeBin)
     foreach ($nativeRoot in $nativeRoots) {
         if (-not $nativeRoot) { continue }
         $launcher = Join-Path $nativeRoot 'mios-launch.exe'
@@ -5206,13 +5243,13 @@ function Install-WindowsBranding {
         $existing = if (Test-Path $profilePath) { Get-Content $profilePath -Raw } else { '' }
         $marker   = '# >>> MiOS oh-my-posh init >>>'
         $endMark  = '# <<< MiOS oh-my-posh init <<<'
-        $miosProfilePath = if (Test-Path 'M:\') { 'M:\MiOS\powershell\profile.ps1' }
-                            else { Join-Path $env:USERPROFILE 'MiOS-bootstrap\powershell\profile.ps1' }
+        # The same body Get-MiOS.ps1's redirector loads: the installed layout's profile.
+        $miosProfilePath = (Get-MiosInstalledLayout).ProfileBody.Replace("'", "''")
         $block = @"
 $marker
 # Auto-generated redirector. The MiOS profile body (PSReadLine reload +
-# oh-my-posh init + fastfetch MOTD + dashboard) lives at M:\ as the
-# SSOT; this block is replaced on every re-run between the markers.
+# oh-my-posh init + fastfetch MOTD + dashboard) lives in the installed
+# layout; this block is replaced on every re-run between the markers.
 `$_miosProfile = '$miosProfilePath'
 if (Test-Path `$_miosProfile) { . `$_miosProfile }
 $endMark
@@ -5448,7 +5485,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 
 $Global:MiosProfileMotdRendered = $true
 
-$_miosProfile = 'M:\MiOS\powershell\profile.ps1'
+$_miosProfile = Join-Path (Split-Path -Parent $PSScriptRoot) 'powershell\profile.ps1'
 if (Test-Path -LiteralPath $_miosProfile) {
     . $_miosProfile
     if (Get-Command Show-MiosDashboard -ErrorAction SilentlyContinue) {
@@ -5456,7 +5493,7 @@ if (Test-Path -LiteralPath $_miosProfile) {
         return
     }
 }
-Write-Host "  [!] M:\MiOS\powershell\profile.ps1 missing or Show-MiosDashboard not defined." -ForegroundColor Yellow
+Write-Host "  [!] $_miosProfile missing or Show-MiosDashboard not defined." -ForegroundColor Yellow
 Write-Host "      Re-run irm | iex Get-MiOS.ps1 to refresh the profile." -ForegroundColor DarkGray
 return
 '@
@@ -5497,13 +5534,17 @@ if (`$args.Count -eq 0) {
     $miosBuildRefLiteral = "'" + ([string]$MiosRef).Replace("'", "''") + "'"
     $miosBootstrapRefLiteral = "'" + ([string]$MiosBootstrapRef).Replace("'", "''") + "'"
 
+    # The installed layout's MiOS checkout, baked into the verb scripts instead of a guessed drive root (C:\, C:\MiOS, M:\).
+    $miosRepoLiteral = "'" + $MiosRepoDir.Replace("'", "''") + "'"
+    $_repoTrim = $MiosRepoDir.TrimEnd('\')
+    $miosRepoWsl = '/mnt/' + $_repoTrim.Substring(0, 1).ToLower() + ($_repoTrim.Substring(2) -replace '\\', '/')
     $pullPath = Join-Path $MiosBinDir 'mios-pull.ps1'
     $pullScript = @"
 $devResolveBlock
 $windowsRefreshBlock
 `$ErrorActionPreference = 'Continue'
 `$sysLetter = if (`$env:SystemDrive) { `$env:SystemDrive } else { 'C:' }
-`$miosRoot = if (Test-Path "`$sysLetter\.git") { "`$sysLetter\" } elseif (Test-Path "`$sysLetter\MiOS\.git") { "`$sysLetter\MiOS" } elseif (Test-Path 'M:\.git') { 'M:\' } else { "`$sysLetter\" }
+`$miosRoot = $miosRepoLiteral
 if ((Test-Path (Join-Path `$miosRoot '.git')) -and (Get-Command git -ErrorAction SilentlyContinue)) {
     Update-MiosWindowsBuildCheckout -Path `$miosRoot -Ref $miosBuildRefLiteral
 } else {
@@ -5751,7 +5792,7 @@ try {
 `$ErrorActionPreference = 'Continue'
 
 `$sysLetter = if (`$env:SystemDrive) { `$env:SystemDrive } else { 'C:' }
-`$miosRoot = if (Test-Path "`$sysLetter\.git") { "`$sysLetter\" } elseif (Test-Path "`$sysLetter\MiOS\.git") { "`$sysLetter\MiOS" } elseif (Test-Path 'M:\.git') { 'M:\' } else { "`$sysLetter\" }
+`$miosRoot = $miosRepoLiteral
 if ((Test-Path (Join-Path `$miosRoot '.git')) -and (Get-Command git -ErrorAction SilentlyContinue)) {
     Update-MiosWindowsBuildCheckout -Path `$miosRoot -Ref $miosBuildRefLiteral
 } else {
@@ -5803,14 +5844,14 @@ try {
 # build driver's first `podman ...` invocation.
 Start-Sleep -Milliseconds 800
 
-`$driverSrc = '/mnt/c/usr/libexec/mios/mios-build-driver'
-if (Test-Path 'C:\MiOS\usr\libexec\mios\mios-build-driver') {
-    `$driverSrc = '/mnt/c/MiOS/usr/libexec/mios/mios-build-driver'
-} elseif (-not (Test-Path 'C:\usr\libexec\mios\mios-build-driver') -and (Test-Path 'M:\usr\libexec\mios\mios-build-driver')) {
-    `$driverSrc = '/mnt/m/usr/libexec/mios/mios-build-driver'
-}
+# The driver comes from the installed MiOS checkout only, so the build runs the checked-out source, never a download.
+`$driverSrc = '$miosRepoWsl/usr/libexec/mios/mios-build-driver'
 Write-Host ('  [build] staging mios-build-driver into {0}:/usr/libexec/mios/' -f `$distro) -ForegroundColor DarkGray
-& wsl.exe -d `$distro --user root -- bash -c "mkdir -p /usr/libexec/mios && if [ -r '`$driverSrc' ]; then cp '`$driverSrc' /usr/libexec/mios/mios-build-driver && chmod +x /usr/libexec/mios/mios-build-driver && echo '[stage] driver staged from `$driverSrc'; else echo '[stage] WARN: `$driverSrc not readable from inside `$distro -- falling back to curl'; curl -fsSL -o /usr/libexec/mios/mios-build-driver '$MiosRawBase/usr/libexec/mios/mios-build-driver' && chmod +x /usr/libexec/mios/mios-build-driver; fi"
+& wsl.exe -d `$distro --user root -- bash -c "mkdir -p /usr/libexec/mios && if [ -r '`$driverSrc' ]; then cp '`$driverSrc' /usr/libexec/mios/mios-build-driver && chmod +x /usr/libexec/mios/mios-build-driver && echo '[stage] driver staged from `$driverSrc'; else echo '[stage] ERROR: `$driverSrc is not readable inside `$distro'; exit 1; fi"
+if (`$LASTEXITCODE -ne 0) {
+    Write-Host '  [build] mios-build-driver could not be staged from the installed MiOS checkout; build stopped.' -ForegroundColor Red
+    exit 1
+}
 
 Write-Host ''
 Write-Host ('  [build] handing off to {0}:/usr/libexec/mios/mios-build-driver' -f `$distro) -ForegroundColor Cyan
@@ -5828,12 +5869,7 @@ Write-Host '  [build] OCI image build completed OK.' -ForegroundColor Green
 # never wired in, so the AI-plane "is it operational?" check never executed. The
 # smoke is best-effort here (non-fatal): a still-warming AI plane warns rather
 # than failing the build verb; `mios smoke` re-runs it on demand.
-`$_smoke = '/mnt/c/tests/post-bootstrap-smoke.sh'
-if (Test-Path 'C:\MiOS\tests\post-bootstrap-smoke.sh') {
-    `$_smoke = '/mnt/c/MiOS/tests/post-bootstrap-smoke.sh'
-} elseif (-not (Test-Path 'C:\tests\post-bootstrap-smoke.sh') -and (Test-Path 'M:\tests\post-bootstrap-smoke.sh')) {
-    `$_smoke = '/mnt/m/tests/post-bootstrap-smoke.sh'
-}
+`$_smoke = '$miosRepoWsl/tests/post-bootstrap-smoke.sh'
 if ((& wsl.exe -d `$distro --user root -- bash -lc "test -f `$_smoke && echo y" 2>`$null) -eq 'y') {
     Write-Host '  [build] running post-bootstrap acceptance smoke (AI-plane + parity)...' -ForegroundColor Cyan
     & wsl.exe -d `$distro --user root -- bash `$_smoke
@@ -5851,28 +5887,40 @@ $ErrorActionPreference = 'SilentlyContinue'
 $Script:MiOSBin  = $PSScriptRoot
 $Script:MiOSRoot = Split-Path -Parent $Script:MiOSBin
 
-# Canonical profile body (Show-MiosDashboard + mios <verb> dispatcher).
+# The native entry hands verbs it does not own back to this hub, so a hub reached from its own dispatch is a loop.
+if ($env:MIOS_HUB_ACTIVE) {
+    Write-Host "  [!] mios verb '$($args -join ' ')' has no handler (the native entry returned it to the hub)." -ForegroundColor Yellow
+    exit 64
+}
+
+# Canonical profile body (Show-MiosDashboard + mios <verb> dispatcher), loaded for its functions only: dispatching a
+# verb must not open the host terminal the body starts for an interactive session.
 $_miosProfile = Join-Path $Script:MiOSRoot 'powershell\profile.ps1'
 if (Test-Path -LiteralPath $_miosProfile) {
+    $_skipMotd = $env:MIOS_SKIP_MOTD
+    $env:MIOS_SKIP_MOTD = '1'
     try { . $_miosProfile } catch {
         Write-Host "  [!] Failed to load $_miosProfile : $($_.Exception.Message)" -ForegroundColor Yellow
-    }
+    } finally { $env:MIOS_SKIP_MOTD = $_skipMotd }
 }
 
 if ($args.Count -gt 0) {
     $verb = $args[0]
     $rest = if ($args.Count -gt 1) { $args[1..($args.Count - 1)] } else { @() }
-    if (Get-Command mios -ErrorAction SilentlyContinue) {
-        & mios $verb @rest
+    # Only a function is a dispatcher here: a command named mios may be this very script on PATH.
+    $dispatcher = Get-Command mios -CommandType Function -ErrorAction SilentlyContinue
+    $vScript = Join-Path $Script:MiOSBin "mios-$verb.ps1"
+    $nativeEntry = Join-Path $Script:MiOSBin 'mios-native-entry.ps1'
+    if (-not $dispatcher -and (Test-Path -LiteralPath $vScript)) {
+        & $vScript @rest
+    } elseif ($dispatcher -or (Test-Path -LiteralPath $nativeEntry)) {
+        # Both of these may hand an unowned verb back to this hub; the guard turns that into one refusal.
+        $env:MIOS_HUB_ACTIVE = '1'
+        try {
+            if ($dispatcher) { & $dispatcher $verb @rest } else { & $nativeEntry $verb @rest }
+        } finally { Remove-Item Env:MIOS_HUB_ACTIVE -ErrorAction SilentlyContinue }
     } else {
-        # Fallback when the profile didn't load: invoke the per-verb
-        # bin script directly.
-        $vScript = Join-Path $Script:MiOSBin "mios-$verb.ps1"
-        if (Test-Path -LiteralPath $vScript) {
-            & $vScript @rest
-        } else {
-            Write-Host "  [!] mios verb '$verb' not found ($vScript)." -ForegroundColor Yellow
-        }
+        Write-Host "  [!] mios verb '$verb' not found ($vScript)." -ForegroundColor Yellow
     }
 }
 '@
@@ -5884,9 +5932,10 @@ if ($args.Count -gt 0) {
     if (-not (Test-Path -LiteralPath $_nativeSetup)) { throw "Native MiOS CMD setup missing: $_nativeSetup" }
     # Phase 3 built the catalog before the Quadlet realize stage; this process does not build it twice.
     if (-not $script:MiosNativeCatalogInstalled) { $null = Install-MiosNativeCatalog -Root $MiosRepoDir -Machine $DevDistro }
+    $_setupArgs = Get-MiosClientSetupArguments -Setup $_nativeSetup -Distro $DevDistro -SourceRoot $MiosRepoDir
     # The client setup probes the native MiOS-MCP payload; nothing else installs it outside the image build.
     Install-MiosNativeMcp -Machine $DevDistro
-    & $_nativeSetup -Distro $DevDistro -BinDirectory $MiosBinDir -SourceRoot $MiosRepoDir
+    & $_nativeSetup @_setupArgs
     if (-not $?) { throw 'Native MiOS CMD/client setup failed' }
 
     # mios-code.ps1 -- `mios code` verb. Opens code-server in the
@@ -5920,7 +5969,7 @@ Start-Process $url | Out-Null
 # AI-hint: Legacy Windows mios-ai command enters the native AI workspace in the invoking terminal.
 # AI-related: usr/share/mios/windows/mios-native-client-setup.ps1, build-mios.ps1
 param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Arguments)
-$nativeBin = if ($env:MIOS_NATIVE_BIN) { $env:MIOS_NATIVE_BIN } else { Join-Path $env:ProgramData 'MiOS\bin' }
+$nativeBin = if ($env:MIOS_NATIVE_BIN) { $env:MIOS_NATIVE_BIN } else { $PSScriptRoot }
 $entry = Join-Path $nativeBin 'mios-native-entry.ps1'
 if (-not (Test-Path -LiteralPath $entry)) { throw 'MiOS native terminal entrypoint is missing; run the MiOS native client setup.' }
 & $entry ai @Arguments
@@ -6232,7 +6281,8 @@ function btop {
 
 # Windows tmux dispatch is rendered and enforced by the native Rust SSOT launcher.
 function tmux {
-    & (Join-Path `$env:ProgramData 'MiOS\bin\mios-launch.exe') --tmux @args
+    `$_nativeBin = if (`$env:MIOS_NATIVE_BIN) { `$env:MIOS_NATIVE_BIN } else { `$Global:MiosBin }
+    & (Join-Path `$_nativeBin 'mios-launch.exe') --tmux @args
 }
 $endMark
 "@

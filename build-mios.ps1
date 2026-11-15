@@ -3354,17 +3354,24 @@ fi
 
 _mios_pw='__MIOS_LOGIN_PASSWORD__'
 _mios_pw_hash='__MIOS_LOGIN_PASSWORD_HASH__'
-for account in "$DEV_USER" mios; do
-    if [[ -n "$_mios_pw_hash" ]]; then
-        printf '%s:%s\n' "$account" "$_mios_pw_hash" | sudo chpasswd -e 2>&1 \
-            && echo "[quadlet-overlay] $account password hash applied" \
-            || echo "[quadlet-overlay] WARN: chpasswd -e for $account failed"
-    else
-        printf '%s:%s\n' "$account" "$_mios_pw" | sudo chpasswd 2>&1 \
-            && echo "[quadlet-overlay] $account password set" \
-            || echo "[quadlet-overlay] WARN: chpasswd for $account failed"
-    fi
-done
+# The operator's credential goes to the MiOS login only. The mios service account logs in with no password
+# (its terminals carry their own credential), so its password stays locked, on every run and on existing guests.
+if [[ -z "$DEV_USER" ]]; then
+    echo "[quadlet-overlay] WARN: no usable MiOS login for [identity].username; the operator's credential was not applied"
+elif [[ -n "$_mios_pw_hash" ]]; then
+    printf '%s:%s\n' "$DEV_USER" "$_mios_pw_hash" | sudo chpasswd -e 2>&1 \
+        && echo "[quadlet-overlay] $DEV_USER password hash applied" \
+        || echo "[quadlet-overlay] WARN: chpasswd -e for $DEV_USER failed"
+else
+    printf '%s:%s\n' "$DEV_USER" "$_mios_pw" | sudo chpasswd 2>&1 \
+        && echo "[quadlet-overlay] $DEV_USER password set" \
+        || echo "[quadlet-overlay] WARN: chpasswd for $DEV_USER failed"
+fi
+if id mios >/dev/null 2>&1; then
+    sudo usermod -L mios 2>&1 \
+        && echo "[quadlet-overlay] mios password locked" \
+        || echo "[quadlet-overlay] WARN: usermod -L mios failed"
+fi
 
 if [[ -n "$_mios_pw" ]] && command -v python3 >/dev/null 2>&1; then
     if python3 - "${_mios_pw}" <<'PYVERIFY' 2>&1; then
@@ -7658,7 +7665,8 @@ if ! id mios >/dev/null 2>&1; then
     _useradd_rc=$?
     set -e
     if id mios >/dev/null 2>&1; then
-        echo 'mios:mios' | chpasswd 2>/dev/null || true
+        # No password: the account is locked. The operator's credential goes to the MiOS login (the realize stage).
+        usermod -L mios 2>/dev/null || true
         # Passwordless sudo for mios so build-mios.ps1's later steps
         # (smoke test, container-host setup) don't prompt.
         if [ -d /etc/sudoers.d ]; then

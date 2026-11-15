@@ -80,6 +80,17 @@ function Invoke-Checks([string]$Build, [string]$Get, [string]$Field) {
     if ($literalLogins.Count) { $literalLogins | ForEach-Object { Write-Host "    literal login: $_" } }
     Check ($literalLogins.Count -eq 0) 'no installer, generated verb, shortcut, profile or handoff logs in as, hands off to or defaults to a literal account name'
 
+    # The one credential is the operator's: chpasswd never takes a literal user:password pair.
+    $literalPasswords = 0
+    foreach ($text in @($build, $getText, $field)) {
+        $literalPasswords += ([regex]::Matches($text, "(echo|printf)\s+(['`"])[^'`"$]*:[^'`"$]*\2\s*\|\s*(sudo\s+)?chpasswd")).Count
+    }
+    Check ($literalPasswords -eq 0) 'no installer path sets a literal password: chpasswd only ever takes the operator''s credential'
+    $locked = (Get-Count $build 'sudo usermod -L mios 2>&1') -eq 1 -and (Get-Count $build 'usermod -L mios 2>/dev/null || true') -eq 1 -and
+              (Get-Count $build '"$DEV_USER" "$_mios_pw_hash" | sudo chpasswd -e') -eq 1 -and (Get-Count $build '"$DEV_USER" "$_mios_pw" | sudo chpasswd') -eq 1 -and
+              -not $build.Contains('for account in "$DEV_USER" mios')
+    Check $locked 'the operator''s credential goes to the MiOS login only, and the mios account''s password is locked at creation and on every realize'
+
     # The launcher resolves the login once, then bakes it into every script and shortcut it writes.
     $launcher = (Get-FunctionText $build 'Install-MiosLauncher') -replace "`r`n", "`n"
     $baked = (Get-Count $launcher '$miosLogin = Get-MiosLinuxLogin (Resolve-MiosBuilderDistribution $DevDistro)') -eq 1 -and
@@ -193,6 +204,14 @@ try {
            Edits = @(, @("'ConvertTo-MiosNativeArgument', 'Get-MiosLinuxLogin', 'Sync-MiosUserTomlToBuilder'", "'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder'")) },
         @{ Name = 'the profile''s resolver falls back to a name'; Target = 'get'; Expected = 'executed against a wsl.exe mock, both resolvers return a usable login (the profile''s once per distro) and refuse a failed guard, root or a non-plain name with the fix'
            Edits = @(, @("    if (`$LASTEXITCODE -ne 0 -or -not `$login -or `$login -eq 'root') { throw", "    if (`$LASTEXITCODE -ne 0 -or -not `$login -or `$login -eq 'root') { `$login = 'user' } elseif (`$false) { throw")) },
+        @{ Name = 'the seed sets mios:mios again'; Target = 'build'; Expected = 'no installer path sets a literal password: chpasswd only ever takes the operator''s credential'
+           Edits = @(, @("        usermod -L mios 2>/dev/null || true", "        echo 'mios:mios' | chpasswd 2>/dev/null || true")) },
+        @{ Name = 'the realize stops locking mios'; Target = 'build'; Expected = 'the operator''s credential goes to the MiOS login only, and the mios account''s password is locked at creation and on every realize'
+           Edits = @(, @('sudo usermod -L mios 2>&1', 'sudo true 2>&1')) },
+        @{ Name = 'the operator''s credential goes to mios again'; Target = 'build'; Expected = 'the operator''s credential goes to the MiOS login only, and the mios account''s password is locked at creation and on every realize'
+           Edits = @(, @('"$DEV_USER" "$_mios_pw_hash" | sudo chpasswd -e', '"mios" "$_mios_pw_hash" | sudo chpasswd -e')) },
+        @{ Name = 'the realize sets a literal password with printf'; Target = 'build'; Expected = 'no installer path sets a literal password: chpasswd only ever takes the operator''s credential'
+           Edits = @(, @("_mios_pw='__MIOS_LOGIN_PASSWORD__'", "printf 'user:changeme\n' | sudo chpasswd`n_mios_pw='__MIOS_LOGIN_PASSWORD__'")) },
         @{ Name = 'the field profile body no longer carries the resolver'; Target = 'field'; Expected = 'the field backend''s profile verbs embed and use Get-MiOS.ps1''s Get-MiosLinuxLogin'
            Edits = @(, @("`n`$loginHelperBlock`n`nfunction mios-dev {", "`n`nfunction mios-dev {")) }
     )

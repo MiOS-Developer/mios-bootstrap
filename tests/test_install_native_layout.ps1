@@ -55,6 +55,38 @@ function Invoke-Child([string]$Engine, [string[]]$Arguments, [hashtable]$Env = @
 }
 function Read-Log([string]$Path) { if (Test-Path -LiteralPath $Path) { return (@(Get-Content -LiteralPath $Path) -join '|') } else { return '' } }
 
+# Only extracted staging code runs. Files and processes are in-memory fixtures;
+# a legacy direct invocation targets a nonexistent file beneath the scratch root.
+function Invoke-MiosTerminalProjectionProbe {
+    param([string]$Body, [string]$FixtureBin, [int]$NativeCode, [int]$StaleCode,
+          [bool]$FunctionMode = $true, [bool]$Present = $true)
+    $calls = New-Object System.Collections.Generic.List[object]
+    function Get-MiosInstalledLayout { [pscustomobject]@{ NativeBin = $FixtureBin } }
+    function Test-Path {
+        param([string]$LiteralPath, [string]$PathType)
+        return $Present -and ($LiteralPath -in @((Join-Path $FixtureBin 'mios-launch.exe'), (Join-Path $FixtureBin 'native-binding.json')))
+    }
+    function Start-Process {
+        param([string]$FilePath, [string[]]$ArgumentList, [switch]$NoNewWindow, [switch]$Wait, [switch]$PassThru)
+        $calls.Add([pscustomobject]@{ FilePath=$FilePath; Arguments=@($ArgumentList); Wait=[bool]$Wait; PassThru=[bool]$PassThru; NoNewWindow=[bool]$NoNewWindow })
+        if ($PassThru) { [pscustomobject]@{ ExitCode = $NativeCode } }
+    }
+    $savedBin = $env:MIOS_NATIVE_BIN
+    $savedExit = Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+    $hadExit = $null -ne $savedExit; $savedExitValue = if ($hadExit) { $savedExit.Value } else { $null }
+    $env:MIOS_NATIVE_BIN = $FixtureBin; $global:LASTEXITCODE = $StaleCode
+    $BinDirectory = $FixtureBin; $accepted = $false; $message = $null; $value = $null
+    try {
+        if ($FunctionMode) { . ([scriptblock]::Create($Body)); $value = Install-MiOSTmuxProfile -Required }
+        else { $value = . ([scriptblock]::Create($Body)) }
+        $accepted = $true
+    } catch { $message = $_.Exception.Message }
+    finally {
+        $env:MIOS_NATIVE_BIN = $savedBin
+        if ($hadExit) { $global:LASTEXITCODE = $savedExitValue } else { Remove-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue }
+    }
+    [pscustomobject]@{ Accepted=$accepted; Message=$message; Calls=@($calls.ToArray()); Value=$value }
+}
 function Invoke-Checks([string]$Get, [string]$Build) {
     $script:fail = 0; $script:checks = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
     $getText = ([IO.File]::ReadAllText($Get)) -replace "`r`n", "`n"; $buildText = ([IO.File]::ReadAllText($Build)) -replace "`r`n", "`n"
@@ -195,7 +227,23 @@ try { $a = Get-MiosClientSetupArguments -Setup $Setup -Distro 'MiOS-DEV' -Source
     }
     Check $verbOk 'the mios pull and mios build verbs use the installed MiOS checkout: its root, its driver (never a download) and its smoke script'
 
-    Write-Host "NATIVE_LAYOUT_ASSERTIONS $($script:checks)"
+    # A GUI native launcher must be waited, and its status must not come from an earlier native command.
+    foreach ($site in @(@('Get-MiOS.ps1', $getAst), @('build-mios.ps1', $buildAst))) {
+        $body = Get-FunctionText $site[1] 'Install-MiOSTmuxProfile'
+        $ok = $false
+        if ($body) {
+            $bin = Join-Path $scratch 'projection-bin'
+            $a = Invoke-MiosTerminalProjectionProbe -Body $body -FixtureBin $bin -NativeCode 0 -StaleCode -1978335189
+            $b = Invoke-MiosTerminalProjectionProbe -Body $body -FixtureBin $bin -NativeCode 7 -StaleCode 0
+            $c = Invoke-MiosTerminalProjectionProbe -Body $body -FixtureBin $bin -NativeCode 0 -StaleCode 0 -Present $false
+            $ok = $a.Accepted -and $a.Calls.Count -eq 1 -and $a.Calls[0].Wait -and $a.Calls[0].PassThru -and $a.Calls[0].NoNewWindow -and
+                  $a.Calls[0].FilePath -eq (Join-Path $bin 'mios-launch.exe') -and ($a.Calls[0].Arguments -join '|') -eq '--stage-host-terminal' -and
+                  -not $b.Accepted -and $b.Message -match '\(exit 7\)' -and $b.Calls.Count -eq 1 -and $b.Calls[0].Wait -and
+                  -not $c.Accepted -and $c.Calls.Count -eq 0 -and $c.Message -match 'missing.*incomplete'
+            if (-not $ok -and $env:MIOS_TEST_VERBOSE) { Write-Host ($a, $b, $c | ConvertTo-Json -Depth 5 -Compress) }
+        }
+        Check $ok ($site[0] + ' native tmux staging waits for its GUI process and checks that process''s exit code')
+    }    Write-Host "NATIVE_LAYOUT_ASSERTIONS $($script:checks)"
     return $script:fail
 }
 
@@ -208,6 +256,14 @@ try {
     $baseline = Invoke-Checks $GetPath $BuildPath
     if ($baseline) { Write-Host 'NATIVE_LAYOUT_BASELINE_FAILED'; exit 1 }
     $plants = @(
+        @{ Name = 'the entrypoint invokes the GUI renderer asynchronously again'; Expected = 'Get-MiOS.ps1 native tmux staging waits for its GUI process and checks that process''s exit code'
+           File = 'Get'; Edits = @(, @('$projectionProcess = Start-Process -FilePath $launcher -ArgumentList ''--stage-host-terminal'' -NoNewWindow -Wait -PassThru', '& $launcher --stage-host-terminal')) },
+        @{ Name = 'the build reads an unrelated native exit status again'; Expected = 'build-mios.ps1 native tmux staging waits for its GUI process and checks that process''s exit code'
+           File = 'Build'; Edits = @(, @('if ($projectionProcess.ExitCode -ne 0) { throw "Native layered SSOT tmux projection failed (exit $($projectionProcess.ExitCode))" }', 'if ($LASTEXITCODE -ne 0) { throw "Native layered SSOT tmux projection failed (exit $LASTEXITCODE)" }')) },
+        @{ Name = 'the entrypoint no longer waits for staging'; Expected = 'Get-MiOS.ps1 native tmux staging waits for its GUI process and checks that process''s exit code'
+           File = 'Get'; Edits = @(, @('$projectionProcess = Start-Process -FilePath $launcher -ArgumentList ''--stage-host-terminal'' -NoNewWindow -Wait -PassThru', '$projectionProcess = Start-Process -FilePath $launcher -ArgumentList ''--stage-host-terminal'' -NoNewWindow -PassThru')) },
+        @{ Name = 'the build loses the staging process status object'; Expected = 'build-mios.ps1 native tmux staging waits for its GUI process and checks that process''s exit code'
+           File = 'Build'; Edits = @(, @('$projectionProcess = Start-Process -FilePath $launcher -ArgumentList ''--stage-host-terminal'' -NoNewWindow -Wait -PassThru', '$projectionProcess = Start-Process -FilePath $launcher -ArgumentList ''--stage-host-terminal'' -NoNewWindow -Wait')) },
         @{ Name = 'the two layout functions disagree on the body'; Expected = 'Get-MiOS.ps1 and build-mios.ps1 resolve one installed layout (root, bin, native bin, profile body, scope)'
            File = 'Get'; Edits = @(, @("        ProfileBody = Join-Path `$root 'powershell\profile.ps1'`n        Scope       = if (`$Elevated)", "        ProfileBody = Join-Path `$root 'powershell\profile-main.ps1'`n        Scope       = if (`$Elevated)")) },
         @{ Name = 'the M:\ / MiOS-bootstrap redirector guess restored'; Expected = 'both profile redirectors load the installed layout''s body, with no M:\ or MiOS-bootstrap guess'

@@ -35,12 +35,17 @@
 #   pwsh -NoProfile -File tests\test_install_host_tools.ps1
 #   pwsh -NoProfile -File tests\test_install_host_tools.ps1 -PlantDefect
 
-[CmdletBinding()]
+# The complete helper runs through the actual build-mios.ps1 loader. Scratch
+# contains a stale system-root helper which must not shadow the bootstrap copy.
+# -PlantSourceDefect restores the stale-first order and must reproduce that fault.
+#   pwsh -NoProfile -File tests\test_install_host_tools.ps1 -PlantSourceDefect[CmdletBinding()]
 param(
-    [switch]$PlantDefect
+    [switch]$PlantDefect,
+    [switch]$PlantSourceDefect
 )
 
 $ErrorActionPreference = "Continue"
+if ($PlantDefect -and $PlantSourceDefect) { throw 'Choose one negative control at a time' }
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $targetScript = Join-Path $repoRoot "src\install-host-tools.ps1"
@@ -365,7 +370,28 @@ Write-Host "  install-host-tools.ps1 winget ladder tests (task_3435)" -Foregroun
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 try {
-    . $scriptUnderTest
+    # Both copies exist, exactly as on an upgraded host. Only the bootstrap copy
+    # is current; the legacy sentinel makes an incorrect selection observable.
+    $legacySource = Join-Path $MiosRepoDir 'src/install-host-tools.ps1'
+    $currentSource = Join-Path $MiosBootstrapShadow 'src/install-host-tools.ps1'
+    foreach ($file in @($legacySource, $currentSource)) {
+        New-Item -ItemType Directory -Path (Split-Path $file -Parent) -Force | Out-Null
+    }
+    Set-Content -LiteralPath $legacySource -Value "throw 'fixture stale root helper selected'" -Encoding utf8
+    $legacyHash = (Get-FileHash -LiteralPath $legacySource).Hash
+    Copy-Item -LiteralPath $scriptUnderTest -Destination $currentSource
+    $loaderTokens = $null; $loaderErrors = $null
+    $loaderTree = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot 'build-mios.ps1'), [ref]$loaderTokens, [ref]$loaderErrors)
+    $loader = $loaderTree.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Install-MiosWindowsTools' }, $true)
+    if ($loaderErrors.Count -or -not $loader) { throw 'Production host-tools loader not found or did not parse' }
+    $loaderText = $loader.Extent.Text.Replace("`r`n", "`n")
+    if ($PlantSourceDefect) {
+        $fixedOrder = "        (Join-Path `$MiosBootstrapShadow 'src\install-host-tools.ps1'),`n        (Join-Path `$MiosRepoDir 'src\install-host-tools.ps1')"
+        $staleOrder = "        (Join-Path `$MiosRepoDir 'src\install-host-tools.ps1'),`n        (Join-Path `$MiosBootstrapShadow 'src\install-host-tools.ps1')"
+        if (-not $loaderText.Contains($fixedOrder)) { throw 'Negative control: current bootstrap-first loader not found' }
+        $loaderText = $loaderText.Replace($fixedOrder, $staleOrder)
+    }
+    . ([scriptblock]::Create($loaderText))
 
     try {
         Install-MiosWindowsTools
@@ -374,7 +400,14 @@ try {
         $script:MockLog.Add("HARNESS-ERROR: $script:HarnessError")
     }
 
-    $userPathAfter = [Environment]::GetEnvironmentVariable("PATH", "User")
+    if ($PlantSourceDefect) {
+        if ($script:HarnessError -ceq 'fixture stale root helper selected' -and $script:WingetCalls.Count -eq 0) {
+            Write-Host 'PLANTED DEFECT REPRODUCED: stale system-root helper shadowed current bootstrap source' -ForegroundColor Yellow
+            exit 0
+        }
+        Write-Error 'Negative control failed: stale-first loader did not reproduce the fault'
+        exit 1
+    }    $userPathAfter = [Environment]::GetEnvironmentVariable("PATH", "User")
     $btopAfter = [Environment]::GetEnvironmentVariable("BTOP_CONFIG_DIR", "User")
     $logText = $script:MockLog -join "`n"
 
@@ -456,6 +489,8 @@ try {
     Assert-Condition "no third (hash) install attempt for any pkg" ( $retryCount -le 2 )
     Assert-Condition "summary counts 0x8A15002B as already-present, not failed" ( $logText.Contains("winget summary: 1 installed / 3 already-present / 0 failed") )
     Assert-Condition "script completed without a terminating error" ( $null -eq $script:HarnessError ) ("$script:HarnessError")
+    Assert-Condition 'actual loader selected the current bootstrap helper' ($logText.Contains(('Host tools source: {0}' -f $currentSource)))
+    Assert-Condition 'legacy root helper preserved without execution or modification' ((Get-FileHash -LiteralPath $legacySource).Hash -ceq $legacyHash)
 
     Write-Host "`n[Suite 6] hermeticity (nothing written outside scratch)" -ForegroundColor Yellow
     Assert-Condition "User PATH unchanged" ( $userPathAfter -ceq $userPathBefore ) ("before='$userPathBefore' after='$userPathAfter'")

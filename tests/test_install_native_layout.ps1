@@ -87,6 +87,62 @@ function Invoke-MiosTerminalProjectionProbe {
     }
     [pscustomobject]@{ Accepted=$accepted; Message=$message; Calls=@($calls.ToArray()); Value=$value }
 }
+# Extract the production wallpaper stage, not a duplicate implementation.
+function Get-MiosWallpaperStageCode([string]$Text) {
+    $m = [regex]::Matches($Text, '(?ms)^    # -- mios-wallpaperd[^\n]*\n(?<Body>.*?)^\s*# Register MiOS-Autostart ')
+    if ($m.Count -ne 1) { throw 'Missing or ambiguous production wallpaper stage' }
+    return $m[0].Groups['Body'].Value
+}
+# No real service, artifact, process, WSL, registry or filesystem operations run.
+function Invoke-MiosWallpaperScopeProbe {
+    param([string]$Body, [string]$FixtureRoot, [bool]$Elevated, [bool]$Exists = $true,
+          [int]$CreateExit = 0, [switch]$ArtifactFail, [switch]$StartFail)
+    $state = @{ Artifact=0; ServiceArgument=''; Binary=''; Destination=''; Queries=0; Created=0; Started=0; Warnings=@(); Error=$null }
+    $adminVar = Get-Variable -Name IsAdmin -Scope Script -ErrorAction SilentlyContinue
+    $hadAdmin = $null -ne $adminVar; $oldAdmin = if ($hadAdmin) { $adminVar.Value } else { $null }
+    $lastVar = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+    $hadLast = $null -ne $lastVar; $oldLast = if ($hadLast) { $lastVar.Value } else { $null }
+    $MiosBinDir = Join-Path $FixtureRoot 'User install bin'
+    $MiosRepoDir = Join-Path $FixtureRoot 'system checkout'
+    $DevDistro = 'fixture-MiOS-DEV'
+    function Install-MiosNativeWindowsArtifact {
+        param($Root, $Machine, $Binary, $Destination, $ServiceName)
+        $state.Artifact++; $state.ServiceArgument=$ServiceName; $state.Binary=$Binary; $state.Destination=$Destination
+        if ($ArtifactFail) { throw 'fixture native artifact failure' }
+        if ($ServiceName -and -not $Elevated) { throw 'fixture machine-service stop denied' }
+        return $Destination
+    }
+    function Get-Service {
+        [CmdletBinding()] param([string]$Name)
+        $state.Queries++
+        if (-not $Elevated) { throw 'fixture User scope queried a machine service' }
+        if ($Name -ne 'MiOS-Wallpaper-Service') { throw 'fixture wrong service queried' }
+        if ($Exists) { return [pscustomobject]@{ Status='Running' } }
+    }
+    function Start-Service {
+        [CmdletBinding()] param([string]$Name)
+        $state.Started++
+        if (-not $Elevated -or $Name -ne 'MiOS-Wallpaper-Service') { throw 'fixture User scope started a machine service' }
+        if ($StartFail) { throw 'fixture service start failure' }
+    }
+    function sc.exe {
+        param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Arguments)
+        $state.Created++
+        if (-not $Elevated -or $Arguments[0] -ne 'create' -or $Arguments[1] -ne 'MiOS-Wallpaper-Service') { throw 'fixture invalid machine service registration' }
+        if (($Arguments -join '|') -notlike ('*'+$state.Destination+'*')) { throw 'fixture unverified service destination' }
+        $global:LASTEXITCODE=$CreateExit
+    }
+    function Log-Ok { param($Message) }
+    function Log-Warn { param($Message) $state.Warnings += $Message }
+    try { $script:IsAdmin=$Elevated; $global:LASTEXITCODE=0; & ([scriptblock]::Create($Body)) }
+    catch { $state.Error=$_.Exception.Message }
+    finally {
+        if ($hadAdmin) { Set-Variable -Name IsAdmin -Scope Script -Value $oldAdmin } else { Remove-Variable -Name IsAdmin -Scope Script -ErrorAction SilentlyContinue }
+        if ($hadLast) { Set-Variable -Name LASTEXITCODE -Scope Global -Value $oldLast } else { Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue }
+    }
+    return [pscustomobject]$state
+}
+
 function Invoke-Checks([string]$Get, [string]$Build) {
     $script:fail = 0; $script:checks = 0; $script:failedChecks = New-Object System.Collections.Generic.List[string]
     $getText = ([IO.File]::ReadAllText($Get)) -replace "`r`n", "`n"; $buildText = ([IO.File]::ReadAllText($Build)) -replace "`r`n", "`n"
@@ -243,7 +299,32 @@ try { $a = Get-MiosClientSetupArguments -Setup $Setup -Distro 'MiOS-DEV' -Source
             if (-not $ok -and $env:MIOS_TEST_VERBOSE) { Write-Host ($a, $b, $c | ConvertTo-Json -Depth 5 -Compress) }
         }
         Check $ok ($site[0] + ' native tmux staging waits for its GUI process and checks that process''s exit code')
-    }    Write-Host "NATIVE_LAYOUT_ASSERTIONS $($script:checks)"
+    }
+    # Exercise the actual wallpaper stage with no real service or artifact calls.
+    $wallpaper = Get-MiosWallpaperStageCode $buildText
+    $userOk = $true
+    foreach ($exists in @($true, $false)) {
+        $u = Invoke-MiosWallpaperScopeProbe -Body $wallpaper -FixtureRoot $scratch -Elevated $false -Exists $exists
+        $userOk = $userOk -and -not $u.Error -and $u.Artifact -eq 1 -and -not $u.ServiceArgument -and
+                  $u.Binary -eq 'mios-wallpaperd' -and $u.Destination -eq (Join-Path (Join-Path $scratch 'User install bin') 'mios-wallpaperd.exe') -and
+                  ($u.Queries + $u.Created + $u.Started) -eq 0 -and ($u.Warnings -join ' ') -match 'User scope:.*service setup deferred.*existing machine service unchanged'
+        if ($u.Error -and $env:MIOS_TEST_VERBOSE) { Write-Host ('Wallpaper User fixture: ' + $u.Error) }
+    }
+    Check $userOk 'a User wallpaper stage verifies its own binary and never stops, queries, registers or starts the machine service'
+    $m = Invoke-MiosWallpaperScopeProbe -Body $wallpaper -FixtureRoot $scratch -Elevated $true
+    $n = Invoke-MiosWallpaperScopeProbe -Body $wallpaper -FixtureRoot $scratch -Elevated $true -Exists $false
+    $c = Invoke-MiosWallpaperScopeProbe -Body $wallpaper -FixtureRoot $scratch -Elevated $true -Exists $false -CreateExit 5
+    $t = Invoke-MiosWallpaperScopeProbe -Body $wallpaper -FixtureRoot $scratch -Elevated $true -StartFail
+    $f = Invoke-MiosWallpaperScopeProbe -Body $wallpaper -FixtureRoot $scratch -Elevated $true -ArtifactFail
+    $u = Invoke-MiosWallpaperScopeProbe -Body $wallpaper -FixtureRoot $scratch -Elevated $false -ArtifactFail
+    $machineOk = -not $m.Error -and $m.ServiceArgument -eq 'MiOS-Wallpaper-Service' -and $m.Queries -eq 1 -and $m.Created -eq 0 -and $m.Started -eq 1 -and
+                 -not $n.Error -and $n.ServiceArgument -eq 'MiOS-Wallpaper-Service' -and $n.Artifact -eq 1 -and $n.Created -eq 1 -and $n.Started -eq 1 -and
+                 $c.Error -eq 'Could not register the verified MiOS wallpaper service' -and $c.Started -eq 0 -and
+                 $t.Error -eq 'fixture service start failure' -and $f.Error -eq 'fixture native artifact failure' -and ($f.Queries + $f.Created + $f.Started) -eq 0 -and
+                 $u.Error -eq 'fixture native artifact failure' -and ($u.Queries + $u.Created + $u.Started) -eq 0
+    if (-not $machineOk -and $env:MIOS_TEST_VERBOSE) { Write-Host ($m, $n, $c, $t, $f, $u | ConvertTo-Json -Depth 4 -Compress) }
+    Check $machineOk 'Machine wallpaper service registration and start remain enabled; artifact and service failures stay terminating'
+    Write-Host "NATIVE_LAYOUT_ASSERTIONS $($script:checks)"
     return $script:fail
 }
 
@@ -256,6 +337,10 @@ try {
     $baseline = Invoke-Checks $GetPath $BuildPath
     if ($baseline) { Write-Host 'NATIVE_LAYOUT_BASELINE_FAILED'; exit 1 }
     $plants = @(
+        @{ Name = 'User wallpaper staging passes the machine service name again'; Expected = 'a User wallpaper stage verifies its own binary and never stops, queries, registers or starts the machine service'
+           File = 'Build'; Edits = @(, @('$wallpaperServiceName = if ($script:IsAdmin) { $svcName } else { '''' }', '$wallpaperServiceName = $svcName')) },
+        @{ Name = 'User wallpaper staging controls machine services again'; Expected = 'a User wallpaper stage verifies its own binary and never stops, queries, registers or starts the machine service'
+           File = 'Build'; Edits = @(, @("    if (`$script:IsAdmin) {`n        if (-not (Get-Service -Name `$svcName -ErrorAction SilentlyContinue)) {", "    if (`$true) {`n        if (-not (Get-Service -Name `$svcName -ErrorAction SilentlyContinue)) {")) },
         @{ Name = 'the entrypoint invokes the GUI renderer asynchronously again'; Expected = 'Get-MiOS.ps1 native tmux staging waits for its GUI process and checks that process''s exit code'
            File = 'Get'; Edits = @(, @('$projectionProcess = Start-Process -FilePath $launcher -ArgumentList ''--stage-host-terminal'' -NoNewWindow -Wait -PassThru', '& $launcher --stage-host-terminal')) },
         @{ Name = 'the build reads an unrelated native exit status again'; Expected = 'build-mios.ps1 native tmux staging waits for its GUI process and checks that process''s exit code'

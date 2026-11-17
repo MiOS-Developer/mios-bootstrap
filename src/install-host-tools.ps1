@@ -719,11 +719,17 @@ function Configure-MiosBrowserAI {
     $prefsObj['browser.ml.chat.provider'] = [ordered]@{ Value = $providerUrl; Status = 'default' }
 
     $distDir = Join-Path (Split-Path $zenExe -Parent) 'distribution'
-    if (-not (Test-Path -LiteralPath $distDir)) {
-        New-Item -ItemType Directory -Path $distDir -Force | Out-Null
+    # The install-wide fallback is optional; do not elevate or relax its ACLs.
+    # Keep primary profile failures and unrelated I/O errors terminating.
+    try {
+        if (-not (Test-Path -LiteralPath $distDir)) {
+            New-Item -ItemType Directory -Path $distDir -Force -ErrorAction Stop | Out-Null
+        }
+        $json = (@{ policies = @{ Preferences = $prefsObj } } | ConvertTo-Json -Depth 8)
+        $dst  = Join-Path $distDir 'policies.json'
+        [IO.File]::WriteAllText($dst, $json, (New-Object System.Text.UTF8Encoding($false)))
+        Log-Ok ("browser_ai: Zen AI sidebar wired to {0} -> {1}" -f $providerUrl, $dst)
+    } catch [System.UnauthorizedAccessException] {
+        Log-Warn ("browser_ai: managed policy deferred (access denied at {0}); per-profile user.js settings are retained" -f $distDir)
     }
-    $json = (@{ policies = @{ Preferences = $prefsObj } } | ConvertTo-Json -Depth 8)
-    $dst  = Join-Path $distDir 'policies.json'
-    [IO.File]::WriteAllText($dst, $json, (New-Object System.Text.UTF8Encoding($false)))
-    Log-Ok ("browser_ai: Zen AI sidebar wired to {0} -> {1}" -f $providerUrl, $dst)
 }

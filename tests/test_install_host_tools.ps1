@@ -251,6 +251,94 @@ if ($PlantDefect) {
     Write-Host "[negative control] planted collapsed forceArgs line into $scriptUnderTest" -ForegroundColor Yellow
 }
 
+# Run the real browser function against scratch profiles and a fake executable.
+# No package installs, real browsers, network, registry writes or ACL edits.
+function Invoke-MiosBrowserPolicyProbe {
+    param(
+        [string]$Definition,
+        [string]$ScratchDirectory,
+        [ValidateSet('Writable', 'DirectoryDenied', 'PolicyDenied', 'ProfileDenied', 'OtherIO')]
+        [string]$Mode = 'Writable'
+    )
+    $ErrorActionPreference = 'Stop'
+    $saved = @{}
+    foreach ($name in @('APPDATA', 'LOCALAPPDATA', 'ProgramFiles', 'ProgramFiles(x86)')) {
+        $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+    $exitVariable = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+    $hadExitCode = $null -ne $exitVariable
+    $savedExitCode = if ($hadExitCode) { $exitVariable.Value } else { $null }
+    $probeState = @{ warnings = [Collections.Generic.List[string]]::new(); ok = [Collections.Generic.List[string]]::new() }
+    try {
+        $local = Join-Path $ScratchDirectory 'LocalAppData'
+        $roaming = Join-Path $ScratchDirectory 'AppData'
+        $machine = Join-Path $ScratchDirectory 'ProgramFiles'
+        $machineX86 = Join-Path $ScratchDirectory 'ProgramFilesx86'
+        $profile = Join-Path $roaming 'zen\Profiles\fixture'
+        $install = Join-Path $machine 'Zen'
+        $distribution = Join-Path $install 'distribution'
+        $userJs = Join-Path $profile 'user.js'
+        $policyPath = Join-Path $distribution 'policies.json'
+        foreach ($dir in @($local, (Join-Path $local 'Programs'), $profile, $install, $machineX86)) {
+            Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        Microsoft.PowerShell.Management\New-Item -ItemType File -Path (Join-Path $install 'zen.exe') -Force | Out-Null
+        if ($Mode -eq 'PolicyDenied') {
+            # Writing text to a directory raises a real UnauthorizedAccessException,
+            # including the .NET method-invocation wrapper, without changing ACLs.
+            Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path $policyPath -Force | Out-Null
+        }
+        if ($Mode -eq 'ProfileDenied') {
+            Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path $userJs -Force | Out-Null
+        }
+        $env:LOCALAPPDATA = $local; $env:APPDATA = $roaming
+        $env:ProgramFiles = $machine; ${env:ProgramFiles(x86)} = $machineX86
+        function winget {
+            if ($args[0] -ne 'list') { throw 'Browser fixture refused a package-install call' }
+            $global:LASTEXITCODE = 0
+            'Fixture.Browser'
+        }
+        function Get-MiosTomlValue {
+            param($Section, $Key, $Default)
+            switch ("$Section|$Key") {
+                'browser_ai|enable' { return 'true' }
+                'browser_ai|package' { return 'Fixture.Browser' }
+                'browser_ai|provider_url' { return 'http://fixture.invalid/v1' }
+                'browser_ai|prefs' { return @('browser.ml.chat.enabled|bool|true', 'fixture.count|int|3', 'fixture.label|string|source') }
+                default { return $Default }
+            }
+        }
+        function Get-Process { [CmdletBinding()] param([string]$Name) }
+        function Log-Ok { param([string]$Message) $probeState.ok.Add($Message) }
+        function Log-Warn { param([string]$Message) $probeState.warnings.Add($Message) }
+        function New-Item {
+            [CmdletBinding()]
+            param([string]$ItemType, [string]$Path, [switch]$Force)
+            if ($Path -eq $distribution -and $Mode -eq 'DirectoryDenied') {
+                throw [UnauthorizedAccessException]::new('fixture directory access denied')
+            }
+            if ($Path -eq $distribution -and $Mode -eq 'OtherIO') {
+                throw [IO.IOException]::new('fixture unexpected I/O')
+            }
+            Microsoft.PowerShell.Management\New-Item @PSBoundParameters
+        }
+        . ([scriptblock]::Create($Definition))
+        $failure = $null
+        try { Configure-MiosBrowserAI } catch { $failure = $_.Exception.Message }
+        [pscustomobject]@{
+            error = $failure
+            warnings = @($probeState.warnings.ToArray())
+            ok = @($probeState.ok.ToArray())
+            user_js = if ([IO.File]::Exists($userJs)) { [IO.File]::ReadAllText($userJs) } else { $null }
+            policy = if ([IO.File]::Exists($policyPath)) { [IO.File]::ReadAllText($policyPath) } else { $null }
+        }
+    } finally {
+        foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
+        if ($hadExitCode) { $global:LASTEXITCODE = $savedExitCode }
+        else { Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue }
+    }
+}
+
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedTemp = $env:TEMP
 $savedProgramFiles = $env:ProgramFiles
@@ -375,6 +463,37 @@ try {
     $callLines = @(Get-Content -LiteralPath $script:WingetCallFile -ErrorAction SilentlyContinue)
     Assert-Condition "btop config dir resolved from [packages.windows].btop_config_dir (scratch)" ( Test-Path -LiteralPath (Join-Path $btopDstDir "themes") ) ("expected $btopDstDir/themes")
     Assert-Condition "winget call log recorded all invocations" ( $callLines.Count -ge 8 ) ("lines: $($callLines.Count)")
+    Write-Host "`n[Suite 7] optional managed browser policy / mandatory profile boundary" -ForegroundColor Yellow
+    $tokens = $null; $parseErrors = $null
+    $tree = [Management.Automation.Language.Parser]::ParseFile($scriptUnderTest, [ref]$tokens, [ref]$parseErrors)
+    $browser = $tree.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Configure-MiosBrowserAI' }, $true)
+    $definition = $browser.Extent.Text
+    $writable = Invoke-MiosBrowserPolicyProbe $definition (Join-Path $scratch 'browser-writable')
+    Assert-Condition 'writable browser policy completes' ($null -eq $writable.error -and $null -ne $writable.policy) $writable.error
+    Assert-Condition 'primary profile receives the SSOT provider' ($writable.user_js -match [regex]::Escape('user_pref("browser.ml.chat.provider", "http://fixture.invalid/v1");'))
+    $policy = $writable.policy | ConvertFrom-Json
+    Assert-Condition 'managed policy preserves boolean preference type' ($policy.policies.Preferences.'browser.ml.chat.enabled'.Value -is [bool] -and $policy.policies.Preferences.'browser.ml.chat.enabled'.Value)
+    Assert-Condition 'managed policy preserves integer and string values' ($policy.policies.Preferences.'fixture.count'.Value -eq 3 -and $policy.policies.Preferences.'fixture.label'.Value -eq 'source')
+    Assert-Condition 'managed policy uses SSOT provider and default status' ($policy.policies.Preferences.'browser.ml.chat.provider'.Value -eq 'http://fixture.invalid/v1' -and $policy.policies.Preferences.'browser.ml.chat.provider'.Status -eq 'default')
+    foreach ($mode in @('DirectoryDenied', 'PolicyDenied')) {
+        $denied = Invoke-MiosBrowserPolicyProbe $definition (Join-Path $scratch ('browser-' + $mode)) $mode
+        Assert-Condition "$mode does not abort primary setup" ($null -eq $denied.error -and $null -ne $denied.user_js) $denied.error
+        Assert-Condition "$mode explicitly reports deferred policy, not success" (($denied.warnings -join "`n") -match 'managed policy deferred' -and ($denied.ok -join "`n") -notmatch 'Zen AI sidebar wired' -and $null -eq $denied.policy)
+    }
+    $profileDenied = Invoke-MiosBrowserPolicyProbe $definition (Join-Path $scratch 'browser-profile-denied') 'ProfileDenied'
+    Assert-Condition 'primary profile access denial still terminates' ($null -ne $profileDenied.error -and $null -eq $profileDenied.policy)
+    $otherIO = Invoke-MiosBrowserPolicyProbe $definition (Join-Path $scratch 'browser-other-io') 'OtherIO'
+    Assert-Condition 'unrelated policy I/O failure still terminates' ($otherIO.error -match 'fixture unexpected I/O')
+    $permissionCatch = 'catch [System.UnauthorizedAccessException]'
+    Assert-Condition 'production has a narrow permission catch' ($definition.Contains($permissionCatch))
+    if ($definition.Contains($permissionCatch)) {
+        $unguarded = $definition.Replace($permissionCatch, 'catch [System.Security.SecurityException]')
+        $red = Invoke-MiosBrowserPolicyProbe $unguarded (Join-Path $scratch 'browser-planted-unguarded') 'DirectoryDenied'
+        Assert-Condition 'planted missing permission catch reproduces the fatal denial' ($null -ne $red.error -and $null -ne $red.user_js -and $red.warnings.Count -eq 0)
+        $broad = $definition.Replace($permissionCatch, 'catch')
+        $red = Invoke-MiosBrowserPolicyProbe $broad (Join-Path $scratch 'browser-planted-broad-catch') 'OtherIO'
+        Assert-Condition 'planted broad catch violates the unrelated-I/O contract' ($null -eq $red.error -and ($red.warnings -join "`n") -match 'managed policy deferred')
+    }
 } finally {
     $env:LOCALAPPDATA = $savedLocalAppData
     $env:TEMP = $savedTemp

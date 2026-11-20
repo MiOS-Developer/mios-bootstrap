@@ -1,4 +1,4 @@
-# AI-hint: Pester fixture (run under pwsh on Linux or Windows) for MiOS-DEV's Windows-host networking: the WSL Hyper-V service-port rules in Get-MiOS.ps1, the .wslconfig networkingMode/firewall/hostAddressLoopback rendered by every writer, and the Windows Defender rules and portproxy in build-mios.ps1, all from mios.toml [firewall.windows] and [wsl2]. -PlantDefect plants each named defect into the extracted source and requires its named test to fail.
+# AI-hint: Pester fixture (run under pwsh on Linux or Windows) for MiOS-DEV's Windows-host networking: the WSL Hyper-V service-port rules in Get-MiOS.ps1, the .wslconfig networkingMode/firewall/hostAddressLoopback rendered by every writer, the Windows Defender rules and portproxy in build-mios.ps1, all from mios.toml [firewall.windows] and [wsl2], and the dev VM's own firewalld ports and host-network drop-ins in build-mios.ps1's overlay. -PlantDefect plants each named defect into the extracted source and requires its named test to fail.
 # AI-related: Get-MiOS.ps1, build-mios.ps1, /usr/share/mios/mios.toml, [firewall.windows], [wsl2], [ports]
 # AI-functions: Invoke-Suite
 
@@ -72,6 +72,13 @@ $suite = {
             'portproxy-distro'  = @{ File = 'build-mios.ps1'
                                      From = '& wsl.exe -d $_wslDistro --user root'
                                      To   = '& wsl.exe -d $DevDistro --user root' }
+            # Statement-level plants in build-mios.ps1's overlay (outside the lifted functions).
+            'devvm-fw-literal'  = @{ File = 'build-mios.ps1#overlay'
+                                     From = '$_p = Get-MiosSsotPort -Key $_k'
+                                     To   = '$_p = if ($_k -eq ''cockpit'') { 8090 } else { Get-MiosSsotPort -Key $_k }' }
+            'owui-port-override' = @{ File = 'build-mios.ps1#overlay'
+                                     From = '"mios-open-webui:" \'
+                                     To   = '"mios-open-webui:Environment=PORT=3030" \' }
         }
         if ($Plant -and -not $plants.ContainsKey($Plant)) { throw "Unknown plant '$Plant'." }
 
@@ -90,6 +97,32 @@ $suite = {
             }
             return $text
         }
+
+        # build-mios.ps1 with a '#overlay' plant applied: the overlay steps are statements inside a large function, so
+        # these tests lift them from the whole file rather than from a function definition.
+        function global:Get-OverlaySource {
+            $text = [IO.File]::ReadAllText((Join-Path $global:WslRepoRoot 'build-mios.ps1')).Replace("`r`n", "`n")
+            $p = $global:WslPlant
+            if ($p -and $global:WslPlants[$p].File -eq 'build-mios.ps1#overlay') {
+                $count = ([regex]::Matches($text, [regex]::Escape($global:WslPlants[$p].From))).Count
+                if ($count -ne 1) { throw "Plant '$p' must match build-mios.ps1 exactly once (matched $count)." }
+                $text = $text.Replace($global:WslPlants[$p].From, $global:WslPlants[$p].To)
+            }
+            return $text
+        }
+        # The statements from the $_fwServicePorts assignment through $_fwPortsStr, run in the build fixture's scope;
+        # returns the dev VM firewalld port list it renders.
+        function global:Invoke-DevVmFirewallRun {
+            $ast = [Management.Automation.Language.Parser]::ParseInput((Get-OverlaySource), [ref]$null, [ref]$null)
+            $a = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$_fwServicePorts' }, $true)
+            if (-not $a) { throw 'build-mios.ps1 has no $_fwServicePorts assignment' }
+            $st = @($a.Parent.Statements); $i = [array]::IndexOf($st, $a); $j = $i
+            while ($j -lt $st.Count -and $st[$j].Extent.Text -notmatch '^\$_fwPortsStr\s*=') { $j++ }
+            if ($j -ge $st.Count) { throw 'no $_fwPortsStr after $_fwServicePorts' }
+            $code = ($st[$i..$j] | ForEach-Object { $_.Extent.Text }) -join "`n"
+            & $global:BuildMios { param($c) . ([scriptblock]::Create($c)); $_fwPortsStr } $code
+        }
+        $global:WslPlant = $Plant
 
         $getNames = @('Split-MiosTomlKeyLine', 'Get-MiosTomlValue', 'Get-MiosTomlTableArray', 'Get-MiosTomlStringArray',
             'Get-MiosVendorBoundedList', 'Get-MiosWslServicePortPlan', 'ConvertTo-MiosNetworkPrefix', 'ConvertTo-MiosCanonicalPrefix',
@@ -616,6 +649,29 @@ minimum_cpus = 4
         }
     }
 
+    Describe 'MiOS-DEV guest surface in build-mios.ps1' {
+        BeforeEach { Reset-FwFixture }
+
+        It 'opens the dev VM firewalld ports from [ports] alone, leaving out a key with no port by name' {
+            # The fixture's [ports] defines ssh, forge_http, llm_light, pgvector and searxng; the other dev VM keys
+            # (cockpit among them) have no port and must stay closed by name, with no vendor literal in their place.
+            $ports = Invoke-DevVmFirewallRun
+            $ports | Should -Be '22 8100 8400 8500 8800'
+            ($global:FwFixture.Log -join "`n") | Should -Match 'WARN dev VM firewalld: mios\.toml \[ports\]\.cockpit does not resolve'
+        }
+
+        It 'leaves every service on its SSOT port in the dev host-network drop-ins' {
+            # The vendor Quadlets render PORT= from [ports]; a drop-in that sets it again moves the listener off the port
+            # the Windows exposure opens (Open WebUI was pinned to 3030 against [ports].open_webui).
+            $src = Get-OverlaySource
+            $m = [regex]::Match($src, '(?ms)for svc_pair in \\\n(?<list>.*?)^; do')
+            $m.Success | Should -BeTrue
+            $pairs = @([regex]::Matches($m.Groups['list'].Value, '"(?<svc>mios-[a-z0-9-]+):(?<extra>[^"]*)"') | ForEach-Object { $_ })
+            @($pairs | ForEach-Object { $_.Groups['svc'].Value }) | Should -Contain 'mios-open-webui'
+            @($pairs | Where-Object { $_.Groups['extra'].Value -match '(^|\|)Environment=PORT=' } | ForEach-Object { $_.Groups['svc'].Value }) | Should -BeNullOrEmpty
+        }
+    }
+
     Describe 'SSOT readers' {
         BeforeEach { Reset-FwFixture }
 
@@ -697,6 +753,8 @@ $plants = [ordered]@{
     'defender-operator-widening' = 'the operator layer cannot widen the Defender exposure, ports, profiles or scope'
     'portproxy-stale' = 'removes stale portproxy forwards of MiOS ports no longer exposed and keeps foreign ones'
     'portproxy-distro' = 'asks the registered builder distribution for the portproxy VM address'
+    'devvm-fw-literal' = 'opens the dev VM firewalld ports from [ports] alone, leaving out a key with no port by name'
+    'owui-port-override' = 'leaves every service on its SSOT port in the dev host-network drop-ins'
 }
 $bad = 0
 foreach ($plant in $plants.Keys) {

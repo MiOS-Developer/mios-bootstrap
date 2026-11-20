@@ -48,6 +48,21 @@ $suite = {
             'firewall-stripped' = @{ File = 'build-mios.ps1'
                                      From = "`$defaultKeys['firewall'] = `$fwall.ToString().ToLowerInvariant()"
                                      To   = '$null = $fwall' }
+            'profiles-empty-open' = @{ File = 'Get-MiOS.ps1'
+                                     From = 'if (-not $scope.Addresses.Count -or -not $profiles.Count) {'
+                                     To   = 'if (-not $scope.Addresses.Count) {' }
+            'operator-port-redirect' = @{ File = 'Get-MiOS.ps1'
+                                     From = "`$base = Get-MiosTomlValue -Section 'ports' -Key `$key -Default 0 -VendorOnly"
+                                     To   = "`$base = Get-MiosTomlValue -Section 'ports' -Key `$key -Default 0" }
+            'defender-refresh-unscoped' = @{ File = 'build-mios.ps1'
+                                     From = "-Profile `$profileText -RemoteAddress `$plan.RemoteAddresses -ErrorAction Stop`n                `$existing"
+                                     To   = "-Profile `$profileText -ErrorAction Stop`n                `$existing" }
+            'defender-operator-widening' = @{ File = 'build-mios.ps1'
+                                     From = 'if (@($vendor | Where-Object { $_ -ieq $item }).Count) { if (-not @($kept'
+                                     To   = 'if ($true) { if (-not @($kept' }
+            'portproxy-stale'   = @{ File = 'build-mios.ps1'
+                                     From = 'if ($owned.ContainsKey($listen) -and $wanted -notcontains $listen) {'
+                                     To   = 'if ($false) {' }
             'defender-unscoped' = @{ File = 'build-mios.ps1'
                                      From = '-Profile $profileText -RemoteAddress $plan.RemoteAddresses -ErrorAction Stop | Out-Null'
                                      To   = '-Profile $profileText -ErrorAction Stop | Out-Null' }
@@ -60,7 +75,7 @@ $suite = {
             if ($errors.Count) { throw "$File does not parse: $($errors[0].Message)" }
             $defs = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $Names }, $true))
             foreach ($n in $Names) { if (@($defs | Where-Object Name -eq $n).Count -ne 1) { throw "$File`: missing or duplicate function $n" } }
-            $text = ($defs | ForEach-Object { $_.Extent.Text }) -join "`n"
+            $text = (($defs | ForEach-Object { $_.Extent.Text }) -join "`n").Replace("`r`n", "`n")
             if ($Plant -and $Plants[$Plant].File -eq $File -and (-not $Probe -or $text.Contains($Plants[$Plant].From))) {
                 $from = $Plants[$Plant].From
                 $count = ([regex]::Matches($text, [regex]::Escape($from))).Count
@@ -82,11 +97,15 @@ $suite = {
         # build-mios.ps1 carries its own Get-MiosTomlValue and copies of the shared WSL helpers: load its functions into
         # a module so the two scripts' definitions never shadow each other. Its TOML reads go through Get-MiOS.ps1's
         # layered reader over the same fixture text; host-sizing and logging helpers are stubs.
-        $buildNames = @('Get-MiosSsotPort', 'Resolve-MiosWslNetworkingMode', 'Get-MiosWslExperimentalLines', 'Repair-WslConfig',
+        $buildNames = @('Get-MiosSsotPort', 'ConvertTo-MiosNetworkPrefix', 'Test-MiosPrefixWithin', 'Get-MiosVendorTomlValue',
+            'Resolve-MiosWslNetworkingMode', 'Get-MiosWslExperimentalLines', 'Repair-WslConfig',
             'Set-MiosWslConfig', 'Get-MiosLanExposurePlan', 'Set-MiosLanFirewallRules', 'Set-MiosLanPortProxy')
         $buildText = Get-FixtureSource -File 'build-mios.ps1' -Names $buildNames -Plant $Plant -Plants $plants -Root $RepoRoot
         $global:BuildMios = New-Module -Name 'MiosBuildFixture' -ScriptBlock ([scriptblock]::Create(@'
-function Get-MiosTomlValue { param($Section, $Key, $Default, [switch]$VendorOnly, $SourcePath) & $global:GetMiosTomlValue -Section $Section -Key $Key -Default $Default }
+function Get-MiosTomlValue { param($Section, $Key, $Default, [switch]$VendorOnly, $SourcePath)
+    if ($SourcePath) { return (& $global:GetMiosTomlValue -Section $Section -Key $Key -Default $Default -VendorOnly) }
+    & $global:GetMiosTomlValue -Section $Section -Key $Key -Default $Default }
+function Resolve-MiosTomlLayers { @([pscustomobject]@{ Path = 'C:\usr\share\mios\mios.toml'; Text = $global:FwFixture.Vendor }) }
 function Get-MiosCpuMinimum { 4 }
 function Resolve-MiosCpuAllocation { param($AvailableCpus, $RequestedCpus) $RequestedCpus }
 function Write-Log { param($T, $L) $global:FwFixture.Log.Add([string]$T) }
@@ -191,19 +210,26 @@ minimum_cpus = 4
         function global:Set-NetFirewallRule {
             [CmdletBinding()]param($DisplayName, $Enabled, $Action, $Direction, $Profile, $RemoteAddress)
             $r = $global:FwFixture.HostRules[$DisplayName]
-            $r.Profile = [string]$Profile; $r.RemoteAddress = @($RemoteAddress | ForEach-Object { [string]$_ })
+            # Like the real cmdlet, a parameter left unbound keeps the rule's current value.
+            if ($PSBoundParameters.ContainsKey('Profile')) { $r.Profile = [string]$Profile }
+            if ($PSBoundParameters.ContainsKey('RemoteAddress')) { $r.RemoteAddress = @($RemoteAddress | ForEach-Object { [string]$_ }) }
         }
         function global:Remove-NetFirewallRule { [CmdletBinding()]param($DisplayName) [void]$global:FwFixture.HostRules.Remove($DisplayName) }
         function global:Get-NetFirewallPortFilter { [CmdletBinding()]param([Parameter(ValueFromPipeline)]$InputObject) process { } }
         function global:Set-NetFirewallPortFilter { [CmdletBinding()]param([Parameter(ValueFromPipeline)]$InputObject, $Protocol, $LocalPort) process { } }
-        function global:netsh { $global:FwFixture.Netsh.Add(($args -join ' ')); $global:LASTEXITCODE = 0 }
+        function global:netsh {
+            $line = $args -join ' '; $global:FwFixture.Netsh.Add($line); $global:LASTEXITCODE = 0
+            if ($line -match 'portproxy show v4tov4') { return @($global:FwFixture.Proxy.Keys | ForEach-Object { "0.0.0.0         $_         $($global:FwFixture.Proxy[$_])  $_" }) }
+            if ($line -match 'portproxy delete v4tov4 listenaddress=0\.0\.0\.0 listenport=([0-9]+)') { $global:FwFixture.Proxy.Remove($Matches[1]) }
+            if ($line -match 'portproxy add v4tov4 listenaddress=0\.0\.0\.0 listenport=([0-9]+) connectaddress=(\S+)') { $global:FwFixture.Proxy[$Matches[1]] = $Matches[2] }
+        }
         function global:wsl.exe { $global:LASTEXITCODE = 0; '2: eth0    inet 172.24.170.9/20 brd 172.24.175.255 scope global eth0' }
         function global:Get-Service { [CmdletBinding()]param($Name, $ErrorAction) [pscustomobject]@{ Status = 'Running' } }
 
         function global:Reset-FwFixture([string]$Vendor = $global:WslVendorBase, [string]$Operator = '') {
             $global:FwFixture = @{ Vendor = $Vendor; Operator = $Operator; Rules = @{}; Policy = $null; HostRules = @{}
                 PolicySets = New-Object System.Collections.Generic.List[string]; Calls = New-Object System.Collections.Generic.List[string]
-                Netsh = New-Object System.Collections.Generic.List[string]; Log = New-Object System.Collections.Generic.List[string] }
+                Netsh = New-Object System.Collections.Generic.List[string]; Log = New-Object System.Collections.Generic.List[string]; Proxy = @{} }
         }
         function global:Add-ForeignRule([string]$Name, [string]$Creator = $global:WslCreator) {
             $global:FwFixture.Rules[$Name] = [pscustomobject]@{ Name = $Name; DisplayName = $Name; VMCreatorId = $Creator; Direction = 'Inbound'
@@ -363,6 +389,31 @@ minimum_cpus = 4
             $text | Should -Match '10.0.0.0/8'
         }
 
+        It 'opens no Hyper-V rule and closes open ones when the SSOT profiles resolve empty or to Any' {
+            $null = Invoke-Sync
+            (Get-ServiceRules).Count | Should -Be 2
+            foreach ($bad in '[]', '["Any"]') {
+                $global:FwFixture.Vendor = $global:WslVendorBase.Replace('profiles         = ["Private", "Domain"]', "profiles         = $bad")
+                $result = Invoke-Sync
+                $result.Status | Should -Be 'unscoped'
+                (Get-ServiceRules).Count | Should -Be 0
+            }
+        }
+
+        It 'an operator [ports] override cannot redirect an exposed key to another listener' {
+            Reset-FwFixture -Operator "[ports]`nforge_http = 8600`nstack_id = 1`n"
+            $null = Invoke-Sync
+            @(Get-ServiceRules | ForEach-Object { $_.LocalPorts[0] }) | Should -Be @('8400', '8500')
+        }
+
+        It 'reads Hyper-V profiles back as flag values without drift' {
+            $null = Invoke-Sync
+            foreach ($r in Get-ServiceRules) { $r.Profiles = '3' }
+            $global:FwFixture.Calls.Clear()
+            $null = Invoke-Sync
+            $global:FwFixture.Calls.Count | Should -Be 0
+        }
+
         It 'leaves [wsl2.inbound] rules and foreign rules alone' {
             Add-ForeignRule 'MiOS-WSL-operator'
             Add-ForeignRule 'ThirdParty'
@@ -388,7 +439,7 @@ minimum_cpus = 4
         BeforeEach { Reset-FwFixture }
 
         It 'the Get-MiOS.ps1 and build-mios.ps1 copies of the shared WSL helpers are identical' {
-            foreach ($n in 'Resolve-MiosWslNetworkingMode', 'Get-MiosWslExperimentalLines') {
+            foreach ($n in 'Resolve-MiosWslNetworkingMode', 'Get-MiosWslExperimentalLines', 'ConvertTo-MiosNetworkPrefix', 'Test-MiosPrefixWithin') {
                 $texts = foreach ($f in 'Get-MiOS.ps1', 'build-mios.ps1') {
                     Get-FixtureSource -File $f -Names @($n) -Plant $Plant -Plants $global:WslPlants -Root $global:WslRepoRoot -Probe
                 }
@@ -489,6 +540,40 @@ minimum_cpus = 4
             @($global:FwFixture.HostRules.Keys) | Should -Be @('MiOS - forge_http (8400/tcp)')
         }
 
+        It 'refreshes an existing open Defender rule to the SSOT scope and profiles' {
+            $global:FwFixture.HostRules['MiOS - forge_http (8400/tcp)'] = [pscustomobject]@{ DisplayName = 'MiOS - forge_http (8400/tcp)'; Port = '8400'
+                Profile = 'Any'; RemoteAddress = @('Any'); Action = 'Allow' }
+            Invoke-Build 'Set-MiosLanFirewallRules'
+            $r = $global:FwFixture.HostRules['MiOS - forge_http (8400/tcp)']
+            $r.RemoteAddress | Should -Be @('LocalSubnet', '100.64.0.0/10', 'fd7a:115c:a1e0::/48')
+            $r.Profile | Should -Be 'Private,Domain'
+        }
+
+        It 'opens no Defender rule when the SSOT profiles resolve empty' {
+            Reset-FwFixture -Vendor $global:WslVendorBase.Replace('profiles         = ["Private", "Domain"]', 'profiles         = []')
+            Invoke-Build 'Set-MiosLanFirewallRules'
+            $global:FwFixture.HostRules.Count | Should -Be 0
+            ($global:FwFixture.Log -join "`n") | Should -Match 'LAN-FIREWALL-UNSCOPED'
+        }
+
+        It 'the operator layer cannot widen the Defender exposure, ports, profiles or scope' {
+            Reset-FwFixture -Operator ("[firewall.windows]`nexpose = [`"forge_http`", `"pgvector`"]`nprofiles = [`"Private`", `"Public`"]`n" +
+                "remote_addresses = [`"100.100.0.0/16`", `"0.0.0.0/1`", `"Internet`", `"10.0.0.1-10.0.0.9`", `"192.168.1.0/25`"]`n[ports]`nforge_http = 8600`n")
+            Invoke-Build 'Set-MiosLanFirewallRules'
+            @($global:FwFixture.HostRules.Keys) | Should -Be @('MiOS - forge_http (8400/tcp)')
+            $r = $global:FwFixture.HostRules['MiOS - forge_http (8400/tcp)']
+            $r.RemoteAddress | Should -Be @('100.100.0.0/16')
+            $r.Profile | Should -Be 'Private'
+            $log = $global:FwFixture.Log -join "`n"
+            foreach ($refused in 'pgvector', 'Public', '0.0.0.0/1', 'Internet', '10.0.0.1-10.0.0.9', '192.168.1.0/25') { $log | Should -Match ([regex]::Escape($refused)) }
+        }
+
+        It 'removes stale portproxy forwards of MiOS ports no longer exposed and keeps foreign ones' {
+            $global:FwFixture.Proxy['8800'] = '172.24.170.9'; $global:FwFixture.Proxy['8600'] = '172.24.170.9'; $global:FwFixture.Proxy['9999'] = '172.24.170.9'
+            Invoke-Build 'Set-MiosLanPortProxy'
+            @($global:FwFixture.Proxy.Keys | Sort-Object) | Should -Be @('8400', '8500', '9999')
+        }
+
         It 'forwards only expose ports through the portproxy under NAT' {
             Invoke-Build 'Set-MiosLanPortProxy'
             $adds = @($global:FwFixture.Netsh | Where-Object { $_ -match ' add v4tov4 ' })
@@ -572,6 +657,11 @@ $plants = [ordered]@{
     'mode-upgrade'      = 'build-mios.ps1 keeps SSOT NAT as NAT on Windows 11'
     'firewall-stripped' = 'Set-MiosWslConfig writes the SSOT mode and firewall and never strips firewall'
     'defender-unscoped' = 'creates a Defender rule only for each expose port, scoped to the SSOT remote addresses and profiles'
+    'profiles-empty-open' = 'opens no Hyper-V rule and closes open ones when the SSOT profiles resolve empty or to Any'
+    'operator-port-redirect' = 'an operator [ports] override cannot redirect an exposed key to another listener'
+    'defender-refresh-unscoped' = 'refreshes an existing open Defender rule to the SSOT scope and profiles'
+    'defender-operator-widening' = 'the operator layer cannot widen the Defender exposure, ports, profiles or scope'
+    'portproxy-stale' = 'removes stale portproxy forwards of MiOS ports no longer exposed and keeps foreign ones'
 }
 $bad = 0
 foreach ($plant in $plants.Keys) {

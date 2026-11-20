@@ -252,7 +252,7 @@ try { Invoke-MiosQuadletOverlay -Stage $Stage } catch { $err = $_.Exception.Mess
             $run = { param($s, $rc) & $harness -FnSrc $fnRun -RepoDir $repoDir -ShadowDir $shadowDir -Stage $s -Rc $rc }
             $co = & $run 'checkout' 0; $rz = & $run 'realize' 0; $r7 = & $run 'realize' 7; $r3 = & $run 'realize' 3; $c4 = & $run 'checkout' 4; $bad = & $run 'bogus' 0
         } finally { $env:MIOS_SKIP_DEV_QUADLETS = $savedSkip }
-        $one = { param($r, $stage) $r.Calls.Count -eq 1 -and $r.Calls[0].Staged -and $r.Calls[0].Command.Contains("MIOS_OVERLAY_STAGE='$stage'") -and $r.Calls[0].Command.Contains("MIOS_DEV_MACHINE='MiOS-DEV'") -and -not $r.Left }
+        $one = { param($r, $stage) $r.Calls.Count -eq 1 -and $r.Calls[0].Staged -and $r.Calls[0].Command.Contains("MIOS_OVERLAY_STAGE='$stage'") -and $r.Calls[0].Command.Contains("MIOS_BUILDER_DISTRO='MiOS-DEV'") -and -not $r.Left }
         $runOk = $co.Error -eq '' -and (& $one $co 'checkout') -and -not $co.Calls[0].Credential -and $co.Logs.Contains('OK mios.git checked out at / in MiOS-DEV') -and
                  $rz.Error -eq '' -and (& $one $rz 'realize') -and $rz.Calls[0].Credential -and $rz.Logs.Contains('OK MiOS Quadlet overlay applied to MiOS-DEV') -and
                  $r7.Error -eq 'Quadlet overlay failed (rc=7)' -and (& $one $r7 'realize') -and $r7.Logs.Contains('FAIL Quadlet overlay realize failed (rc=7)') -and $r7.Logs -notmatch 're-provision' -and

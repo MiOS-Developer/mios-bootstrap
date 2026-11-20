@@ -183,7 +183,7 @@ function Invoke-Checks([string]$Build) {
     $rcAt = $fn.IndexOf('if ($overlayRc -ne 0) {'); $throwAt = $fn.IndexOf('throw "Quadlet overlay failed (rc=$overlayRc)"', [Math]::Max(0, $rcAt))
     Check ($rcAt -ge 0 -and $throwAt -gt $rcAt -and -not $fn.Contains('rerun safe')) 'any non-zero overlay exit is fatal, never "partial overlay possible ... rerun safe"'
     Check ($fn.Contains('if ($overlayRc -eq 4) {') -and $fn.Contains('Unknown paths: $($unknownPaths -join '', '')') -and
-           $fn.Contains('re-provision it (podman machine rm $DevDistro, then re-run the installer).') -and $fn.Contains("mios_dev_machine='`$DevDistro'")) 'an unknown-path refusal tells the operator the paths and the remedy on screen'
+           $fn.Contains('re-provision it (podman machine rm $DevDistro, then re-run the installer).') -and $fn.Contains("MIOS_BUILDER_DISTRO='`$DevDistro'")) 'an unknown-path refusal tells the operator the paths and the remedy on screen'
     Write-Host "QUADLET_OVERLAY_ASSERTIONS $($script:checks)"
     return $script:fail
 }

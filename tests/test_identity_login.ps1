@@ -61,11 +61,11 @@ function Invoke-Checks([string]$Build, [string]$Get, [string]$Field) {
     $starts = Get-Count $build "import sys,pwd; sys.path.insert(0,'/usr/lib/mios'); import mios_toml as m;"
     Check ($plain -eq 4 -and $starts -eq 4) 'the realize, sudoers, wsl --import and seed paths carry the same guard text (4 plain copies, no drifted copy)'
 
-    $realizeWrites = (Get-Count $build "printf '\n[user]\ndefault=%s\n' `"`$MIOS_LOGIN`" | sudo tee -a /etc/wsl.conf") -eq 1
-    $seedWrites = (Get-Count $build "printf '\n[user]\ndefault=%s\n' `"`$MIOS_LOGIN`" >> /etc/wsl.conf") -eq 1
+    $realizeWrites = (Get-Count $build "printf '\n[user]\ndefault=%s\n' `"`$mios_login`" | sudo tee -a /etc/wsl.conf") -eq 1
+    $seedWrites = (Get-Count $build "printf '\n[user]\ndefault=%s\n' `"`$mios_login`" >> /etc/wsl.conf") -eq 1
     $sudoersUser = $build.Contains('DEV_USER=$(python3 -c "import sys,pwd;') -and $build.Contains('no usable MiOS login for [identity].username; sudoers drop-in not written')
     $pyLogin = (Get-Count $build 'login = probe.stdout.strip() if probe.returncode == 0 else ""') -eq 1 -and $build.Contains('probe = subprocess.run([sys.executable, "-c", GUARD], capture_output=True, text=True)')
-    Check ($realizeWrites -and $seedWrites -and $sudoersUser -and $pyLogin) 'each writer takes the login from the guard: realize and seed write default=$MIOS_LOGIN, sudoers grants $DEV_USER, the wsl --import sanitizer uses the guard''s output'
+    Check ($realizeWrites -and $seedWrites -and $sudoersUser -and $pyLogin) 'each writer takes the login from the guard: realize and seed write default=$mios_login, sudoers grants $DEV_USER, the wsl --import sanitizer uses the guard''s output'
 
     # No login, handoff or default names an account literally. systemctl's --user subcommands and root are not logins.
     $literalLogins = New-Object System.Collections.Generic.List[string]
@@ -177,14 +177,14 @@ try {
            Edits = @(, @("`$login = ((& wsl.exe -d `$Distribution -u root --exec python3 -c `$identityProbe) -join '').Trim()",
                          "`$login = ((& wsl.exe -d `$Distribution -u root --exec python3 -c 'import pwd; print(pwd.getpwuid(1000).pw_name)') -join '').Trim()")) },
         @{ Name = 'the realize writes a literal default=mios again'; Target = 'build'; Expected = 'no installer path writes a literal default=mios'
-           Edits = @(, @("printf '\n[user]\ndefault=%s\n' `"`$MIOS_LOGIN`" | sudo tee -a /etc/wsl.conf", "printf '\n[user]\ndefault=mios\n' | sudo tee -a /etc/wsl.conf")) },
+           Edits = @(, @("printf '\n[user]\ndefault=%s\n' `"`$mios_login`" | sudo tee -a /etc/wsl.conf", "printf '\n[user]\ndefault=mios\n' | sudo tee -a /etc/wsl.conf")) },
         @{ Name = 'the seed''s guard copy drifted'; Target = 'build'; Expected = 'the realize, sudoers, wsl --import and seed paths carry the same guard text (4 plain copies, no drifted copy)'
-           Edits = @(, @("or no login shell)' % n)`" 2>/dev/null) || MIOS_LOGIN=`"`"", "or no login shell!)' % n)`" 2>/dev/null) || MIOS_LOGIN=`"`"")) },
+           Edits = @(, @("or no login shell)' % n)`" 2>/dev/null) || mios_login=`"`"", "or no login shell!)' % n)`" 2>/dev/null) || mios_login=`"`"")) },
         @{ Name = 'build-mios.ps1''s PowerShell guard copy drifted'; Target = 'build'; Expected = 'one PowerShell copy of the MiOS identity guard in build-mios.ps1 and one in Get-MiOS.ps1, both byte for byte (the field backend takes Get-MiOS.ps1''s)'
            Edits = @(, @("or no login shell)'' % n)'`n    `$login = ((& wsl.exe", "or no login shell!)'' % n)'`n    `$login = ((& wsl.exe")) },
         @{ Name = 'a third PowerShell copy of the guard'; Target = 'build'; Expected = 'one PowerShell copy of the MiOS identity guard in build-mios.ps1 and one in Get-MiOS.ps1, both byte for byte (the field backend takes Get-MiOS.ps1''s)'
            Edits = @(, @("    `$user = Get-MiosLinuxLogin `$distribution", "    $probeLine`n    `$user = Get-MiosLinuxLogin `$distribution")) },
-        @{ Name = 'the wsl --import sanitizer takes id mios again'; Target = 'build'; Expected = 'each writer takes the login from the guard: realize and seed write default=$MIOS_LOGIN, sudoers grants $DEV_USER, the wsl --import sanitizer uses the guard''s output'
+        @{ Name = 'the wsl --import sanitizer takes id mios again'; Target = 'build'; Expected = 'each writer takes the login from the guard: realize and seed write default=$mios_login, sudoers grants $DEV_USER, the wsl --import sanitizer uses the guard''s output'
            Edits = @(, @('login = probe.stdout.strip() if probe.returncode == 0 else ""', 'login = "mios" if os.system("id mios >/dev/null 2>&1") == 0 else ""')) },
         @{ Name = 'a generated verb logs in as mios again'; Target = 'build'; Expected = $literal
            Edits = @(, @("--user `$miosLogin -- mios `$v @Args", "--user mios -- mios `$v @Args")) },

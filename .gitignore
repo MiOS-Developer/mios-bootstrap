@@ -118,9 +118,6 @@
 !.devloop/
 !.devloop/handoff/
 !.devloop/handoff/mios-bootstrap-port-parity.md
-# Goal state and task ledger the dev loop carries between sessions.
-!.devloop/goal_state.json
-!.devloop/tasks.jsonl
 
 # Re-ignore noise
 **/__pycache__/

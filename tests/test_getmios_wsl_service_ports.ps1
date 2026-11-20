@@ -69,6 +69,9 @@ $suite = {
             'defender-unscoped' = @{ File = 'build-mios.ps1'
                                      From = '-Profile $profileText -RemoteAddress $plan.RemoteAddresses -ErrorAction Stop | Out-Null'
                                      To   = '-Profile $profileText -ErrorAction Stop | Out-Null' }
+            'portproxy-distro'  = @{ File = 'build-mios.ps1'
+                                     From = '& wsl.exe -d $_wslDistro --user root'
+                                     To   = '& wsl.exe -d $DevDistro --user root' }
         }
         if ($Plant -and -not $plants.ContainsKey($Plant)) { throw "Unknown plant '$Plant'." }
 
@@ -100,7 +103,7 @@ $suite = {
         # build-mios.ps1 carries its own Get-MiosTomlValue and copies of the shared WSL helpers: load its functions into
         # a module so the two scripts' definitions never shadow each other. Its TOML reads go through Get-MiOS.ps1's
         # layered reader over the same fixture text; host-sizing and logging helpers are stubs.
-        $buildNames = @('Get-MiosSsotPort', 'ConvertTo-MiosNetworkPrefix', 'Test-MiosPrefixWithin', 'Get-MiosVendorTomlValue',
+        $buildNames = @('Get-MiosSsotPort', 'ConvertTo-MiosNetworkPrefix', 'Test-MiosPrefixWithin', 'Get-MiosVendorTomlValue', 'Resolve-MiosBuilderDistribution',
             'Resolve-MiosWslNetworkingMode', 'Get-MiosWslExperimentalLines', 'Repair-WslConfig',
             'Set-MiosWslConfig', 'Get-MiosLanExposurePlan', 'Set-MiosLanFirewallRules', 'Set-MiosLanPortProxy')
         $buildText = Get-FixtureSource -File 'build-mios.ps1' -Names $buildNames -Plant $Plant -Plants $plants -Root $RepoRoot
@@ -226,13 +229,25 @@ minimum_cpus = 4
             if ($line -match 'portproxy delete v4tov4 listenaddress=0\.0\.0\.0 listenport=([0-9]+)') { $global:FwFixture.Proxy.Remove($Matches[1]) }
             if ($line -match 'portproxy add v4tov4 listenaddress=0\.0\.0\.0 listenport=([0-9]+) connectaddress=(\S+)') { $global:FwFixture.Proxy[$Matches[1]] = $Matches[2] }
         }
-        function global:wsl.exe { $global:LASTEXITCODE = 0; '2: eth0    inet 172.24.170.9/20 brd 172.24.175.255 scope global eth0' }
+        # The registered distributions are the fixture's: --list answers them, and -d of any other name fails like WSL.
+        function global:wsl.exe {
+            $a = @($args | ForEach-Object { [string]$_ })
+            $global:LASTEXITCODE = 0
+            if ($a -contains '--list') { return @($global:FwFixture.Distros) }
+            $i = [array]::IndexOf($a, '-d')
+            if ($i -ge 0) {
+                $global:FwFixture.Probes.Add($a[$i + 1])
+                if ($global:FwFixture.Distros -notcontains $a[$i + 1]) { $global:LASTEXITCODE = 1; return 'There is no distribution with the supplied name.' }
+            }
+            '2: eth0    inet 172.24.170.9/20 brd 172.24.175.255 scope global eth0'
+        }
         function global:Get-Service { [CmdletBinding()]param($Name, $ErrorAction) [pscustomobject]@{ Status = 'Running' } }
 
         function global:Reset-FwFixture([string]$Vendor = $global:WslVendorBase, [string]$Operator = '') {
             $global:FwFixture = @{ Vendor = $Vendor; Operator = $Operator; Rules = @{}; Policy = $null; HostRules = @{}
                 PolicySets = New-Object System.Collections.Generic.List[string]; Calls = New-Object System.Collections.Generic.List[string]
-                Netsh = New-Object System.Collections.Generic.List[string]; Log = New-Object System.Collections.Generic.List[string]; Proxy = @{} }
+                Netsh = New-Object System.Collections.Generic.List[string]; Log = New-Object System.Collections.Generic.List[string]; Proxy = @{}
+                Distros = @('podman-MiOS-DEV'); Probes = New-Object System.Collections.Generic.List[string] }
         }
         function global:Add-ForeignRule([string]$Name, [string]$Creator = $global:WslCreator) {
             $global:FwFixture.Rules[$Name] = [pscustomobject]@{ Name = $Name; DisplayName = $Name; VMCreatorId = $Creator; Direction = 'Inbound'
@@ -586,6 +601,19 @@ minimum_cpus = 4
             @($adds | ForEach-Object { [regex]::Match($_, 'listenport=([0-9]+)').Groups[1].Value }) | Should -Be @('8400', '8500')
             ($adds -join "`n") | Should -Not -Match 'listenport=8600'
         }
+
+        It 'asks the registered builder distribution for the portproxy VM address' {
+            # [bootstrap].dev_distro names the podman machine (MiOS-DEV); WSL registers it as podman-MiOS-DEV, or under the
+            # machine name itself for an imported builder.
+            foreach ($registered in @('podman-MiOS-DEV', 'MiOS-DEV')) {
+                Reset-FwFixture
+                $global:FwFixture.Distros = @('Ubuntu', $registered)
+                Invoke-Build 'Set-MiosLanPortProxy'
+                @($global:FwFixture.Probes) | Should -Be @($registered)
+                @($global:FwFixture.Proxy.Keys | Sort-Object) | Should -Be @('8400', '8500')
+                ($global:FwFixture.Log -join "`n") | Should -Not -Match 'could not resolve'
+            }
+        }
     }
 
     Describe 'SSOT readers' {
@@ -668,6 +696,7 @@ $plants = [ordered]@{
     'defender-refresh-unscoped' = 'refreshes an existing open Defender rule to the SSOT scope and profiles'
     'defender-operator-widening' = 'the operator layer cannot widen the Defender exposure, ports, profiles or scope'
     'portproxy-stale' = 'removes stale portproxy forwards of MiOS ports no longer exposed and keeps foreign ones'
+    'portproxy-distro' = 'asks the registered builder distribution for the portproxy VM address'
 }
 $bad = 0
 foreach ($plant in $plants.Keys) {

@@ -419,9 +419,6 @@ stale_fallbacks = []
 # which systemd does not expand; that is a binding-correctness question (shared
 # with llm_heavy in the same unit) this register does not measure.
 unbound = ["field_live_chat"]
-[ports.lan_firewall]
-profiles = ["Private", "Domain"]
-expose   = ["forge_http", "open_webui", "hermes", "searxng", "cockpit", "llm_light", "code_server", "guacamole_web"]
 
 # ----------------------------------------------------------------------------
 # [ai] -- Local AI surface (Architectural Law 5: UNIFIED-AI-REDIRECTS).

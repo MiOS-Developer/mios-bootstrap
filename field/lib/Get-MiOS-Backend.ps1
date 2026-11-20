@@ -5300,7 +5300,9 @@ function Get-MiosFieldCanonicalFunctions {
     $names = if ($Names) { $Names } else { @('Split-MiosTomlKeyLine', 'Get-MiosTomlTableArray', 'Get-MiosTomlValue',
         'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Test-MiosElevated', 'Enable-MiOSWindowsFeatures',
         'Test-MiosWslVmCreator', 'Register-MiosWslVmCreator', 'Get-MiosTomlStringArray', 'Get-MiosWslServicePortPlan',
-        'ConvertTo-MiosNetworkPrefix', 'Resolve-MiosWslRemoteScope', 'Sync-MiosWslServicePortRules', 'Set-MiosWslFirewallPolicy',
+        'ConvertTo-MiosNetworkPrefix', 'Get-MiosVendorBoundedList', 'ConvertTo-MiosCanonicalPrefix', 'Test-MiosPrefixWithin',
+        'Resolve-MiosWslRemoteScope', 'Resolve-MiosWslServiceScope', 'Sync-MiosWslServicePortRules', 'Set-MiosWslFirewallPolicy',
+        'Resolve-MiosWslNetworkingMode', 'Get-MiosWslExperimentalLines',
         'Invoke-MiosPlatformGate', 'Get-MiosWslConfigText', 'Invoke-MiOSFullReap', 'Update-MiosWindowsBuildCheckout') }
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names
@@ -5372,13 +5374,25 @@ function Invoke-MiosFieldPlatformGate {
 
 function Get-MiosFieldWslConfigText {
     param([AllowEmptyString()][string]$Existing, [string[]]$ManagedLines,
-        [Parameter(Mandatory)][bool]$Firewall, [string]$CanonicalPath = (Get-MiosFieldCanonicalPath))
+        [Parameter(Mandatory)][bool]$Firewall, [bool]$HostAddressLoopback = $true, [string]$CanonicalPath = (Get-MiosFieldCanonicalPath))
     $definitions = Get-MiosFieldCanonicalFunctions -Path $CanonicalPath
     return & {
-        param([scriptblock]$Definitions, [string]$Text, [string[]]$Lines, [bool]$Enabled)
+        param([scriptblock]$Definitions, [string]$Text, [string[]]$Lines, [bool]$Enabled, [bool]$Loopback)
         . $Definitions
-        Get-MiosWslConfigText -Existing $Text -ManagedLines $Lines -Firewall $Enabled
-    } $definitions $Existing $ManagedLines $Firewall
+        Get-MiosWslConfigText -Existing $Text -ManagedLines $Lines -Firewall $Enabled -HostAddressLoopback $Loopback
+    } $definitions $Existing $ManagedLines $Firewall $HostAddressLoopback
+}
+
+function Resolve-MiosFieldWslNetworkingMode {
+    # The canonical [wsl2].networking_mode resolver (NAT unless SSOT says mirrored on Windows 11 22H2+; never an
+    # upgrade), run over this file's own layered Get-MiosTomlValue.
+    param([string]$CanonicalPath = (Get-MiosFieldCanonicalPath), [int]$WindowsBuild = [Environment]::OSVersion.Version.Build)
+    $definitions = Get-MiosFieldCanonicalFunctions -Path $CanonicalPath -Names @('Resolve-MiosWslNetworkingMode')
+    return & {
+        param([scriptblock]$Definitions, [int]$Build)
+        . $Definitions
+        Resolve-MiosWslNetworkingMode -WindowsBuild $Build
+    } $definitions $WindowsBuild
 }
 
 function Complete-MiosFieldPlatformGate {
@@ -5865,10 +5879,11 @@ try { Add-MiosDefenderExclusions } catch { Write-Host "  [!] Defender exclusion 
 
 # Resolve .wslconfig before the first WSL call. The canonical formatter enforces firewall=true,
 # preserves unmanaged settings and rejects duplicate/ambiguous WSL2 sections.
-$_netMode  = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'networking_mode'      -Default 'NAT')
+$_netMode  = Resolve-MiosFieldWslNetworkingMode
 $_lhfwd    = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'localhost_forwarding' -Default 'true')
 $_fwall    = Get-MiosTomlValue -Section 'wsl2' -Key 'firewall' -Default $true
 $_gui      = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'gui_applications'     -Default 'true')
+$_loopback = [bool](Get-MiosTomlValue -Section 'wsl2' -Key 'host_address_loopback' -Default $true)
 $_isMirror = ($_netMode -ieq 'mirrored')
 
 $_wslCfg = Join-Path $env:USERPROFILE ".wslconfig"
@@ -5882,7 +5897,7 @@ if (-not $_isMirror) {
 }
 if ($_gui -ieq 'true') { $_keyLines.Add('guiApplications=true') }
 
-$_wslCfgNext = Get-MiosFieldWslConfigText -Existing $_wslCfgRaw -ManagedLines $_keyLines.ToArray() -Firewall ([bool]$_fwall)
+$_wslCfgNext = Get-MiosFieldWslConfigText -Existing $_wslCfgRaw -ManagedLines $_keyLines.ToArray() -Firewall ([bool]$_fwall) -HostAddressLoopback $_loopback
 if ($_wslCfgNext -cne $_wslCfgRaw) {
     [IO.File]::WriteAllText($_wslCfg, $_wslCfgNext, (New-Object Text.UTF8Encoding($false)))
     Write-Host "  [+] .wslconfig: $_netMode mode with required firewall policy written from mios.toml." -ForegroundColor Green

@@ -233,7 +233,8 @@ Describe 'MiOS-DEV service ports on the WSL Hyper-V firewall' {
 
     It 'degrades with WSL-SERVICE-PORTS-UNSUPPORTED where the rule cmdlets are missing' {
         $saved = ${function:global:Set-NetFirewallHyperVRule}
-        Remove-Item function:global:Set-NetFirewallHyperVRule
+        Remove-Item Function:\Set-NetFirewallHyperVRule
+        Get-Command Set-NetFirewallHyperVRule -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
         try {
             $out = @(Sync-MiosWslServicePortRules -Creator $global:WslCreator 6>&1)
         } finally { Set-Item function:global:Set-NetFirewallHyperVRule $saved }
@@ -248,7 +249,8 @@ Describe 'SSOT readers for the service-port rules' {
     BeforeEach { Reset-FwFixture }
 
     It 'reads a multi-line string array with comments' {
-        Get-MiosTomlStringArray -Section 'firewall' -Key 'open_ports' | Should -Be @('forge_http', 'ssh')
+        $got = Get-MiosTomlStringArray -Section 'firewall' -Key 'open_ports'
+        $got | Should -Be @('forge_http', 'ssh')
     }
 
     It 'refuses a non-string array element' {
@@ -286,6 +288,7 @@ Describe 'SSOT readers for the service-port rules' {
         $keys.Count | Should -BeGreaterThan 0
         @($plan.Ports.Keys) | Should -Be @($expected.Keys)
         @($plan.Ports.Values) | Should -Be @($expected.Values)
-        Get-MiosTomlStringArray -Section 'ssh.windows' -Key 'remote_addresses' | Should -Be @('LocalSubnet', '100.64.0.0/10')
+        $remote = Get-MiosTomlStringArray -Section 'ssh.windows' -Key 'remote_addresses'
+        $remote | Should -Be @('LocalSubnet', '100.64.0.0/10')
     }
 }

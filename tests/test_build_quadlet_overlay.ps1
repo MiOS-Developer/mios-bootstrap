@@ -173,7 +173,7 @@ function Invoke-Checks([string]$Build) {
     Check ($pyExit -eq 0 -and (Get-Sha $wsl) -eq $before -and (Get-Sha $usrLib) -eq $before) 'the wsl.conf sanitizer leaves mios.git''s etc/ and usr/lib/ copies unchanged'
 
     # --- Source contract ------------------------------------------------------------------------------------------------
-    $overlapLine = [regex]::Match($text, 'MIOS_ROOT_OVERLAP=\(([^)]*)\)').Groups[1].Value -split '\s+' | Where-Object { $_ }
+    $overlapLine = [regex]::Match($text, 'mios_root_overlap=\(([^)]*)\)').Groups[1].Value -split '\s+' | Where-Object { $_ }
     Check (@(Compare-Object @($overlapLine) $overlap).Count -eq 0 -and $text.Contains('mios_root_checkout / FETCH_HEAD || exit $?') -and
            $text.Contains('if ! sudo install -d -m 0700 "$backup/files"; then') -and
            -not $text.Contains('checkout --detach FETCH_HEAD || exit 1')) 'the seed checks out only through mios_root_checkout with exactly the 5 known overlaps'

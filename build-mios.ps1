@@ -2746,10 +2746,10 @@ set -uo pipefail
 SRC="${1:?source mios.git path required}"
 SENTINEL="/var/lib/mios/.quadlet-overlay-seeded"
 STAGE1_MARKER="/run/mios/quadlet-stage1"
-OVERLAY_STAGE="${MIOS_OVERLAY_STAGE:-}"
+OVERLAY_STAGE="${mios_overlay_stage:-}"
 case "$OVERLAY_STAGE" in
     checkout|realize) ;;
-    *) echo "[quadlet-overlay] ERROR: MIOS_OVERLAY_STAGE must be checkout or realize (got '$OVERLAY_STAGE')"; exit 2 ;;
+    *) echo "[quadlet-overlay] ERROR: mios_overlay_stage must be checkout or realize (got '$OVERLAY_STAGE')"; exit 2 ;;
 esac
 
 # The sentinel is the only gate, for both stages: realize writes it last, so a run that stopped anywhere repeats.
@@ -2866,7 +2866,7 @@ fi
 # bound-image store, the WSL boot/user/automount config), so each one git would refuse to overwrite is backed up, moved
 # aside and replaced by the checkout. os-release and the rpc_pipefs unit stay rpm-owned: `rpm -V` reports them and a
 # dnf update could rewrite them; MiOS-DEV is replaced through machine-os, never dnf-updated. Any other path refuses.
-MIOS_ROOT_OVERLAP=(etc/chrony.conf etc/wsl.conf usr/lib/os-release
+mios_root_overlap=(etc/chrony.conf etc/wsl.conf usr/lib/os-release
     usr/lib/systemd/system/var-lib-nfs-rpc_pipefs.mount usr/share/containers/storage.conf)
 
 # 0 when a container store under root $1 already holds images or layers: they would then mount under MiOS's
@@ -2919,7 +2919,7 @@ mios_root_checkout() {
     done < <(sudo git -C "$root" ls-tree -r -z --name-only "$ref")
     for p in "${conflicts[@]}"; do
         known=0
-        for k in "${MIOS_ROOT_OVERLAP[@]}"; do if [[ "$p" == "$k" ]]; then known=1; break; fi; done
+        for k in "${mios_root_overlap[@]}"; do if [[ "$p" == "$k" ]]; then known=1; break; fi; done
         (( known )) || unknown+=("$p")
     done
     if (( ${#unknown[@]} )); then
@@ -3793,7 +3793,7 @@ echo "[quadlet-overlay] sealed: $SENTINEL"
     $stagedWsl   = "/mnt/$stagedDrive" + ($stagedPath.Substring(2) -replace '\\','/')
 
     # Not $stage: PowerShell names are case-insensitive, so that would be the ValidateSet-bound $Stage parameter.
-    $seedCommand = "set -e; export MIOS_DEV_ENABLE_AI='$enableAi' MIOS_DEV_ENABLE_RUNNER='$enableRunner' mios_dev_machine='$DevDistro' MIOS_OVERLAY_STAGE='$Stage'; " +
+    $seedCommand = "set -e; export MIOS_DEV_ENABLE_AI='$enableAi' MIOS_DEV_ENABLE_RUNNER='$enableRunner' mios_dev_machine='$DevDistro' mios_overlay_stage='$Stage'; " +
                    "bash '$stagedWsl' '$miosRootWsl'"
     $seedLines = New-Object System.Collections.Generic.List[string]
     try {

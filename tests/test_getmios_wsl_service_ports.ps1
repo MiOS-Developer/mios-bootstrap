@@ -14,6 +14,9 @@ $suite = {
     param([string]$RepoRoot, [string]$Plant)
 
     BeforeAll {
+        # On Windows the NetSecurity commands are functions, so a mid-suite auto-load (any Get-Command of one of them)
+        # imports them into the global scope over the firewall stubs below. Load it first; the stubs then stay in front.
+        if (Get-Module -ListAvailable -Name NetSecurity) { Import-Module NetSecurity -ErrorAction Stop }
         $global:WslCreator = '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}'
         $global:WslRepoRoot = $RepoRoot
 
@@ -423,11 +426,14 @@ minimum_cpus = 4
         }
 
         It 'degrades with WSL-SERVICE-PORTS-UNSUPPORTED where the rule cmdlets are missing' {
-            $saved = ${function:global:Set-NetFirewallHyperVRule}
-            Remove-Item Function:\Set-NetFirewallHyperVRule
+            # Removing the stub is not enough on Windows, where NetSecurity's own command stays resolvable: hide the name
+            # from the presence probe itself. Every other name still resolves through the real cmdlet, invoked by its
+            # CmdletInfo because Pester 6 has no implicit fall-through and also aliases the module-qualified name.
+            $global:WslRealGetCommand = $ExecutionContext.InvokeCommand.GetCmdlet('Get-Command')
+            Mock Get-Command { & $global:WslRealGetCommand @PesterBoundParameters }
+            Mock Get-Command { } -ParameterFilter { $Name -contains 'Set-NetFirewallHyperVRule' }
             Get-Command Set-NetFirewallHyperVRule -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
-            try { $out = @(Sync-MiosWslServicePortRules -Creator $global:WslCreator 6>&1) }
-            finally { Set-Item function:global:Set-NetFirewallHyperVRule $saved }
+            $out = @(Sync-MiosWslServicePortRules -Creator $global:WslCreator 6>&1)
             ($out | Where-Object { $_ -is [Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) -join "`n" |
                 Should -Match 'WSL-SERVICE-PORTS-UNSUPPORTED'
             ($out | Where-Object { $_ -isnot [Management.Automation.InformationRecord] }).Status | Should -Be 'unsupported'

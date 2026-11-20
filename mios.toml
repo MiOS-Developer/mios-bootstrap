@@ -419,6 +419,7 @@ stale_fallbacks = []
 # which systemd does not expand; that is a binding-correctness question (shared
 # with llm_heavy in the same unit) this register does not measure.
 unbound = ["field_live_chat"]
+ssh_ca = 8130    # mios-ssh-ca: the user SSH CA signer (POST /v1/ssh/certificates); binds ONLY this node's tailnet IPv4 and serves only on the [ssh.ca].signer node.
 
 # ----------------------------------------------------------------------------
 # [ai] -- Local AI surface (Architectural Law 5: UNIFIED-AI-REDIRECTS).

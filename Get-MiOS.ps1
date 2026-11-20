@@ -2452,6 +2452,8 @@ function Get-MiosMachineWorkerScript {
         'Test-MiosElevated', 'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Enable-MiOSWindowsFeatures',
         'Get-MiosTomlTableArray', 'ConvertTo-MiosWindowsPath', 'Test-MiosDefenderExclusionRefused', 'Get-MiosDefenderExclusionPlan',
         'Add-MiosDefenderExclusions', 'Test-MiosWslVmCreator', 'Register-MiosWslVmCreator', 'Set-MiosWslFirewallPolicy',
+        'Get-MiosTomlStringArray', 'Get-MiosWslServicePortPlan', 'ConvertTo-MiosNetworkPrefix', 'Resolve-MiosWslRemoteScope',
+        'Sync-MiosWslServicePortRules',
         'Invoke-MiosPlatformGate', 'Assert-MiosOriginContext', 'Initialize-MiosPipePeerApi',
         'Initialize-MiosMachineStorage', 'Publish-MiosMachineToml', 'Register-MiosBootstrapResume',
         'Get-MiosMachinePodmanExe', 'Get-MiosMachinePodmanVersion', 'Get-MiosPodmanVersion', 'Get-MiosRequiredPodmanVersion',
@@ -6015,6 +6017,201 @@ function Register-MiosWslVmCreator([string]$Creator) {
     throw 'The WSL firewall creator did not appear after registration; provisioning stopped before MiOS-DEV.'
 }
 
+function Get-MiosTomlStringArray {
+    # A TOML array of quoted strings (single- or multi-line, comments allowed) from the layered TOML. The first layer
+    # that declares the key wins, an empty array included. Returns $null when no layer declares it.
+    param([Parameter(Mandatory)][string]$Section, [Parameter(Mandatory)][string]$Key)
+    foreach ($txt in @((Resolve-MiosTomlText), (Resolve-MiosVendorTomlText))) {
+        if (-not $txt) { continue }
+        $mSec = [regex]::Match($txt, '(?ms)^\[' + [regex]::Escape($Section) + '\][ \t]*\r?\n(?<body>.*?)(?=^\[[^\]]+\]|\z)')
+        if (-not $mSec.Success) { continue }
+        $body = $mSec.Groups['body'].Value
+        $mKey = [regex]::Match($body, '(?m)^[ \t]*' + [regex]::Escape($Key) + '[ \t]*=[ \t]*\[')
+        if (-not $mKey.Success) { continue }
+        $items = New-Object System.Collections.Generic.List[string]
+        $i = $mKey.Index + $mKey.Length; $closed = $false
+        while ($i -lt $body.Length) {
+            $c = $body[$i]
+            if ($c -eq ']') { $closed = $true; break }
+            if ($c -eq '#') { while ($i -lt $body.Length -and $body[$i] -ne "`n") { $i++ }; continue }
+            if ($c -eq '"' -or $c -eq "'") {
+                $end = $body.IndexOf($c, $i + 1)
+                if ($end -lt 0) { break }
+                $value = $body.Substring($i + 1, $end - $i - 1)
+                if ($value.Contains('\') -or $value.Contains("`n")) { throw "Unsupported string in mios.toml [$Section].$Key." }
+                $items.Add($value); $i = $end + 1; continue
+            }
+            if ($c -eq ',' -or [char]::IsWhiteSpace($c)) { $i++; continue }
+            throw "mios.toml [$Section].$Key must be an array of quoted strings."
+        }
+        if (-not $closed) { throw "mios.toml [$Section].$Key is an unterminated array." }
+        return , $items.ToArray()
+    }
+    return $null
+}
+
+function Get-MiosWslServicePortPlan {
+    # MiOS-DEV's service ports, from SSOT only: each [firewall].open_ports key resolved through [ports].<key>, shifted
+    # by [ports].stack_id * 10000. A key without a valid [ports] value opens nothing and is reported as refused.
+    $plan = [pscustomobject]@{ Ports = [ordered]@{}; Refused = @() }
+    $ports = [ordered]@{}
+    $keys = Get-MiosTomlStringArray -Section 'firewall' -Key 'open_ports'
+    if ($null -eq $keys) { $plan.Refused += 'mios.toml [firewall].open_ports is not declared by any layer'; return $plan }
+    $stack = Get-MiosTomlValue -Section 'ports' -Key 'stack_id' -Default 0
+    if ($stack -isnot [int] -or $stack -lt 0) { throw 'mios.toml [ports].stack_id must be a nonnegative integer.' }
+    $seen = @{}
+    foreach ($key in $keys) {
+        if ($key -notmatch '^[a-z][a-z0-9_]*$') { $plan.Refused += "open_ports entry '$key' is not a [ports] key name"; continue }
+        if ($ports.Contains($key)) { continue }
+        $base = Get-MiosTomlValue -Section 'ports' -Key $key -Default 0
+        if ($base -isnot [int] -or $base -lt 1 -or $base -gt 65535) { $plan.Refused += "$key has no valid [ports].$key value"; continue }
+        $port = $base + ($stack * 10000)
+        if ($port -gt 65535) { $plan.Refused += "$key resolves to $port with stack_id $stack, above 65535"; continue }
+        if ($seen.ContainsKey($port)) { $plan.Refused += "$key repeats port $port of $($seen[$port])"; continue }
+        $seen[$port] = $key
+        $ports[$key] = $port
+    }
+    $plan.Ports = $ports
+    return $plan
+}
+
+function ConvertTo-MiosNetworkPrefix {
+    # The network address of IP/PrefixLength in CIDR form (192.168.1.37/24 -> 192.168.1.0/24).
+    param([Parameter(Mandatory)][Net.IPAddress]$Address, [Parameter(Mandatory)][int]$PrefixLength)
+    $bytes = $Address.GetAddressBytes()
+    if ($PrefixLength -lt 1 -or $PrefixLength -gt ($bytes.Length * 8)) { throw 'Invalid prefix length.' }
+    for ($b = 0; $b -lt $bytes.Length; $b++) {
+        $keep = [math]::Min(8, [math]::Max(0, $PrefixLength - ($b * 8)))
+        $bytes[$b] = $bytes[$b] -band [byte]((0xFF -shl (8 - $keep)) -band 0xFF)
+    }
+    return ([Net.IPAddress]::new($bytes)).ToString() + '/' + $PrefixLength
+}
+
+function Resolve-MiosWslRemoteScope {
+    # SSOT remote_addresses to the explicit prefixes a Hyper-V rule accepts. Hyper-V rules take only addresses, subnets
+    # and ranges (MSFT_NetFirewallHyperVRule.RemoteAddresses), not the LocalSubnet keyword host rules take, so LocalSubnet
+    # becomes the subnets of this host's preferred unicast addresses, loopback and link-local excluded.
+    # Anything unscoped (Any, /0, 0.0.0.0, ::) is refused, never widened.
+    param([AllowEmptyCollection()][string[]]$Entries)
+    $scope = New-Object System.Collections.Generic.List[string]
+    $refused = @()
+    foreach ($raw in @($Entries)) {
+        $entry = ([string]$raw).Trim()
+        if ($entry -ieq 'LocalSubnet') {
+            if (-not (Get-Command Get-NetIPAddress -ErrorAction SilentlyContinue)) { $refused += 'LocalSubnet: Get-NetIPAddress is unavailable'; continue }
+            $found = 0
+            foreach ($a in @(Get-NetIPAddress -AddressState Preferred -ErrorAction Stop)) {
+                $ip = $null
+                if (-not [Net.IPAddress]::TryParse(([string]$a.IPAddress -replace '%.*$', ''), [ref]$ip)) { continue }
+                if ([Net.IPAddress]::IsLoopback($ip) -or $ip.IsIPv6LinkLocal) { continue }
+                if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and $ip.GetAddressBytes()[0] -eq 169 -and $ip.GetAddressBytes()[1] -eq 254) { continue }
+                $len = [int]$a.PrefixLength
+                if ($len -lt 1) { continue }
+                $cidr = ConvertTo-MiosNetworkPrefix -Address $ip -PrefixLength $len
+                if (-not $scope.Contains($cidr)) { $scope.Add($cidr) }
+                $found++
+            }
+            if (-not $found) { $refused += 'LocalSubnet: no preferred unicast address on this host' }
+            continue
+        }
+        $ipText = $entry; $prefix = $null
+        if ($entry -match '^([^/]+)/([0-9]{1,3})$') { $ipText = $Matches[1]; $prefix = [int]$Matches[2] }
+        $ip = $null
+        if (-not [Net.IPAddress]::TryParse($ipText, [ref]$ip)) { $refused += "'$entry' is not an address, CIDR or LocalSubnet"; continue }
+        $bits = if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) { 32 } else { 128 }
+        if ($null -eq $prefix) { $prefix = $bits }
+        if ($prefix -lt 1 -or $prefix -gt $bits -or $ip.Equals([Net.IPAddress]::Any) -or $ip.Equals([Net.IPAddress]::IPv6Any)) {
+            $refused += "'$entry' is unscoped"; continue
+        }
+        $cidr = ConvertTo-MiosNetworkPrefix -Address $ip -PrefixLength $prefix
+        if (-not $scope.Contains($cidr)) { $scope.Add($cidr) }
+    }
+    return [pscustomobject]@{ Addresses = @($scope | Sort-Object); Refused = $refused }
+}
+
+function Sync-MiosWslServicePortRules {
+    # One inbound Hyper-V allow rule per SSOT service port for the WSL VM creator, scoped to the SSOT remote addresses
+    # ([ssh.windows].remote_addresses: the local subnet and the tailnet). Reconciled by name: missing rules are created,
+    # drifted rules corrected, and rules for ports that left SSOT removed. The default inbound action is never touched.
+    param([string]$Creator = '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}')
+    $prefix = 'MiOS-DEV-Port-'
+    $result = [pscustomobject]@{ Status = 'ready'; Opened = @(); Removed = @(); Refused = @(); Addresses = @() }
+    $cmdlets = @('Get-NetFirewallHyperVRule', 'New-NetFirewallHyperVRule', 'Set-NetFirewallHyperVRule', 'Remove-NetFirewallHyperVRule')
+    $missing = @($cmdlets | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
+    if ($missing.Count) {
+        Write-Host "  [!] WSL-SERVICE-PORTS-UNSUPPORTED: $($missing -join ', ') unavailable (Hyper-V firewall needs Windows 11 22H2+ with WSL 2.0.9+); MiOS-DEV service ports stay closed to the LAN and tailnet." -ForegroundColor Yellow
+        $result.Status = 'unsupported'
+        return $result
+    }
+    $plan = Get-MiosWslServicePortPlan
+    $result.Refused += $plan.Refused
+    $remote = Get-MiosTomlStringArray -Section 'ssh.windows' -Key 'remote_addresses'
+    if ($null -eq $remote) { $remote = @(); $result.Refused += 'mios.toml [ssh.windows].remote_addresses is not declared by any layer' }
+    $scope = Resolve-MiosWslRemoteScope -Entries $remote
+    $result.Refused += $scope.Refused
+    $result.Addresses = $scope.Addresses
+    foreach ($r in $result.Refused) { Write-Host "  [!] WSL service port refused ($r)" -ForegroundColor Yellow }
+    $desired = [ordered]@{}
+    if (-not $scope.Addresses.Count) {
+        Write-Host '  [!] WSL-SERVICE-PORTS-UNSCOPED: mios.toml [ssh.windows].remote_addresses resolved to no address; no MiOS-DEV service port is opened.' -ForegroundColor Yellow
+        $result.Status = 'unscoped'
+    } else {
+        foreach ($key in $plan.Ports.Keys) {
+            $desired[$prefix + ($key -replace '[^A-Za-z0-9-]', '-')] = @{ Key = $key; Port = [string]$plan.Ports[$key] }
+        }
+    }
+    $existing = @{}
+    foreach ($rule in @(Get-NetFirewallHyperVRule -ErrorAction Stop)) {
+        if ([string]$rule.Name -like ($prefix + '*')) { $existing[[string]$rule.Name] = $rule }
+    }
+    # Remove first: a port that left SSOT, or a rule whose action/direction/creator/state cannot be corrected in place.
+    foreach ($name in @($existing.Keys)) {
+        $rule = $existing[$name]
+        $sameCreator = $false
+        $id = [guid]::Empty
+        if ([guid]::TryParse([string]$rule.VMCreatorId, [ref]$id)) { $sameCreator = ($id -eq [guid]$Creator) }
+        $fixed = $sameCreator -and ([string]$rule.Direction -eq 'Inbound') -and ([string]$rule.Action -eq 'Allow') -and
+            ([string]$rule.Enabled -ne 'False')
+        if (-not $desired.Contains($name) -or -not $fixed) {
+            Remove-NetFirewallHyperVRule -Name $name -ErrorAction Stop
+            $existing.Remove($name)
+            if (-not $desired.Contains($name)) { $result.Removed += $name }
+        }
+    }
+    foreach ($name in $desired.Keys) {
+        $want = $desired[$name]
+        $display = "MiOS-DEV $($want.Key) ($($want.Port)/tcp)"
+        try {
+            if ($existing.ContainsKey($name)) {
+                $rule = $existing[$name]
+                $ports = @($rule.LocalPorts | ForEach-Object { [string]$_ })
+                $addrs = @($rule.RemoteAddresses | ForEach-Object { [string]$_ } | Sort-Object)
+                $drift = ([string]$rule.Protocol -notin @('TCP', '6')) -or ($ports.Count -ne 1 -or $ports[0] -ne $want.Port) -or
+                    (($addrs -join ',') -ne ($scope.Addresses -join ','))
+                if ($drift) {
+                    Set-NetFirewallHyperVRule -Name $name -NewDisplayName $display -Protocol TCP -LocalPorts $want.Port `
+                        -RemoteAddresses $scope.Addresses -ErrorAction Stop | Out-Null
+                }
+            } else {
+                New-NetFirewallHyperVRule -Name $name -DisplayName $display -VMCreatorId $Creator -Direction Inbound -Action Allow `
+                    -Protocol TCP -LocalPorts $want.Port -RemoteAddresses $scope.Addresses -ErrorAction Stop | Out-Null
+            }
+            $result.Opened += "$($want.Key)/$($want.Port)"
+        } catch {
+            $result.Refused += "$($want.Key): $($_.Exception.Message)"
+            Write-Host "  [!] WSL-SERVICE-PORT-FAILED: $($want.Key) ($($want.Port)/tcp) stays closed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    if ($result.Opened.Count) {
+        Write-Host "  [+] MiOS-DEV inbound: $($result.Opened -join ', ') from $($scope.Addresses -join ', ')" -ForegroundColor Green
+    }
+    $mode = [string](Get-MiosTomlValue -Section 'wsl2' -Key 'networking_mode' -Default 'NAT')
+    if ($mode -ine 'mirrored') {
+        Write-Host "  [i] WSL networking_mode=$mode`: these rules govern traffic that reaches the VM directly; LAN and tailnet clients reach a NAT guest only through a host port proxy, and Windows localhost through the loopback the policy allows." -ForegroundColor Cyan
+    }
+    return $result
+}
+
 function Set-MiosWslFirewallPolicy {
     $creator = '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}'
     $provider = @('Get-NetFirewallHyperVVMCreator', 'Get-NetFirewallHyperVVMSetting', 'Set-NetFirewallHyperVVMSetting', 'Get-NetFirewallHyperVRule',
@@ -6063,6 +6260,8 @@ function Set-MiosWslFirewallPolicy {
         New-NetFirewallHyperVRule -Name $name -DisplayName $name -VMCreatorId $creator -Direction Inbound -Action Allow `
             -Protocol $protocol -LocalPorts ([string]$rule['local_port']) -RemoteAddresses $remote -ErrorAction Stop | Out-Null
     }
+    # MiOS-DEV's SSOT service ports, reconciled after the policy reads back inbound Block.
+    $null = Sync-MiosWslServicePortRules -Creator $creator
 }
 
 function Invoke-MiosPlatformGate {

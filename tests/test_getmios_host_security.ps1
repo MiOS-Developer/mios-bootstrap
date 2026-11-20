@@ -61,7 +61,8 @@ function Import-MiosFunctions([string]$Path) {
     $want = @('Get-MiosTomlAssignments', 'Split-MiosTomlKeyLine', 'Get-MiosTomlCredentialKeys', 'ConvertTo-MiosCredentialFreeToml',
         'Assert-MiosNoReparsePath', 'Set-MiosHostTierAcl', 'Initialize-MiosHostTierDirectory', 'Write-MiosHostToml',
         'Repair-MiosHostTierCredentials', 'Get-MiosTomlTableArray', 'ConvertTo-MiosWindowsPath', 'Test-MiosDefenderExclusionRefused',
-        'Get-MiosDefenderExclusionPlan', 'Add-MiosDefenderExclusions', 'Set-MiosWslFirewallPolicy', 'Set-MiosPrivateUserTomlAcl',
+        'Get-MiosDefenderExclusionPlan', 'Add-MiosDefenderExclusions', 'Get-MiosTomlStringArray', 'Get-MiosWslServicePortPlan',
+        'ConvertTo-MiosNetworkPrefix', 'Resolve-MiosWslRemoteScope', 'Sync-MiosWslServicePortRules', 'Set-MiosWslFirewallPolicy', 'Set-MiosPrivateUserTomlAcl',
         'Import-MiosUserToml', 'ConvertTo-MiosNativeArgument', 'Sync-MiosUserTomlToBuilder', 'Get-MiosUserTomlReceiverScript', 'Get-MiosWslConfigText',
         'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Enable-MiOSWindowsFeatures', 'Test-MiosWslVmCreator', 'Register-MiosWslVmCreator',
         'Invoke-MiosPlatformGate', 'Get-MiosElevationContextError', 'Assert-MiosMachineWriteBoundary', 'New-MiosMachineCreationAcl',
@@ -288,6 +289,8 @@ function Install-ApiMocks {
             [pscustomobject]@{ Name = 'MiOS-WSL-other-creator'; VMCreatorId = '{11111111-1111-1111-1111-111111111111}' })
     }
     function global:Remove-NetFirewallHyperVRule { [CmdletBinding()]param($Name) $script:firewallRemoved.Add([string]$Name) }
+    # Present so the service-port reconcile runs here too; its own fixture is tests/GetMiOS.WslServicePorts.Tests.ps1.
+    function global:Set-NetFirewallHyperVRule { [CmdletBinding()]param($Name) throw "Unexpected Hyper-V rule update: $Name" }
     function global:New-NetFirewallHyperVRule {
         [CmdletBinding()]param($Name, $DisplayName, $VMCreatorId, $Direction, $Action, $Protocol, $LocalPorts, $RemoteAddresses)
         $script:firewallAdded.Add(@{ Name = $Name; Remote = $RemoteAddresses; Ports = $LocalPorts })

@@ -5299,7 +5299,8 @@ function Get-MiosFieldCanonicalFunctions {
     if ($errors.Count) { throw 'The canonical platform source does not parse; Field preparation stopped.' }
     $names = if ($Names) { $Names } else { @('Split-MiosTomlKeyLine', 'Get-MiosTomlTableArray', 'Get-MiosTomlValue',
         'Get-MiosFeatureState', 'Get-MiosDismEnableOutcome', 'Test-MiosElevated', 'Enable-MiOSWindowsFeatures',
-        'Test-MiosWslVmCreator', 'Register-MiosWslVmCreator', 'Set-MiosWslFirewallPolicy',
+        'Test-MiosWslVmCreator', 'Register-MiosWslVmCreator', 'Get-MiosTomlStringArray', 'Get-MiosWslServicePortPlan',
+        'ConvertTo-MiosNetworkPrefix', 'Resolve-MiosWslRemoteScope', 'Sync-MiosWslServicePortRules', 'Set-MiosWslFirewallPolicy',
         'Invoke-MiosPlatformGate', 'Get-MiosWslConfigText', 'Invoke-MiOSFullReap', 'Update-MiosWindowsBuildCheckout') }
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names

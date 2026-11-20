@@ -70,7 +70,7 @@ $suite = {
                                      From = '-Profile $profileText -RemoteAddress $plan.RemoteAddresses -ErrorAction Stop | Out-Null'
                                      To   = '-Profile $profileText -ErrorAction Stop | Out-Null' }
             'portproxy-distro'  = @{ File = 'build-mios.ps1'
-                                     From = '& wsl.exe -d $_wslDistro --user root'
+                                     From = '& wsl.exe -d $distro --user root'
                                      To   = '& wsl.exe -d $DevDistro --user root' }
             # Statement-level plants in build-mios.ps1's overlay (outside the lifted functions).
             'devvm-fw-literal'  = @{ File = 'build-mios.ps1#overlay'
@@ -79,6 +79,24 @@ $suite = {
             'owui-port-override' = @{ File = 'build-mios.ps1#overlay'
                                      From = '"mios-open-webui:" \'
                                      To   = '"mios-open-webui:Environment=PORT=3030" \' }
+            'elevate-unconditionally' = @{ File = 'build-mios.ps1'
+                                     From = 'if (-not $drift.Count -and -not $Force) {'
+                                     To   = 'if ($false) {' }
+            'drift-mask'        = @{ File = 'build-mios.ps1'
+                                     From = 'if ($t -ieq ''LocalSubnet'') { ''LocalSubnet'' } else { ConvertTo-MiosCanonicalPrefix $t }'
+                                     To   = 'if ($t -ieq ''LocalSubnet'') { ''LocalSubnet'' } else { $t }' }
+            'projection-all-sections' = @{ File = 'build-mios.ps1'
+                                     From = '$on = ($Matches[1] -cmatch ''^(firewall\.windows|wsl2|ports)$'')'
+                                     To   = '$on = $true' }
+            'request-any-layer' = @{ File = 'build-mios.ps1'
+                                     From = 'if (-not (Test-MiosLanExposureLayerText $text)) {'
+                                     To   = 'if ($false) {' }
+            'request-any-address' = @{ File = 'build-mios.ps1'
+                                     From = 'if ($address -and -not (Test-MiosWslNatAddress $address)) {'
+                                     To   = 'if ($false) {' }
+            'reply-list'        = @{ File = 'build-mios.ps1'
+                                     From = 'Lines = @(if ($null -ne $Lines) { $Lines.ToArray() })'
+                                     To   = 'Lines = @($Lines)' }
         }
         if ($Plant -and -not $plants.ContainsKey($Plant)) { throw "Unknown plant '$Plant'." }
 
@@ -138,13 +156,21 @@ $suite = {
         # layered reader over the same fixture text; host-sizing and logging helpers are stubs.
         $buildNames = @('Get-MiosSsotPort', 'ConvertTo-MiosNetworkPrefix', 'Test-MiosPrefixWithin', 'Get-MiosVendorTomlValue', 'Resolve-MiosBuilderDistribution',
             'Resolve-MiosWslNetworkingMode', 'Get-MiosWslExperimentalLines', 'Repair-WslConfig',
-            'Set-MiosWslConfig', 'Get-MiosLanExposurePlan', 'Set-MiosLanFirewallRules', 'Set-MiosLanPortProxy')
+            'Set-MiosWslConfig', 'Get-MiosLanExposurePlan', 'Set-MiosLanFirewallRules', 'Set-MiosLanPortProxy',
+            'Resolve-MiosWslVmAddress', 'Get-MiosVendorPortSet', 'ConvertTo-MiosCanonicalPrefix', 'Get-MiosLanExposureDrift',
+            'Get-MiosLanExposureLayers', 'Test-MiosLanExposureLayerText', 'Test-MiosWslNatAddress', 'Invoke-MiosLanExposureRequest',
+            'Get-MiosLanExposureWorkerScript', 'Invoke-MiosLanExposure', 'ConvertTo-MiosLanExposureReply')
         $buildText = Get-FixtureSource -File 'build-mios.ps1' -Names $buildNames -Plant $Plant -Plants $plants -Root $RepoRoot
+        # Invoke-MiosElevatedLanExposure is never lifted: it starts a UAC worker. Its stub records each hand-off instead.
         $global:BuildMios = New-Module -Name 'MiosBuildFixture' -ScriptBlock ([scriptblock]::Create(@'
 function Get-MiosTomlValue { param($Section, $Key, $Default, [switch]$VendorOnly, $SourcePath)
     if ($SourcePath) { return (& $global:GetMiosTomlValue -Section $Section -Key $Key -Default $Default -VendorOnly) }
     & $global:GetMiosTomlValue -Section $Section -Key $Key -Default $Default }
-function Resolve-MiosTomlLayers { @([pscustomobject]@{ Path = 'C:\usr\share\mios\mios.toml'; Text = $global:FwFixture.Vendor }) }
+function Resolve-MiosTomlLayers {
+    @(if ($global:FwFixture.Operator) { [pscustomobject]@{ Path = 'C:\Users\op\.config\mios\mios.toml'; Text = $global:FwFixture.Operator } }) +
+        @([pscustomobject]@{ Path = 'C:\usr\share\mios\mios.toml'; Text = $global:FwFixture.Vendor }) }
+function Invoke-MiosElevatedLanExposure { param([string]$WslAddress = '') $global:FwFixture.Elevations.Add($WslAddress) }
+$script:IsAdmin = $false
 function Get-MiosCpuMinimum { 4 }
 function Resolve-MiosCpuAllocation { param($AvailableCpus, $RequestedCpus) $RequestedCpus }
 function Write-Log { param($T, $L) $global:FwFixture.Log.Add([string]$T) }
@@ -194,14 +220,15 @@ minimum_cpus = 4
 
         function global:Resolve-MiosTomlText { return $global:FwFixture.Operator }
         function global:Resolve-MiosVendorTomlText { return $global:FwFixture.Vendor }
+        # The host's WSL virtual adapter is 172.24.160.1/20; the MiOS-DEV guest (wsl.exe below) is 172.24.170.9 inside it.
         function global:Get-NetIPAddress {
-            [CmdletBinding()]param([string]$AddressState)
+            [CmdletBinding()]param([string]$AddressState, [string]$AddressFamily)
             return @(
-                @{ IPAddress = '192.168.1.37'; PrefixLength = 24 }, @{ IPAddress = '127.0.0.1'; PrefixLength = 8 },
-                @{ IPAddress = '169.254.3.4'; PrefixLength = 16 }, @{ IPAddress = 'fe80::1%12'; PrefixLength = 64 },
-                @{ IPAddress = '172.24.170.9'; PrefixLength = 20 }, @{ IPAddress = '100.101.102.103'; PrefixLength = 32 },
-                @{ IPAddress = '::1'; PrefixLength = 128 }, @{ IPAddress = '2001:db8:1::5'; PrefixLength = 64 }
-            ) | ForEach-Object { [pscustomobject]$_ }
+                @{ IPAddress = '192.168.1.37'; PrefixLength = 24; InterfaceAlias = 'Ethernet' }, @{ IPAddress = '127.0.0.1'; PrefixLength = 8; InterfaceAlias = 'Loopback Pseudo-Interface 1' },
+                @{ IPAddress = '169.254.3.4'; PrefixLength = 16; InterfaceAlias = 'Ethernet 2' }, @{ IPAddress = 'fe80::1%12'; PrefixLength = 64; InterfaceAlias = 'Ethernet' },
+                @{ IPAddress = '172.24.160.1'; PrefixLength = 20; InterfaceAlias = 'vEthernet (WSL (Hyper-V firewall))' }, @{ IPAddress = '100.101.102.103'; PrefixLength = 32; InterfaceAlias = 'Tailscale' },
+                @{ IPAddress = '::1'; PrefixLength = 128; InterfaceAlias = 'Loopback Pseudo-Interface 1' }, @{ IPAddress = '2001:db8:1::5'; PrefixLength = 64; InterfaceAlias = 'Ethernet' }
+            ) | ForEach-Object { [pscustomobject]$_ } | Where-Object { $AddressFamily -ne 'IPv4' -or $_.IPAddress -notmatch ':' }
         }
         function global:Get-NetFirewallHyperVVMCreator { [CmdletBinding()]param() [pscustomobject]@{ VMCreatorId = $global:WslCreator; FriendlyName = 'WSL' } }
         function global:Invoke-CimMethod { [CmdletBinding()]param($Namespace, $ClassName, $MethodName, $Arguments) [pscustomobject]@{ ReturnValue = 0 } }
@@ -240,7 +267,8 @@ minimum_cpus = 4
         function global:New-NetFirewallRule {
             [CmdletBinding()]param($DisplayName, $Description, $Direction, $Action, $Protocol, $LocalPort, $Profile = 'Any', $RemoteAddress = 'Any')
             $global:FwFixture.HostRules[$DisplayName] = [pscustomobject]@{ DisplayName = $DisplayName; Port = [string]$LocalPort
-                Profile = [string]$Profile; RemoteAddress = @($RemoteAddress | ForEach-Object { [string]$_ }); Action = [string]$Action }
+                Profile = [string]$Profile; RemoteAddress = @($RemoteAddress | ForEach-Object { [string]$_ }); Action = [string]$Action
+                Enabled = 'True'; Direction = [string]$Direction; Protocol = [string]$Protocol }
         }
         function global:Get-NetFirewallRule {
             [CmdletBinding()]param($DisplayName)
@@ -252,10 +280,29 @@ minimum_cpus = 4
             # Like the real cmdlet, a parameter left unbound keeps the rule's current value.
             if ($PSBoundParameters.ContainsKey('Profile')) { $r.Profile = [string]$Profile }
             if ($PSBoundParameters.ContainsKey('RemoteAddress')) { $r.RemoteAddress = @($RemoteAddress | ForEach-Object { [string]$_ }) }
+            foreach ($p in 'Enabled', 'Action', 'Direction') {
+                if ($PSBoundParameters.ContainsKey($p)) { $r | Add-Member -NotePropertyName $p -NotePropertyValue ([string]$PSBoundParameters[$p]) -Force }
+            }
         }
         function global:Remove-NetFirewallRule { [CmdletBinding()]param($DisplayName) [void]$global:FwFixture.HostRules.Remove($DisplayName) }
-        function global:Get-NetFirewallPortFilter { [CmdletBinding()]param([Parameter(ValueFromPipeline)]$InputObject) process { } }
-        function global:Set-NetFirewallPortFilter { [CmdletBinding()]param([Parameter(ValueFromPipeline)]$InputObject, $Protocol, $LocalPort) process { } }
+        # A rule's filters read back from (and, for the port filter, write back to) the rule itself.
+        function global:Get-NetFirewallPortFilter {
+            [CmdletBinding()]param([Parameter(ValueFromPipeline)]$InputObject)
+            process { if ($InputObject) { [pscustomobject]@{ Rule = $InputObject; Protocol = $InputObject.Protocol; LocalPort = $InputObject.Port } } }
+        }
+        function global:Get-NetFirewallAddressFilter {
+            [CmdletBinding()]param([Parameter(ValueFromPipeline)]$InputObject)
+            process { if ($InputObject) { [pscustomobject]@{ RemoteAddress = $InputObject.RemoteAddress } } }
+        }
+        function global:Set-NetFirewallPortFilter {
+            [CmdletBinding()]param([Parameter(ValueFromPipeline)]$InputObject, $Protocol, $LocalPort)
+            process {
+                if ($InputObject -and $InputObject.Rule) {
+                    $InputObject.Rule | Add-Member -NotePropertyName Protocol -NotePropertyValue ([string]$Protocol) -Force
+                    $InputObject.Rule.Port = [string]$LocalPort
+                }
+            }
+        }
         function global:netsh {
             $line = $args -join ' '; $global:FwFixture.Netsh.Add($line); $global:LASTEXITCODE = 0
             if ($line -match 'portproxy show v4tov4') { return @($global:FwFixture.Proxy.Keys | ForEach-Object { "0.0.0.0         $_         $($global:FwFixture.Proxy[$_])  $_" }) }
@@ -280,7 +327,12 @@ minimum_cpus = 4
             $global:FwFixture = @{ Vendor = $Vendor; Operator = $Operator; Rules = @{}; Policy = $null; HostRules = @{}
                 PolicySets = New-Object System.Collections.Generic.List[string]; Calls = New-Object System.Collections.Generic.List[string]
                 Netsh = New-Object System.Collections.Generic.List[string]; Log = New-Object System.Collections.Generic.List[string]; Proxy = @{}
-                Distros = @('podman-MiOS-DEV'); Probes = New-Object System.Collections.Generic.List[string] }
+                Distros = @('podman-MiOS-DEV'); Probes = New-Object System.Collections.Generic.List[string]
+                Elevations = New-Object System.Collections.Generic.List[string] }
+        }
+        function global:New-HostRule([string]$Name, [string]$Port) {
+            [pscustomobject]@{ DisplayName = $Name; Port = $Port; Profile = 'Private,Domain'; Action = 'Allow'; Enabled = 'True'
+                Direction = 'Inbound'; Protocol = 'TCP'; RemoteAddress = @('LocalSubnet', '100.64.0.0/10', 'fd7a:115c:a1e0::/48') }
         }
         function global:Add-ForeignRule([string]$Name, [string]$Creator = $global:WslCreator) {
             $global:FwFixture.Rules[$Name] = [pscustomobject]@{ Name = $Name; DisplayName = $Name; VMCreatorId = $Creator; Direction = 'Inbound'
@@ -493,7 +545,9 @@ minimum_cpus = 4
         BeforeEach { Reset-FwFixture }
 
         It 'the Get-MiOS.ps1 and build-mios.ps1 copies of the shared WSL helpers are identical' {
-            foreach ($n in 'Resolve-MiosWslNetworkingMode', 'Get-MiosWslExperimentalLines', 'ConvertTo-MiosNetworkPrefix', 'Test-MiosPrefixWithin') {
+            foreach ($n in 'Resolve-MiosWslNetworkingMode', 'Get-MiosWslExperimentalLines', 'ConvertTo-MiosNetworkPrefix', 'Test-MiosPrefixWithin',
+                    'ConvertTo-MiosCanonicalPrefix', 'Assert-MiosNoReparsePath', 'Set-MiosPrivateUserTomlAcl', 'Initialize-MiosPipePeerApi',
+                    'Read-MiosPipeLine') {
                 $texts = foreach ($f in 'Get-MiOS.ps1', 'build-mios.ps1') {
                     Get-FixtureSource -File $f -Names @($n) -Plant $Plant -Plants $global:WslPlants -Root $global:WslRepoRoot -Probe
                 }
@@ -672,6 +726,143 @@ minimum_cpus = 4
         }
     }
 
+    Describe 'Phase 4 hands the Windows-host exposure to an elevated worker' {
+        BeforeEach { Reset-FwFixture }
+
+        It 'measures no drift once the host matches the plan, and one line per difference' {
+            Invoke-Build 'Set-MiosLanFirewallRules'
+            Invoke-Build 'Set-MiosLanPortProxy'
+            @(Invoke-Build 'Get-MiosLanExposureDrift' @{ WslAddress = '172.24.170.9' }) | Should -BeNullOrEmpty
+            [void]$global:FwFixture.HostRules.Remove('MiOS - llm_light (8500/tcp)')
+            $global:FwFixture.HostRules['MiOS - stale (8999/tcp)'] = New-HostRule 'MiOS - stale (8999/tcp)' '8999'
+            $global:FwFixture.HostRules['MiOS - forge_http (8400/tcp)'].RemoteAddress = @('Any')
+            $global:FwFixture.Proxy['8400'] = '172.24.170.99'
+            $global:FwFixture.Proxy['8600'] = '172.24.170.9'
+            $drift = @(Invoke-Build 'Get-MiosLanExposureDrift' @{ WslAddress = '172.24.170.9' })
+            $drift | Should -Contain "create Defender rule 'MiOS - llm_light (8500/tcp)'"
+            $drift | Should -Contain "remove Defender rule 'MiOS - stale (8999/tcp)'"
+            $drift | Should -Contain "refresh Defender rule 'MiOS - forge_http (8400/tcp)'"
+            $drift | Should -Contain 'forward 0.0.0.0:8400 to 172.24.170.9:8400'
+            $drift | Should -Contain 'remove forward 0.0.0.0:8600'
+            $drift.Count | Should -Be 5
+        }
+
+        It 'reads mask-form scopes and reordered profiles back without drift' {
+            Invoke-Build 'Set-MiosLanFirewallRules'
+            Invoke-Build 'Set-MiosLanPortProxy'
+            foreach ($r in @($global:FwFixture.HostRules.Values)) {
+                $r.RemoteAddress = @('fd7a:115c:a1e0::/48', 'LocalSubnet', '100.64.0.0/255.192.0.0')
+                $r.Profile = 'Domain, Private'
+            }
+            @(Invoke-Build 'Get-MiosLanExposureDrift' @{ WslAddress = '172.24.170.9' }) | Should -BeNullOrEmpty
+        }
+
+        It 'elevates only when the host differs from the plan, with the VM address the operator resolved' {
+            Invoke-Build 'Invoke-MiosLanExposure'
+            @($global:FwFixture.Elevations) | Should -Be @('172.24.170.9')
+            $global:FwFixture.HostRules.Count | Should -Be 0
+            @($global:FwFixture.Netsh | Where-Object { $_ -match ' (add|delete) ' }).Count | Should -Be 0
+            Invoke-Build 'Set-MiosLanFirewallRules'
+            Invoke-Build 'Set-MiosLanPortProxy'
+            $global:FwFixture.Elevations.Clear()
+            Invoke-Build 'Invoke-MiosLanExposure'
+            $global:FwFixture.Elevations.Count | Should -Be 0
+            ($global:FwFixture.Log -join "`n") | Should -Match 'no elevation needed'
+            Invoke-Build 'Invoke-MiosLanExposure' @{ Force = $true }
+            @($global:FwFixture.Elevations) | Should -Be @('172.24.170.9')
+        }
+
+        It 'applies in place, without the worker, when the build is already elevated' {
+            & $global:BuildMios { $script:IsAdmin = $true }
+            try { Invoke-Build 'Invoke-MiosLanExposure' } finally { & $global:BuildMios { $script:IsAdmin = $false } }
+            $global:FwFixture.Elevations.Count | Should -Be 0
+            @($global:FwFixture.HostRules.Keys | Sort-Object) | Should -Be @('MiOS - forge_http (8400/tcp)', 'MiOS - llm_light (8500/tcp)')
+            @($global:FwFixture.Proxy.Keys | Sort-Object) | Should -Be @('8400', '8500')
+            $global:FwFixture.Proxy['8400'] | Should -Be '172.24.170.9'
+        }
+
+        It 'sends only [firewall.windows], [wsl2] and [ports] across the privilege boundary' {
+            Reset-FwFixture -Operator @'
+[identity]
+username = "op"
+password_hash = "$6$fixture-secret-hash"
+
+[firewall.windows]
+expose = ["forge_http"]
+
+[[wsl2.inbound]]
+name = "fixture-inbound"
+
+[auth]
+token = "fixture-secret-token"
+
+  [identity.extra]
+recovery = "fixture-secret-recovery"
+
+[wsl2]
+networking_mode = "NAT"
+'@
+            $layers = @(Invoke-Build 'Get-MiosLanExposureLayers')
+            @($layers | ForEach-Object { $_.Path }) | Should -Be @('C:\Users\op\.config\mios\mios.toml', 'C:\usr\share\mios\mios.toml')
+            $all = ($layers | ForEach-Object { $_.Text }) -join "`n"
+            $all | Should -Not -Match 'secret|username|fixture-inbound|\[identity|\[auth\]|\[\['
+            $layers[0].Text | Should -Match '(?m)^expose = \["forge_http"\]$'
+            $layers[0].Text | Should -Match '(?m)^networking_mode = "NAT"$'
+            $layers[1].Text | Should -Match '(?m)^\[ports\]$'
+            $layers[1].Text | Should -Not -Match '(?m)^\[(firewall|bootstrap\.dev_vm|ports\.categories\.edge)\]$'
+            foreach ($l in $layers) { Invoke-Build 'Test-MiosLanExposureLayerText' @{ Text = $l.Text } | Should -BeTrue }
+        }
+
+        It 'the elevated request refuses other sections, other fields and addresses outside the WSL network' {
+            $layer = { param($t) [pscustomobject]@{ Path = 'C:\usr\share\mios\mios.toml'; Text = $t } }
+            $ok = "[firewall.windows]`nexpose = [""forge_http""]"
+            $bad = @(
+                [pscustomobject]@{ Layers = @(& $layer "[identity]`npassword_hash = ""x"""); WslAddress = '172.24.170.9' },
+                [pscustomobject]@{ Layers = @(& $layer "[[wsl2.inbound]]`nname = ""x"""); WslAddress = '172.24.170.9' },
+                [pscustomobject]@{ Layers = @(& $layer $ok); WslAddress = '8.8.8.8' },
+                [pscustomobject]@{ Layers = @(& $layer $ok); WslAddress = '172.24.160.1' },
+                [pscustomobject]@{ Layers = @(& $layer $ok); WslAddress = '172.24.170.9'; Extra = 1 },
+                [pscustomobject]@{ Layers = @([pscustomobject]@{ Path = 'C:\usr\share\mios\mios.toml'; Text = $ok; Extra = 1 }); WslAddress = '' }
+            )
+            foreach ($r in $bad) { { Invoke-Build 'Invoke-MiosLanExposureRequest' @{ Request = $r } } | Should -Throw }
+            $global:FwFixture.HostRules.Count | Should -Be 0
+            @($global:FwFixture.Netsh | Where-Object { $_ -match ' (add|delete) ' }).Count | Should -Be 0
+            Invoke-Build 'Invoke-MiosLanExposureRequest' @{ Request = [pscustomobject]@{ Layers = @(& $layer $ok); WslAddress = '172.24.170.9' } }
+            @($global:FwFixture.HostRules.Keys | Sort-Object) | Should -Be @('MiOS - forge_http (8400/tcp)', 'MiOS - llm_light (8500/tcp)')
+            $global:FwFixture.Proxy['8400'] | Should -Be '172.24.170.9'
+            # The worker forwards to the address it was handed and never asks WSL itself.
+            $global:FwFixture.Probes.Count | Should -Be 0
+        }
+
+        It 'serializes the worker reply with and without log lines' {
+            $lines = New-Object System.Collections.Generic.List[object]
+            $empty = Invoke-Build 'ConvertTo-MiosLanExposureReply' @{ Status = 'applied'; Lines = $lines } | ConvertFrom-Json
+            $empty.Status | Should -Be 'applied'
+            @($empty.Lines).Count | Should -Be 0
+            $lines.Add([pscustomobject]@{ L = 'OK'; M = 'created' })
+            $lines.Add([pscustomobject]@{ L = 'WARN'; M = 'a "quoted" warning' })
+            $err = Invoke-Build 'ConvertTo-MiosLanExposureReply' @{ Status = 'error'; Detail = 'stopped'; Lines = $lines } | ConvertFrom-Json
+            $err.Status | Should -Be 'error'
+            $err.Detail | Should -Be 'stopped'
+            @($err.Lines | ForEach-Object { "$($_.L) $($_.M)" }) | Should -Be @('OK created', 'WARN a "quoted" warning')
+        }
+
+        It 'compiles the elevated worker from the fixed functions alone' {
+            $source = [IO.File]::ReadAllText((Join-Path $global:WslRepoRoot 'build-mios.ps1'))
+            $worker = Invoke-Build 'Get-MiosLanExposureWorkerScript' @{ Source = $source }
+            $tokens = $null; $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseInput($worker, [ref]$tokens, [ref]$errors)
+            $errors.Count | Should -Be 0
+            $top = @($ast.EndBlock.Statements)
+            $other = @($top | Where-Object { $_ -isnot [Management.Automation.Language.FunctionDefinitionAst] -and $_ -isnot [Management.Automation.Language.AssignmentStatementAst] })
+            @($other | ForEach-Object { $_.Extent.Text }) | Should -Be @('Invoke-MiosLanExposureWorker -PipeName $PipeName -OriginProcessId $OriginProcessId')
+            $defined = @($top | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] } | ForEach-Object { $_.Name })
+            foreach ($n in 'Set-MiosLanFirewallRules', 'Set-MiosLanPortProxy', 'Invoke-MiosLanExposureRequest', 'Invoke-MiosLanExposureWorker', 'Test-MiosWslNatAddress') { $defined | Should -Contain $n }
+            foreach ($n in 'Invoke-MiosLanExposure', 'Invoke-MiosElevatedLanExposure', 'Get-MiosLanExposureLayers', 'Start-Phase', 'Ensure-MiosBuilder') { $defined | Should -Not -Contain $n }
+            { Invoke-Build 'Get-MiosLanExposureWorkerScript' @{ Source = $source.Replace('function Test-MiosWslNatAddress {', 'function Test-MiosWslNatAddressGone {') } } | Should -Throw
+        }
+    }
+
     Describe 'SSOT readers' {
         BeforeEach { Reset-FwFixture }
 
@@ -755,6 +946,12 @@ $plants = [ordered]@{
     'portproxy-distro' = 'asks the registered builder distribution for the portproxy VM address'
     'devvm-fw-literal' = 'opens the dev VM firewalld ports from [ports] alone, leaving out a key with no port by name'
     'owui-port-override' = 'leaves every service on its SSOT port in the dev host-network drop-ins'
+    'elevate-unconditionally' = 'elevates only when the host differs from the plan, with the VM address the operator resolved'
+    'drift-mask' = 'reads mask-form scopes and reordered profiles back without drift'
+    'projection-all-sections' = 'sends only [firewall.windows], [wsl2] and [ports] across the privilege boundary'
+    'request-any-layer' = 'the elevated request refuses other sections, other fields and addresses outside the WSL network'
+    'request-any-address' = 'the elevated request refuses other sections, other fields and addresses outside the WSL network'
+    'reply-list' = 'serializes the worker reply with and without log lines'
 }
 $bad = 0
 foreach ($plant in $plants.Keys) {

@@ -1,4 +1,4 @@
-# AI-hint: Pester fixture (run under pwsh on Linux or Windows) for MiOS-DEV's Windows-host networking: the WSL Hyper-V service-port rules in Get-MiOS.ps1, the .wslconfig networkingMode/firewall/hostAddressLoopback rendered by every writer, the Windows Defender rules and portproxy in build-mios.ps1, all from mios.toml [firewall.windows] and [wsl2], and the dev VM's own firewalld ports and host-network drop-ins in build-mios.ps1's overlay. -PlantDefect plants each named defect into the extracted source and requires its named test to fail.
+# AI-hint: Pester fixture (run under pwsh on Linux or Windows) for MiOS-DEV's Windows-host networking: the WSL Hyper-V service-port rules in Get-MiOS.ps1, the .wslconfig networkingMode/firewall/hostAddressLoopback rendered by every writer, the Windows Defender rules, portproxy and portproxy refresh task in build-mios.ps1, all from mios.toml [firewall.windows] and [wsl2], and the dev VM's own firewalld ports and host-network drop-ins in build-mios.ps1's overlay. -PlantDefect plants each named defect into the extracted source and requires its named test to fail.
 # AI-related: Get-MiOS.ps1, build-mios.ps1, /usr/share/mios/mios.toml, [firewall.windows], [wsl2], [ports]
 # AI-functions: Invoke-Suite
 
@@ -17,6 +17,8 @@ $suite = {
         # On Windows the NetSecurity commands are functions, so a mid-suite auto-load (any Get-Command of one of them)
         # imports them into the global scope over the firewall stubs below. Load it first; the stubs then stay in front.
         if (Get-Module -ListAvailable -Name NetSecurity) { Import-Module NetSecurity -ErrorAction Stop }
+        # ScheduledTasks is the same kind of module, for the portproxy refresh task stubs.
+        if (Get-Module -ListAvailable -Name ScheduledTasks) { Import-Module ScheduledTasks -ErrorAction Stop }
         $global:WslCreator = '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}'
         $global:WslRepoRoot = $RepoRoot
 
@@ -97,6 +99,36 @@ $suite = {
             'reply-list'        = @{ File = 'build-mios.ps1'
                                      From = 'Lines = @(if ($null -ne $Lines) { $Lines.ToArray() })'
                                      To   = 'Lines = @($Lines)' }
+            'refresh-any-port'  = @{ File = 'build-mios.ps1'
+                                     From = 'if (-not $wanted.ContainsKey($listen) -or $connect -ne $listen'
+                                     To   = 'if ($connect -ne $listen' }
+            'refresh-adds'      = @{ File = 'build-mios.ps1'
+                                     From = '$changed = @(); $failed = @()'
+                                     To   = '$changed = @(); $failed = @(); foreach ($k in @($wanted.Keys)) { $null = & $Netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=$k connectaddress=$ip connectport=$k }' }
+            'refresh-loopback'  = @{ File = 'build-mios.ps1'
+                                     From = " -or `$target -like '127.*') { continue }"
+                                     To   = ') { continue }' }
+            'refresh-unbounded' = @{ File = 'build-mios.ps1'
+                                     From = 'if (-not (Test-MiosWslNatAddress $ip)) {'
+                                     To   = 'if ($false) {' }
+            'refresh-principal' = @{ File = 'build-mios.ps1'
+                                     From = "New-ScheduledTaskPrincipal -UserId 'S-1-5-18'"
+                                     To   = 'New-ScheduledTaskPrincipal -UserId $OperatorSid' }
+            'refresh-no-read-grant' = @{ File = 'build-mios.ps1'
+                                     From = '(A;;FR;;;$OperatorSid)'
+                                     To   = '' }
+            'refresh-bound-missing' = @{ File = 'build-mios.ps1'
+                                     From = "@('ConvertTo-MiosNetworkPrefix', 'Test-MiosPrefixWithin', 'Test-MiosWslNatAddress', 'Update-MiosLanPortProxyTarget')"
+                                     To   = "@('Update-MiosLanPortProxyTarget')" }
+            'refresh-drift-register' = @{ File = 'build-mios.ps1'
+                                     From = "`$drift.Add('register the portproxy refresh task')"
+                                     To   = "`$null = 'register the portproxy refresh task'" }
+            'refresh-drift-remove' = @{ File = 'build-mios.ps1'
+                                     From = "} elseif (`$task) { `$drift.Add('remove the portproxy refresh task') }"
+                                     To   = '}' }
+            'refresh-worker-skips' = @{ File = 'build-mios.ps1'
+                                     From = 'try { Register-MiosLanPortProxyRefresh -OperatorSid $OperatorSid } catch'
+                                     To   = 'try { } catch' }
         }
         if ($Plant -and -not $plants.ContainsKey($Plant)) { throw "Unknown plant '$Plant'." }
 
@@ -159,10 +191,14 @@ $suite = {
             'Set-MiosWslConfig', 'Get-MiosLanExposurePlan', 'Set-MiosLanFirewallRules', 'Set-MiosLanPortProxy',
             'Resolve-MiosWslVmAddress', 'Get-MiosVendorPortSet', 'ConvertTo-MiosCanonicalPrefix', 'Get-MiosLanExposureDrift',
             'Get-MiosLanExposureLayers', 'Test-MiosLanExposureLayerText', 'Test-MiosWslNatAddress', 'Invoke-MiosLanExposureRequest',
-            'Get-MiosLanExposureWorkerScript', 'Invoke-MiosLanExposure', 'ConvertTo-MiosLanExposureReply')
+            'Get-MiosLanExposureWorkerScript', 'Invoke-MiosLanExposure', 'ConvertTo-MiosLanExposureReply',
+            'Update-MiosLanPortProxyTarget', 'Get-MiosLanPortProxyRefreshTask', 'Register-MiosLanPortProxyRefresh')
         $buildText = Get-FixtureSource -File 'build-mios.ps1' -Names $buildNames -Plant $Plant -Plants $plants -Root $RepoRoot
         # Invoke-MiosElevatedLanExposure is never lifted: it starts a UAC worker. Its stub records each hand-off instead.
+        # Get-MiosTokenSid is the fixture account, so the refresh task resolves alike on Windows and Linux.
+        $global:FixtureSid = 'S-1-5-21-1000-2000-3000-1001'
         $global:BuildMios = New-Module -Name 'MiosBuildFixture' -ScriptBlock ([scriptblock]::Create(@'
+function Get-MiosTokenSid { $global:FixtureSid }
 function Get-MiosTomlValue { param($Section, $Key, $Default, [switch]$VendorOnly, $SourcePath)
     if ($SourcePath) { return (& $global:GetMiosTomlValue -Section $Section -Key $Key -Default $Default -VendorOnly) }
     & $global:GetMiosTomlValue -Section $Section -Key $Key -Default $Default }
@@ -307,8 +343,46 @@ minimum_cpus = 4
             $line = $args -join ' '; $global:FwFixture.Netsh.Add($line); $global:LASTEXITCODE = 0
             if ($line -match 'portproxy show v4tov4') { return @($global:FwFixture.Proxy.Keys | ForEach-Object { "0.0.0.0         $_         $($global:FwFixture.Proxy[$_])  $_" }) }
             if ($line -match 'portproxy delete v4tov4 listenaddress=0\.0\.0\.0 listenport=([0-9]+)') { $global:FwFixture.Proxy.Remove($Matches[1]) }
-            if ($line -match 'portproxy add v4tov4 listenaddress=0\.0\.0\.0 listenport=([0-9]+) connectaddress=(\S+)') { $global:FwFixture.Proxy[$Matches[1]] = $Matches[2] }
+            if ($line -match 'portproxy (add|set) v4tov4 listenaddress=0\.0\.0\.0 listenport=([0-9]+) connectaddress=(\S+)') { $global:FwFixture.Proxy[$Matches[2]] = $Matches[3] }
         }
+        # The scheduled task store. Like Windows, Get-ScheduledTask shows a standard account only a task whose security
+        # descriptor grants it read access, and reads the SYSTEM principal back by name.
+        function global:New-ScheduledTaskAction { [CmdletBinding()]param($Execute, $Argument) [pscustomobject]@{ Execute = [string]$Execute; Arguments = [string]$Argument } }
+        function global:New-ScheduledTaskTrigger { [CmdletBinding()]param([switch]$Once, $At, $RepetitionInterval) [pscustomobject]@{ Interval = $RepetitionInterval } }
+        function global:New-ScheduledTaskPrincipal { [CmdletBinding()]param($UserId, $LogonType, $RunLevel) [pscustomobject]@{ UserId = [string]$UserId; LogonType = [string]$LogonType; RunLevel = [string]$RunLevel } }
+        function global:New-ScheduledTaskSettingsSet {
+            [CmdletBinding()]param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [switch]$StartWhenAvailable, $MultipleInstances, $ExecutionTimeLimit)
+            [pscustomobject]@{ ExecutionTimeLimit = $ExecutionTimeLimit }
+        }
+        function global:New-ScheduledTask {
+            [CmdletBinding()]param($Action, $Trigger, $Principal, $Settings, $Description)
+            [pscustomobject]@{ Actions = @($Action); Triggers = @($Trigger); Principal = $Principal; Settings = $Settings; Description = [string]$Description; SecurityDescriptor = '' }
+        }
+        function global:Register-ScheduledTask {
+            [CmdletBinding()]param($TaskPath, $TaskName, $InputObject, [switch]$Force)
+            $user = [string]$InputObject.Principal.UserId
+            if ($user -eq 'S-1-5-18') { $user = 'SYSTEM' }
+            $global:FwFixture.TaskCalls.Add("Register $TaskPath$TaskName")
+            $global:FwFixture.Tasks["$TaskPath$TaskName"] = [pscustomobject]@{ TaskPath = $TaskPath; TaskName = $TaskName; Actions = @($InputObject.Actions)
+                Triggers = @($InputObject.Triggers); Principal = [pscustomobject]@{ UserId = $user; RunLevel = $InputObject.Principal.RunLevel }
+                SecurityDescriptor = [string]$InputObject.SecurityDescriptor; Description = $InputObject.Description }
+        }
+        function global:Get-ScheduledTask {
+            [CmdletBinding()]param($TaskPath, $TaskName)
+            $t = $global:FwFixture.Tasks["$TaskPath$TaskName"]
+            if ($t -and $t.SecurityDescriptor -match ('\(A;;F[AR];;;' + [regex]::Escape($global:FixtureSid) + '\)')) { $t }
+        }
+        function global:Unregister-ScheduledTask {
+            [CmdletBinding()]param($TaskPath, $TaskName, [switch]$Confirm)
+            $global:FwFixture.TaskCalls.Add("Unregister $TaskPath$TaskName")
+            [void]$global:FwFixture.Tasks.Remove("$TaskPath$TaskName")
+        }
+        # The registry value WSL writes for the fixture account; Update-MiosLanPortProxyTarget reads it through -Read.
+        $global:RefreshRead = { param($Key, $Name) if ($Name -eq 'NatIpAddress' -and $Key -like "Registry::HKEY_USERS\$global:FixtureSid\*") { $global:FwFixture.NatIp } }
+        function global:Invoke-Refresh([int[]]$Ports = @(8400, 8500)) {
+            Invoke-Build 'Update-MiosLanPortProxyTarget' @{ Ports = $Ports; OperatorSid = $global:FixtureSid; Netsh = 'netsh'; Read = $global:RefreshRead }
+        }
+        function global:Get-RefreshTask { $global:FwFixture.Tasks['\MiOS\MiOS-DEV-PortProxy-Refresh'] }
         # The registered distributions are the fixture's: --list answers them, and -d of any other name fails like WSL.
         function global:wsl.exe {
             $a = @($args | ForEach-Object { [string]$_ })
@@ -328,7 +402,8 @@ minimum_cpus = 4
                 PolicySets = New-Object System.Collections.Generic.List[string]; Calls = New-Object System.Collections.Generic.List[string]
                 Netsh = New-Object System.Collections.Generic.List[string]; Log = New-Object System.Collections.Generic.List[string]; Proxy = @{}
                 Distros = @('podman-MiOS-DEV'); Probes = New-Object System.Collections.Generic.List[string]
-                Elevations = New-Object System.Collections.Generic.List[string] }
+                Elevations = New-Object System.Collections.Generic.List[string]
+                Tasks = @{}; TaskCalls = New-Object System.Collections.Generic.List[string]; NatIp = '172.24.170.9' }
         }
         function global:New-HostRule([string]$Name, [string]$Port) {
             [pscustomobject]@{ DisplayName = $Name; Port = $Port; Profile = 'Private,Domain'; Action = 'Allow'; Enabled = 'True'
@@ -732,6 +807,7 @@ minimum_cpus = 4
         It 'measures no drift once the host matches the plan, and one line per difference' {
             Invoke-Build 'Set-MiosLanFirewallRules'
             Invoke-Build 'Set-MiosLanPortProxy'
+            Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = $global:FixtureSid }
             @(Invoke-Build 'Get-MiosLanExposureDrift' @{ WslAddress = '172.24.170.9' }) | Should -BeNullOrEmpty
             [void]$global:FwFixture.HostRules.Remove('MiOS - llm_light (8500/tcp)')
             $global:FwFixture.HostRules['MiOS - stale (8999/tcp)'] = New-HostRule 'MiOS - stale (8999/tcp)' '8999'
@@ -750,6 +826,7 @@ minimum_cpus = 4
         It 'reads mask-form scopes and reordered profiles back without drift' {
             Invoke-Build 'Set-MiosLanFirewallRules'
             Invoke-Build 'Set-MiosLanPortProxy'
+            Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = $global:FixtureSid }
             foreach ($r in @($global:FwFixture.HostRules.Values)) {
                 $r.RemoteAddress = @('fd7a:115c:a1e0::/48', 'LocalSubnet', '100.64.0.0/255.192.0.0')
                 $r.Profile = 'Domain, Private'
@@ -762,8 +839,10 @@ minimum_cpus = 4
             @($global:FwFixture.Elevations) | Should -Be @('172.24.170.9')
             $global:FwFixture.HostRules.Count | Should -Be 0
             @($global:FwFixture.Netsh | Where-Object { $_ -match ' (add|delete) ' }).Count | Should -Be 0
+            $global:FwFixture.Tasks.Count | Should -Be 0
             Invoke-Build 'Set-MiosLanFirewallRules'
             Invoke-Build 'Set-MiosLanPortProxy'
+            Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = $global:FixtureSid }
             $global:FwFixture.Elevations.Clear()
             Invoke-Build 'Invoke-MiosLanExposure'
             $global:FwFixture.Elevations.Count | Should -Be 0
@@ -857,9 +936,140 @@ networking_mode = "NAT"
             $other = @($top | Where-Object { $_ -isnot [Management.Automation.Language.FunctionDefinitionAst] -and $_ -isnot [Management.Automation.Language.AssignmentStatementAst] })
             @($other | ForEach-Object { $_.Extent.Text }) | Should -Be @('Invoke-MiosLanExposureWorker -PipeName $PipeName -OriginProcessId $OriginProcessId')
             $defined = @($top | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] } | ForEach-Object { $_.Name })
-            foreach ($n in 'Set-MiosLanFirewallRules', 'Set-MiosLanPortProxy', 'Invoke-MiosLanExposureRequest', 'Invoke-MiosLanExposureWorker', 'Test-MiosWslNatAddress') { $defined | Should -Contain $n }
-            foreach ($n in 'Invoke-MiosLanExposure', 'Invoke-MiosElevatedLanExposure', 'Get-MiosLanExposureLayers', 'Start-Phase', 'Ensure-MiosBuilder') { $defined | Should -Not -Contain $n }
+            foreach ($n in 'Set-MiosLanFirewallRules', 'Set-MiosLanPortProxy', 'Invoke-MiosLanExposureRequest', 'Invoke-MiosLanExposureWorker', 'Test-MiosWslNatAddress',
+                'Update-MiosLanPortProxyTarget', 'Get-MiosLanPortProxyRefreshTask', 'Register-MiosLanPortProxyRefresh') { $defined | Should -Contain $n }
+            foreach ($n in 'Invoke-MiosLanExposure', 'Invoke-MiosElevatedLanExposure', 'Get-MiosLanExposureLayers', 'Start-Phase', 'Ensure-MiosBuilder', 'Get-MiosTokenSid') { $defined | Should -Not -Contain $n }
             { Invoke-Build 'Get-MiosLanExposureWorkerScript' @{ Source = $source.Replace('function Test-MiosWslNatAddress {', 'function Test-MiosWslNatAddressGone {') } } | Should -Throw
+        }
+    }
+
+    Describe 'The portproxy refresh task keeps the forwards on the VM address between builds' {
+        BeforeAll {
+            # Mirrored networking needs Windows 11; the resolver is pinned so these cases run on any host.
+            function global:Invoke-Mirrored([scriptblock]$Body) {
+                $saved = & $global:BuildMios { ${function:script:Resolve-MiosWslNetworkingMode} }
+                & $global:BuildMios { Set-Item function:script:Resolve-MiosWslNetworkingMode { param([int]$WindowsBuild) 'mirrored' } }
+                try { & $Body } finally { & $global:BuildMios { param($f) Set-Item function:script:Resolve-MiosWslNetworkingMode $f } $saved }
+            }
+        }
+        BeforeEach { Reset-FwFixture }
+
+        It 're-points the forwarded ports to the VM address WSL records and leaves every other forward alone' {
+            foreach ($p in '8400', '8500', '8600', '9999') { $global:FwFixture.Proxy[$p] = '172.24.170.9' }
+            $global:FwFixture.NatIp = '172.24.171.20'
+            $r = Invoke-Refresh
+            $r.Status | Should -Be 'retargeted'
+            $global:FwFixture.Proxy['8400'] | Should -Be '172.24.171.20'
+            $global:FwFixture.Proxy['8500'] | Should -Be '172.24.171.20'
+            $global:FwFixture.Proxy['8600'] | Should -Be '172.24.170.9'
+            $global:FwFixture.Proxy['9999'] | Should -Be '172.24.170.9'
+            @($global:FwFixture.Netsh | Where-Object { $_ -match ' (add|delete) ' }).Count | Should -Be 0
+            (Invoke-Refresh).Status | Should -Be 'current'
+        }
+
+        It 'never adds a forward and leaves loopback targets to the localhost relays' {
+            $global:FwFixture.Proxy['8400'] = '127.0.0.1'
+            $global:FwFixture.NatIp = '172.24.171.20'
+            (Invoke-Refresh).Status | Should -Be 'current'
+            @($global:FwFixture.Proxy.Keys) | Should -Be @('8400')
+            $global:FwFixture.Proxy['8400'] | Should -Be '127.0.0.1'
+            @($global:FwFixture.Netsh | Where-Object { $_ -match ' (add|set|delete) ' }).Count | Should -Be 0
+        }
+
+        It 'takes only a guest address on the host WSL network from the registry' {
+            $global:FwFixture.Proxy['8400'] = '172.24.170.9'
+            foreach ($bad in '192.168.1.50', '172.24.160.1', '8.8.8.8', '999.1.1.1', '172.24.171.20 connectport=22') {
+                $global:FwFixture.NatIp = $bad
+                (Invoke-Refresh).Status | Should -Be 'refused' -Because "'$bad' is not a guest address on the WSL network"
+            }
+            $global:FwFixture.NatIp = ''
+            (Invoke-Refresh).Status | Should -Be 'no-address'
+            $global:FwFixture.Proxy['8400'] | Should -Be '172.24.170.9'
+            @($global:FwFixture.Netsh | Where-Object { $_ -match ' set ' }).Count | Should -Be 0
+        }
+
+        It 'registers a SYSTEM task carrying the address bound, the plan ports and the account, readable by that account' {
+            Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = $global:FixtureSid }
+            $t = Get-RefreshTask
+            $t | Should -Not -BeNullOrEmpty
+            $t.Principal.UserId | Should -Be 'SYSTEM'
+            $t.Triggers[0].Interval | Should -Be (New-TimeSpan -Minutes 5)
+            @($t.Actions).Count | Should -Be 1
+            $t.Actions[0].Execute | Should -Match 'WindowsPowerShell\\v1\.0\\powershell\.exe$'
+            $t.SecurityDescriptor | Should -Be "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;$global:FixtureSid)"
+            $encoded = [regex]::Match($t.Actions[0].Arguments, '-EncodedCommand (\S+)$').Groups[1].Value
+            $script = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))
+            $tokens = $null; $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseInput($script, [ref]$tokens, [ref]$errors)
+            $errors.Count | Should -Be 0
+            $defs = @($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] })
+            @($defs | ForEach-Object Name) | Should -Be @('ConvertTo-MiosNetworkPrefix', 'Test-MiosPrefixWithin', 'Test-MiosWslNatAddress', 'Update-MiosLanPortProxyTarget')
+            $script | Should -Match ([regex]::Escape("Update-MiosLanPortProxyTarget -Ports @(8400,8500) -OperatorSid '$global:FixtureSid'"))
+            # The embedded body works with nothing but the task's own functions.
+            $global:FwFixture.Proxy['8400'] = '172.24.170.9'; $global:FwFixture.NatIp = '172.24.171.20'
+            $code = ($defs | ForEach-Object { $_.Extent.Text }) -join "`n"
+            $r = & { param($c, $read)
+                . ([scriptblock]::Create($c))
+                Update-MiosLanPortProxyTarget -Ports 8400 -OperatorSid $global:FixtureSid -Netsh 'netsh' -Read $read } $code $global:RefreshRead
+            $r.Status | Should -Be 'retargeted'
+            $global:FwFixture.Proxy['8400'] | Should -Be '172.24.171.20'
+        }
+
+        It 'removes the task when nothing is forwarded and refuses a value that is not an account SID' {
+            Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = $global:FixtureSid }
+            Invoke-Mirrored { Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = $global:FixtureSid } }
+            $global:FwFixture.Tasks.Count | Should -Be 0
+            Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = $global:FixtureSid }
+            $global:FwFixture.Vendor = $global:WslVendorBase.Replace('expose           = ["forge_http", "llm_light"]', 'expose           = []')
+            Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = $global:FixtureSid }
+            $global:FwFixture.Tasks.Count | Should -Be 0
+            $global:FwFixture.Vendor = $global:WslVendorBase
+            foreach ($bad in 'S-1-5-18', 'S-1-5-32-544', "S-1-5-21-1-2-3-4')(A;;FA;;;WD") {
+                { Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = $bad } } | Should -Throw
+            }
+            $global:FwFixture.Tasks.Count | Should -Be 0
+        }
+
+        It 'asks for the refresh task when it is missing or differs, and for its removal under mirrored networking' {
+            Invoke-Build 'Set-MiosLanFirewallRules'
+            Invoke-Build 'Set-MiosLanPortProxy'
+            $drift = { @(Invoke-Build 'Get-MiosLanExposureDrift' @{ WslAddress = '172.24.170.9' }) }
+            @(& $drift) | Should -Be @('register the portproxy refresh task') -Because 'no task is registered'
+            Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = $global:FixtureSid }
+            @(& $drift) | Should -BeNullOrEmpty
+            # Different ports: the task a build with a narrower expose list writes.
+            $global:FwFixture.Vendor = $global:WslVendorBase.Replace('expose           = ["forge_http", "llm_light"]', 'expose           = ["forge_http"]')
+            $narrow = Invoke-Build 'Get-MiosLanPortProxyRefreshTask' @{ OperatorSid = $global:FixtureSid }
+            $global:FwFixture.Vendor = $global:WslVendorBase
+            (Get-RefreshTask).Actions[0].Arguments = $narrow.Argument
+            @(& $drift) | Should -Be @('register the portproxy refresh task') -Because 'the task forwards other ports'
+            # Another account's task cannot be read here, so it is registered for this account.
+            Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = 'S-1-5-21-1000-2000-3000-1002' }
+            @(& $drift) | Should -Be @('register the portproxy refresh task') -Because 'the task serves another account'
+            Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = $global:FixtureSid }
+            (Get-RefreshTask).Principal.UserId = 'MIOS\user'
+            @(& $drift) | Should -Be @('register the portproxy refresh task') -Because 'the task does not run as SYSTEM'
+            Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = $global:FixtureSid }
+            Invoke-Mirrored { @(& $drift) | Should -Be @('remove the portproxy refresh task') -Because 'nothing is forwarded under mirrored networking' }
+            # Under mirrored networking, no task and a task this token cannot read are both no drift.
+            $global:FwFixture.Tasks.Clear()
+            Invoke-Mirrored { @(& $drift) | Should -BeNullOrEmpty }
+            Invoke-Build 'Register-MiosLanPortProxyRefresh' @{ OperatorSid = 'S-1-5-21-1000-2000-3000-1002' }
+            Invoke-Mirrored { @(& $drift) | Should -BeNullOrEmpty }
+        }
+
+        It 'the elevated request registers the task for the origin account it is handed, and the in-place path for this token' {
+            $request = [pscustomobject]@{ Layers = @(Invoke-Build 'Get-MiosLanExposureLayers'); WslAddress = '172.24.170.9' }
+            Invoke-Build 'Invoke-MiosLanExposureRequest' @{ Request = $request }
+            $global:FwFixture.Tasks.Count | Should -Be 0
+            ($global:FwFixture.Log -join "`n") | Should -Match 'originating account is unknown'
+            Invoke-Build 'Invoke-MiosLanExposureRequest' @{ Request = $request; OperatorSid = 'S-1-5-21-1000-2000-3000-1002' }
+            (Get-RefreshTask).SecurityDescriptor | Should -Match ([regex]::Escape('(A;;FR;;;S-1-5-21-1000-2000-3000-1002)'))
+            $global:FwFixture.Tasks.Clear()
+            & $global:BuildMios { $script:IsAdmin = $true }
+            try { Invoke-Build 'Invoke-MiosLanExposure' } finally { & $global:BuildMios { $script:IsAdmin = $false } }
+            $global:FwFixture.Elevations.Count | Should -Be 0
+            (Get-RefreshTask).SecurityDescriptor | Should -Match ([regex]::Escape("(A;;FR;;;$global:FixtureSid)"))
         }
     }
 
@@ -952,6 +1162,16 @@ $plants = [ordered]@{
     'request-any-layer' = 'the elevated request refuses other sections, other fields and addresses outside the WSL network'
     'request-any-address' = 'the elevated request refuses other sections, other fields and addresses outside the WSL network'
     'reply-list' = 'serializes the worker reply with and without log lines'
+    'refresh-any-port' = 're-points the forwarded ports to the VM address WSL records and leaves every other forward alone'
+    'refresh-adds' = 'never adds a forward and leaves loopback targets to the localhost relays'
+    'refresh-loopback' = 'never adds a forward and leaves loopback targets to the localhost relays'
+    'refresh-unbounded' = 'takes only a guest address on the host WSL network from the registry'
+    'refresh-principal' = 'registers a SYSTEM task carrying the address bound, the plan ports and the account, readable by that account'
+    'refresh-no-read-grant' = 'registers a SYSTEM task carrying the address bound, the plan ports and the account, readable by that account'
+    'refresh-bound-missing' = 'registers a SYSTEM task carrying the address bound, the plan ports and the account, readable by that account'
+    'refresh-drift-register' = 'asks for the refresh task when it is missing or differs, and for its removal under mirrored networking'
+    'refresh-drift-remove' = 'asks for the refresh task when it is missing or differs, and for its removal under mirrored networking'
+    'refresh-worker-skips' = 'the elevated request registers the task for the origin account it is handed, and the in-place path for this token'
 }
 $bad = 0
 foreach ($plant in $plants.Keys) {

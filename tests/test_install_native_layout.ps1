@@ -46,7 +46,7 @@ function Invoke-Child([string]$Engine, [string[]]$Arguments, [hashtable]$Env = @
     $psi.Arguments = (($Arguments | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
     foreach ($k in $Env.Keys) { $psi.EnvironmentVariables[$k] = [string]$Env[$k] }
-    foreach ($k in @('MIOS_HUB_ACTIVE', 'MIOS_SKIP_MOTD', 'MIOS_NATIVE_BIN')) { if (-not $Env.ContainsKey($k) -and $psi.EnvironmentVariables.ContainsKey($k)) { $psi.EnvironmentVariables.Remove($k) } }
+    foreach ($k in @('MiosHubActive', 'MIOS_SKIP_MOTD', 'MIOS_NATIVE_BIN')) { if (-not $Env.ContainsKey($k) -and $psi.EnvironmentVariables.ContainsKey($k)) { $psi.EnvironmentVariables.Remove($k) } }
     $p = [Diagnostics.Process]::Start($psi)
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
     $done = $p.WaitForExit($TimeoutMs)
@@ -360,7 +360,7 @@ try {
         @{ Name = 'the hub resolves mios to itself'; Expected = 'mios.ps1 runs a verb in one hop (no body, a broken body, a body''s mios function, or through PATH) and never dispatches to itself'
            File = 'Build'; Edits = @(, @('$dispatcher = Get-Command mios -CommandType Function -ErrorAction SilentlyContinue', '$dispatcher = Get-Command mios -ErrorAction SilentlyContinue')) },
         @{ Name = 'the hub re-entry guard removed'; Expected = 'a verb the native entry hands back to mios.ps1 ends in one refusal, not a loop'
-           File = 'Build'; Edits = @(, @('if ($env:MIOS_HUB_ACTIVE) {', 'if ($false) {')) },
+           File = 'Build'; Edits = @(, @('if ($env:MiosHubActive) {', 'if ($false) {')) },
         @{ Name = 'the hub opens the host terminal while dispatching'; Expected = 'loading the profile body to dispatch a verb does not start the interactive host terminal'
            File = 'Build'; Edits = @(, @("    `$env:MIOS_SKIP_MOTD = '1'`n    try { . `$_miosProfile }", "    try { . `$_miosProfile }")) },
         @{ Name = 'the client setup called without -Scope User'; Expected = 'a per-user install calls the client setup with -Scope User, its bin and its body, and refuses a setup without -Scope'

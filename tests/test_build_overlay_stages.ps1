@@ -125,14 +125,14 @@ function Invoke-Checks([string]$Build) {
         $sent = Join-Path $scratch 'sentinel'; $mark = Join-Path $scratch 'stage1-marker'
         $gateRun = "set -uo pipefail`n" + $gate.Replace('/var/lib/mios/.quadlet-overlay-seeded', (Fwd $sent)).Replace('/run/mios/quadlet-stage1', (Fwd $mark)) + "`necho PROCEEDED`n"
         Write-Lf $mark "marker`n"; Remove-Item -LiteralPath $sent -Force -ErrorAction SilentlyContinue
-        $a = Invoke-Bash $gateRun @((Fwd $srcDir)) @{ MIOS_OVERLAY_STAGE = 'realize' }
+        $a = Invoke-Bash $gateRun @((Fwd $srcDir)) @{ mios_overlay_stage = 'realize' }
         Write-Lf $sent "old`n"; (Get-Item -LiteralPath $sent).LastWriteTime = (Get-Date).AddDays(-2)
-        $b = Invoke-Bash $gateRun @((Fwd $srcDir)) @{ MIOS_OVERLAY_STAGE = 'realize' }
-        $c = Invoke-Bash $gateRun @((Fwd $srcDir)) @{ MIOS_OVERLAY_STAGE = 'checkout' }
+        $b = Invoke-Bash $gateRun @((Fwd $srcDir)) @{ mios_overlay_stage = 'realize' }
+        $c = Invoke-Bash $gateRun @((Fwd $srcDir)) @{ mios_overlay_stage = 'checkout' }
         (Get-Item -LiteralPath $sent).LastWriteTime = (Get-Date).AddDays(2)
-        $d = Invoke-Bash $gateRun @((Fwd $srcDir)) @{ MIOS_OVERLAY_STAGE = 'realize' }
-        $e = Invoke-Bash $gateRun @((Fwd $srcDir)) @{ MIOS_OVERLAY_STAGE = 'checkout' }
-        $f = Invoke-Bash $gateRun @((Fwd $srcDir)) @{ MIOS_OVERLAY_STAGE = 'bogus' }
+        $d = Invoke-Bash $gateRun @((Fwd $srcDir)) @{ mios_overlay_stage = 'realize' }
+        $e = Invoke-Bash $gateRun @((Fwd $srcDir)) @{ mios_overlay_stage = 'checkout' }
+        $f = Invoke-Bash $gateRun @((Fwd $srcDir)) @{ mios_overlay_stage = 'bogus' }
         $gateOk = $a.Rc -eq 0 -and $a.Text -match 'PROCEEDED' -and $b.Text -match 'PROCEEDED' -and $c.Text -match 'PROCEEDED' -and
                   $d.Rc -eq 0 -and $d.Text -notmatch 'PROCEEDED' -and $e.Rc -eq 0 -and $e.Text -notmatch 'PROCEEDED' -and $f.Rc -eq 2 -and $f.Text -notmatch 'PROCEEDED'
     }
@@ -204,7 +204,7 @@ function Invoke-Checks([string]$Build) {
     # The PowerShell side: the stage is exported, the realize copy alone carries the credential, and no copy is kept.
     $fn = & $fnText 'Invoke-MiosQuadletOverlay'
     $iIf = $fn.IndexOf("if (`$Stage -eq 'realize') {"); $iResolve = $fn.IndexOf('Resolve-MiosLoginCredential')
-    Check ($fn.Contains("param([Parameter(Mandatory = `$true)][ValidateSet('checkout', 'realize')][string]`$Stage)") -and $fn.Contains("MIOS_OVERLAY_STAGE='`$Stage'") -and
+    Check ($fn.Contains("param([Parameter(Mandatory = `$true)][ValidateSet('checkout', 'realize')][string]`$Stage)") -and $fn.Contains("mios_overlay_stage='`$Stage'") -and
            (Get-Count $fn 'Resolve-MiosLoginCredential') -eq 1 -and $iIf -ge 0 -and $iIf -lt $iResolve -and
            $fn -match '(?s)\} finally \{\n[^}]*Remove-Item -LiteralPath \$stagedPath -Force') 'each stage is passed to the seed, only realize resolves the credential, and the staged copy is removed after every run'
 
@@ -252,7 +252,7 @@ try { Invoke-MiosQuadletOverlay -Stage $Stage } catch { $err = $_.Exception.Mess
             $run = { param($s, $rc) & $harness -FnSrc $fnRun -RepoDir $repoDir -ShadowDir $shadowDir -Stage $s -Rc $rc }
             $co = & $run 'checkout' 0; $rz = & $run 'realize' 0; $r7 = & $run 'realize' 7; $r3 = & $run 'realize' 3; $c4 = & $run 'checkout' 4; $bad = & $run 'bogus' 0
         } finally { $env:MIOS_SKIP_DEV_QUADLETS = $savedSkip }
-        $one = { param($r, $stage) $r.Calls.Count -eq 1 -and $r.Calls[0].Staged -and $r.Calls[0].Command.Contains("MIOS_OVERLAY_STAGE='$stage'") -and $r.Calls[0].Command.Contains("MIOS_BUILDER_DISTRO='MiOS-DEV'") -and -not $r.Left }
+        $one = { param($r, $stage) $r.Calls.Count -eq 1 -and $r.Calls[0].Staged -and $r.Calls[0].Command.Contains("mios_overlay_stage='$stage'") -and $r.Calls[0].Command.Contains("MIOS_BUILDER_DISTRO='MiOS-DEV'") -and -not $r.Left }
         $runOk = $co.Error -eq '' -and (& $one $co 'checkout') -and -not $co.Calls[0].Credential -and $co.Logs.Contains('OK mios.git checked out at / in MiOS-DEV') -and
                  $rz.Error -eq '' -and (& $one $rz 'realize') -and $rz.Calls[0].Credential -and $rz.Logs.Contains('OK MiOS Quadlet overlay applied to MiOS-DEV') -and
                  $r7.Error -eq 'Quadlet overlay failed (rc=7)' -and (& $one $r7 'realize') -and $r7.Logs.Contains('FAIL Quadlet overlay realize failed (rc=7)') -and $r7.Logs -notmatch 're-provision' -and

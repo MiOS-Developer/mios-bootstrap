@@ -500,10 +500,30 @@ function Invoke-Checks([string]$Path, [switch]$SkipReceiverProtocol) {
         $ctxThrow = @($ctx[0].FindAll({ param($n) $n -is [Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -ceq '$_ctxError' -and
             @($n.Clauses[0].Item2.FindAll({ param($m) $m -is [Management.Automation.Language.ThrowStatementAst] }, $true)).Count -eq 1 }, $true)).Count
     }
+    # Top level has no relaunch, so no origin reaches it (the machine worker gets its origin over the pipe). What this path
+    # enforces is the desktop owner; an origin read from an environment marker nothing sets would only look like a second check.
+    $ctxText = if ($ctx.Count -eq 1) { $ctx[0].Extent.Text } else { '' }
     Check ($ctx.Count -eq 1 -and $ctxThrow -eq 1 -and $guard.Count -eq 1 -and $elevate.Count -eq 1 -and
            $ctx[0].Extent.StartOffset -gt $guard[0].Extent.StartOffset -and $ctx[0].Extent.StartOffset -lt $elevate[0].Extent.StartOffset -and
-           $ctx[0].Extent.Text.Contains('-OriginSid ([string]$env:ELEVATION_ORIGIN_SID)') -and
-           $ctx[0].Extent.Text.Contains('-DesktopSids @(Get-MiosDesktopOwnerSids)')) 'an elevated run checks its account against the origin and desktop owner before any admin step'
+           $ctxText.Contains('-DesktopSids @(Get-MiosDesktopOwnerSids)') -and -not $ctxText.Contains('-OriginSid') -and
+           -not $ctxText.Contains('$env:')) 'an elevated run checks its account against the desktop owner before any admin step, with no unfed origin marker'
+    # Run the real guard block: only the current-account read is substituted, and the desktop owners are planted.
+    $currentRead = '([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)'
+    $ctxRuns = @()
+    if ($ctx.Count -eq 1 -and ([regex]::Matches($ctxText, [regex]::Escape($currentRead))).Count -eq 1) {
+        $ctxRun = $ctxText.Replace($currentRead, '$script:fixtureCurrentSid')
+        $runCtx = { param($current, [string[]]$desktop, [string]$envOrigin)
+            $_isAdmin = $true; $script:fixtureCurrentSid = $current; $script:fixtureDesktopSids = $desktop
+            $saved = $env:ELEVATION_ORIGIN_SID
+            if ($envOrigin) { $env:ELEVATION_ORIGIN_SID = $envOrigin } else { Remove-Item Env:ELEVATION_ORIGIN_SID -ErrorAction SilentlyContinue }
+            function Get-MiosDesktopOwnerSids { $script:fixtureDesktopSids }
+            try { . ([scriptblock]::Create($ctxRun)); 'continued' } catch { if ($_.Exception.Message -match '^Refusing to continue: this desktop belongs to ') { 'refused' } else { 'error: ' + $_.Exception.Message } }
+            finally { if ($null -ne $saved) { $env:ELEVATION_ORIGIN_SID = $saved } else { Remove-Item Env:ELEVATION_ORIGIN_SID -ErrorAction SilentlyContinue } } }
+        $ctxRuns = @((& $runCtx $other @($op) ''), (& $runCtx $other @($op, $other) ''), (& $runCtx $other @($op) $other),
+                     (& $runCtx $op @($op) ''), (& $runCtx $op @() ''))
+    }
+    Check ($ctxRuns.Count -eq 5 -and $ctxRuns[0] -eq 'refused' -and $ctxRuns[1] -eq 'refused' -and $ctxRuns[2] -eq 'refused') 'executed: another account''s elevated shell on the operator desktop is refused at top level'
+    Check ($ctxRuns.Count -eq 5 -and $ctxRuns[3] -eq 'continued' -and $ctxRuns[4] -eq 'continued') 'executed: the desktop owner''s own elevated shell, or a headless one, continues at top level'
     Check ($elevate.Count -eq 1 -and $ast.Extent.Text.Contains('Origin = $Context; OperatorToml = $operatorProjection') -and
            $ast.Extent.Text.Contains('GetNamedPipeServerProcessId')) 'the unelevated pass hands its own account SID to the elevated pass'
     Check ($script:dismLocalizedProbes -eq 0) 'every dism state probe forces English output'
@@ -741,7 +761,9 @@ try {
         @{ Name = 'dism probe localized'; Expected = 'every dism state probe forces English output'; From = '/online /English /get-featureinfo'; To = '/online /get-featureinfo' },
         @{ Name = 'origin mismatch accepted'; Expected = 'elevation into a different account is refused'; From = 'if ($OriginSid -and $OriginSid -ne $CurrentSid) {'; To = 'if ($false) {' },
         @{ Name = 'desktop owner ignored'; Expected = 'an elevated shell of another account on the operator desktop is refused'; From = 'if ($others.Count) {'; To = 'if ($false) {' },
-        @{ Name = 'context refusal does not stop'; Expected = 'an elevated run checks its account against the origin and desktop owner before any admin step'; From = 'if ($_ctxError) {'; To = 'if ($false) {' },
+        @{ Name = 'context refusal does not stop'; Expected = 'executed: another account''s elevated shell on the operator desktop is refused at top level'; From = 'if ($_ctxError) {'; To = 'if ($false) {' },
+        @{ Name = 'desktop owners not consulted at top level'; Expected = 'executed: another account''s elevated shell on the operator desktop is refused at top level'; From = '-DesktopSids @(Get-MiosDesktopOwnerSids)'; To = '-DesktopSids @()' },
+        @{ Name = 'unfed env origin marker restored'; Expected = 'an elevated run checks its account against the desktop owner before any admin step, with no unfed origin marker'; From = '-DesktopSids @(Get-MiosDesktopOwnerSids)'; To = '-OriginSid ([string]$env:ELEVATION_ORIGIN_SID) -DesktopSids @(Get-MiosDesktopOwnerSids)' },
         @{ Name = 'origin not handed over'; Expected = 'the unelevated pass hands its own account SID to the elevated pass'; From = 'Origin = $Context; OperatorToml = $operatorProjection'; To = 'Origin = $null; OperatorToml = $operatorProjection' }
     )
     $caught = 0

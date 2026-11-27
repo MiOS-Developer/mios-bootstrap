@@ -163,9 +163,9 @@ foreach ($name in @('sysrescue_grub.cfg', 'sysrescue_syslinux.cfg', 'mios-kickst
     $prepared += @{ Path = $path; Text = $text; PublicTemplateSha256 = $sourceHash }
 }
 $environment = "# Rendered from layered MiOS field.sysrescue credentials; private, never log.`n" +
-    'MIOS_SR_USER=' + (ConvertTo-MiOSShellLiteral $user) + "`n" +
-    'MIOS_SR_PASS=' + (ConvertTo-MiOSShellLiteral $password) + "`n" +
-    'MIOS_SR_HEADER=' + (ConvertTo-MiOSShellLiteral $header) + "`n"
+    'SR_USER=' + (ConvertTo-MiOSShellLiteral $user) + "`n" +
+    'SR_PASS=' + (ConvertTo-MiOSShellLiteral $password) + "`n" +
+    'SR_HEADER=' + (ConvertTo-MiOSShellLiteral $header) + "`n"
 foreach ($output in $prepared) {
     Write-MiOSPrivateText -Path $output.Path -Text $output.Text -Encoding UTF8 -PublicTemplateSha256 $output.PublicTemplateSha256
 }

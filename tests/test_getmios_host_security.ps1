@@ -502,7 +502,7 @@ function Invoke-Checks([string]$Path, [switch]$SkipReceiverProtocol) {
     }
     Check ($ctx.Count -eq 1 -and $ctxThrow -eq 1 -and $guard.Count -eq 1 -and $elevate.Count -eq 1 -and
            $ctx[0].Extent.StartOffset -gt $guard[0].Extent.StartOffset -and $ctx[0].Extent.StartOffset -lt $elevate[0].Extent.StartOffset -and
-           $ctx[0].Extent.Text.Contains('-OriginSid ([string]$env:MIOS_ORIGIN_SID)') -and
+           $ctx[0].Extent.Text.Contains('-OriginSid ([string]$env:ELEVATION_ORIGIN_SID)') -and
            $ctx[0].Extent.Text.Contains('-DesktopSids @(Get-MiosDesktopOwnerSids)')) 'an elevated run checks its account against the origin and desktop owner before any admin step'
     Check ($elevate.Count -eq 1 -and $ast.Extent.Text.Contains('Origin = $Context; OperatorToml = $operatorProjection') -and
            $ast.Extent.Text.Contains('GetNamedPipeServerProcessId')) 'the unelevated pass hands its own account SID to the elevated pass'
